@@ -1,0 +1,129 @@
+# replication-ha + Kvrocks 2.16.0 单 NARIX 节点、软隔离自动切换的全量示例。
+# 地址、密码和端口都是待替换示例；Kvrocks 必须保持自身 RocksDB/WAL 持久化。生产应配置可靠 external-command fencing，多机多 NARIX 再使用跨节点协调器。
+
+reload: # 配置文件、证书依赖和显式请求的热更新策略。
+  enabled: true # 是否允许文件检查、SIGHUP 和管理接口触发热更新。
+  poll_interval_ms: 1000 # 检查配置来源和 TLS 依赖文件内容的周期，单位毫秒。
+  stable_observations: 2 # 同一有效摘要连续出现多少次后自动发布，最小为 2。
+  transaction_timeout_ms: 60000 # 单次加载、预检、协调和发布事务的总预算，单位毫秒。
+
+admin: # 管理端 HTTP 服务配置。
+  enabled: true # 是否启动健康、状态、指标和 /ha 运维接口。
+  listen: 127.0.0.1:18080 # 管理端监听地址；生产建议绑定回环或受信管理网卡。
+  token: "replace-with-a-long-random-admin-token" # 管理 API 认证令牌，部署前必须替换。
+  allow_unauthenticated: false # 是否允许管理接口免认证；生产必须保持 false。
+
+coordination: # NARIX 进程级内置协调控制面；本单节点示例保持关闭。
+  enabled: false # false 不启动协调 gRPC listener，并要求 peers 为空。
+  cluster_id: "" # 协调集群唯一标识；关闭时使用空字符串。
+  node_id: 0 # 当前协调成员编号；关闭时使用 0。
+  listen: 127.0.0.1:19090 # 协调服务本地监听地址；关闭时不会绑定。
+  advertise: 127.0.0.1:19090 # 其他成员访问本节点的地址；关闭时不会使用。
+  data_dir: "" # 协调状态目录；关闭时使用空字符串。
+  bootstrap_node_id: 0 # 首次建群成员编号；关闭时使用 0。
+  peers: [] # 协调器关闭时静态成员表必须为空。
+  heartbeat_interval_ms: 500 # 领导者心跳周期，单位毫秒；仅启用协调器后生效。
+  election_timeout_min_ms: 1500 # 选举超时下界，单位毫秒；必须大于两倍心跳周期。
+  election_timeout_max_ms: 3000 # 选举超时上界，单位毫秒；必须大于下界。
+  rpc_timeout_ms: 1000 # 成员间单次 gRPC 请求超时，单位毫秒。
+  route_guard_timeout_ms: 5000 # 未确认协调权威后允许沿用路由的保护窗口，单位毫秒。
+  action_timeout_ms: 30000 # HA 控制动作令牌的最长有效时间，单位毫秒。
+  snapshot_log_entries: 10000 # 触发协调状态快照的已提交日志条数。
+  pair_election_retry_ms: 500 # 双节点竞选失败后的重试间隔，单位毫秒。
+  pair_allow_single_survivor: false # 是否允许双节点可靠隔离对端后单存活接管。
+  pair_peer_fencing_command: [] # 双节点隔离失联 NARIX 对端的外部命令数组。
+  pair_peer_fencing_timeout_ms: 5000 # 双节点对端隔离命令超时，单位毫秒。
+  tls: # 协调通道双向 TLS 配置。
+    enabled: false # 是否启用服务端和客户端证书双向校验。
+    certificate_path: null # 当前节点证书链 PEM 文件；启用 TLS 时必填。
+    private_key_path: null # 当前节点私钥 PEM 文件；启用 TLS 时必填。
+    client_ca_path: null # 验证其他成员客户端证书的 CA PEM 文件；启用 TLS 时必填。
+
+proxies: # 托管复制 HA 业务代理项列表。
+  - name: replication-ha-kvrocks # 代理项唯一名称，也是日志、指标和协调状态中的稳定身份。
+    backend_profile: kvrocks # 选择 Kvrocks 2.16.0 HA 适配器。
+    mode: replication-ha # 托管复制 HA 的唯一模式入口。
+
+    listen_host: 0.0.0.0 # 业务 listener 绑定主机；0.0.0.0 表示全部 IPv4 网卡。
+    listen: 7001 # 业务客户端连接 NARIX 的端口。
+    nodes: 198.51.100.11:6666@kvrocks-primary.internal:6666,198.51.100.12:6666@kvrocks-replica.internal:6666 # 节点清单，每项为 client_addr@replication_addr；复制地址必须能被其他 Kvrocks 节点直接访问。
+
+    username: null # Kvrocks HA 只接受全局管理员密码，必须保持 null。
+    password: "replace-with-the-global-requirepass" # NARIX 访问全部 Kvrocks 节点使用的全局 requirepass。
+    backend_tls_enabled: false # 是否对 Kvrocks 数据面和 HA 控制连接启用受证书校验的 RESP TLS。
+    backend_tls_ca_path: null # 验证 Kvrocks 服务端证书链的 PEM CA；启用 TLS 时必填。
+    backend_tls_server_name: null # Kvrocks 证书 SNI；null 时从当前 client_addr 提取。
+    backend_tls_certificate_path: null # 可选 mTLS 客户端证书 PEM；必须与私钥同时配置。
+    backend_tls_private_key_path: null # 可选 mTLS 客户端私钥 PEM；必须与证书同时配置。
+
+    frontend_password: "replace-with-a-long-random-client-password" # 业务客户端连接 NARIX 使用的前端密码。
+    auth_mode: terminate # NARIX 终止前端认证，再使用独立后端凭据连接 Kvrocks。
+    allow_unauthenticated: false # 是否允许客户端跳过代理侧认证；生产保持 false。
+    read_only: false # 是否启用统一只读门禁。
+
+    dedicated_tunnel_max_active: 1024 # Pub/Sub、阻塞、事务等专用后端连接最大活跃数。
+    dedicated_tunnel_queue_size: 1024 # 专用连接达到上限后的等待队列容量。
+    dedicated_tunnel_acquire_timeout_ms: 1000 # 获取专用连接许可的最长等待时间，单位毫秒。
+    dedicated_tunnel_pool_max_idle: 1000 # 每个真实 Kvrocks 节点最多保留的 clean idle tunnel 数。
+    dedicated_tunnel_pool_idle_timeout_ms: 30000 # clean tunnel 最大空闲时间，单位毫秒。
+
+    connect_timeout_ms: 3000 # 数据面和 HA 控制连接的 TCP/TLS 建连超时，单位毫秒。
+    backend_request_timeout_ms: 10000 # 数据面和 HA 控制命令响应超时，单位毫秒。
+    frontend_auth_timeout_ms: 10000 # 前端完成 AUTH/HELLO 初始化的超时，单位毫秒。
+    client_idle_timeout_ms: 0 # 已认证客户端空闲关闭时间；0 表示不主动关闭。
+    tcp_keepalive_ms: 0 # TCP keepalive 周期；0 使用系统默认行为。
+    max_connections: 65535 # 当前代理项允许的最大前端连接数。
+    max_auth_bytes: 16384 # 认证阶段允许累计读取的最大字节数。
+
+    pipeline_max_commands: 1000 # 单批 pipeline 最大命令数量。
+    pipeline_max_bytes: 4194304 # 单批 pipeline 最大输入字节数。
+    pipeline_backend_max_active: 5000 # pipeline 后端连接池最大活跃连接数。
+    pipeline_backend_queue_size: 4096 # pipeline 池耗尽后的等待队列容量。
+    pipeline_backend_submit_timeout_ms: 1000 # 等待向 pipeline 池提交任务的超时，单位毫秒。
+    pipeline_backend_idle_timeout_ms: 60000 # pipeline 后端连接最大空闲时间，单位毫秒。
+
+    frame_max_bytes: 4194304 # 单个 RESP frame 最大字节数。
+    bulk_max_bytes: 4194304 # 单个 RESP bulk string 最大字节数。
+    aggregate_max_concurrency: 32 # 聚合类请求最大并发子任务数。
+    aggregate_max_items: 10000 # 聚合类命令最大元素数。
+    pending_response_bytes: 16777216 # 单前端连接尚未写回的响应字节上限。
+    graceful_shutdown_timeout_ms: 10000 # 收到退出信号后等待连接和任务收敛的时间，单位毫秒。
+    cluster_topology_refresh_ms: 60000 # 通用 Cluster 刷新默认值；replication-ha 不使用槽位拓扑。
+
+    ha: # 后端无关的托管复制 HA 控制面配置。
+      probe_interval_ms: 1000 # 全部 Kvrocks 节点角色和复制健康探测周期，单位毫秒。
+      probe_connect_timeout_ms: 300 # Kvrocks HA 探测建连超时；省略时继承 connect_timeout_ms。
+      probe_request_timeout_ms: 1000 # Kvrocks HA 探测响应超时；省略时继承 backend_request_timeout_ms。
+      master_down_after_failures: 3 # 主节点连续探测失败多少轮后形成故障判断。
+      auto_failover: true # 确认主故障后先关闭路由，再经过 fencing 和候选门禁自动恢复；人工接管改为 false。
+      observer: false # true 时控制面零写入，主故障、未确认新主或双主保持保护；业务只读还需 read_only: true。
+      max_replica_lag: 10 # 候选副本允许的最大复制延迟秒数。
+
+      fencing: # 旧主隔离策略。
+        mode: manual # 默认软隔离，无脚本但存在短暂双写风险；生产强隔离改 external-command 并演练隔离程序。
+        command: [] # 仅 external-command 模式使用；首项是可执行文件，其余按原样作为参数传入，不经 shell。示例：["/opt/narix/bin/fence", "{client_addr}"]。
+        timeout_ms: 10000 # 外部隔离动作超时，单位毫秒。
+
+      coordinator: # HA 动作租约和多 NARIX 协调配置。
+        mode: local-file # 本机单实例用文件租约串行化自动/人工切换与持久化交接；跨机器多实例改用 proxy-cluster 或 redis。
+        owner_id: replication-ha-kvrocks-node-1 # 当前 NARIX 实例参与 HA 动作时使用的稳定身份。
+        lease_path: /var/run/narix/replication-ha-kvrocks.lease # local-file 租约文件路径。
+        group_id: null # proxy-cluster 模式下同一后端拓扑的稳定组名。
+        observation_quorum: 0 # proxy-cluster 故障观察票数；0 表示静态成员多数派。
+        observation_window_ms: 3000 # 相同故障指纹参与计票的时间窗口，单位毫秒。
+        redis_addr: null # redis 协调模式使用的独立协调 Redis 地址，不能指向被管理节点。
+        redis_username: null # 独立协调 Redis 的可选 ACL 用户名。
+        redis_password: null # 独立协调 Redis 的可选认证密码。
+        redis_key: null # redis 协调模式下同一 HA 组共享的租约键。
+        redis_connect_timeout_ms: 3000 # 独立协调 Redis 建连超时，单位毫秒。
+        redis_request_timeout_ms: 3000 # 独立协调 Redis 命令响应超时，单位毫秒。
+        lease_ttl_ms: 15000 # local-file/redis 租约有效期，单位毫秒。
+        lease_renew_interval_ms: 5000 # 租约续约周期，必须小于 TTL。
+        lease_acquire_timeout_ms: 3000 # 单轮竞争租约允许等待的最长时间，单位毫秒。
+
+      persistence: # Kvrocks 节点持久化由 RocksDB/WAL 自身负责，NARIX 不分配 owner。
+        enabled: false # Kvrocks HA 强制要求 false，不能配置产品持久化子块。
+        fail_closed: true # 动态持久化关闭时不参与判断，保留通用字段默认值。
+        force_checkpoint_on_handoff: false # Kvrocks 不由 NARIX 触发持久化点。
+        min_replica_stable_ms: 5000 # 动态持久化关闭时不参与 owner 选择。
+        require_zero_lag: true # 动态持久化关闭时不参与 owner 选择。

@@ -1,0 +1,21 @@
+# NARIX 内置最小安全配置。
+# 业务代理项必须通过 --config、NARIX_CONFIG、profile 文件或 NARIX_ 环境变量提供。
+# 所有字段、默认值、约束和各模式全量示例见 docs/configuration.md。
+
+admin: # 管理端 HTTP 服务配置。
+  enabled: true # 启用健康、就绪、状态、指标和配置热更新接口。
+  listen: 127.0.0.1:18080 # 仅绑定本机管理端口，避免默认暴露到外部网络。
+  token: "change-me-admin-token" # 启动前必须由外部配置或 NARIX_ADMIN_TOKEN 替换。
+  allow_unauthenticated: false # 管理接口保持认证；生产环境不能开启免认证。
+
+reload: # 配置热更新的最小运维配置。
+  enabled: true # 启用文件检查、SIGHUP 和管理接口热更新。
+
+coordination: # 集群配置恢复需要保留的本机 TLS 引导字段。
+  tls: # 默认关闭协调通道 TLS，跨机器协调时由节点外部配置完整覆盖。
+    enabled: false # 不启用协调通道双向 TLS。
+    certificate_path: null # 当前节点证书链；启用 TLS 时必须配置。
+    private_key_path: null # 当前节点私钥；启用 TLS 时必须配置。
+    client_ca_path: null # 校验其他协调成员客户端证书的 CA；启用 TLS 时必须配置。
+
+proxies: [] # 内置配置不预置业务监听器，由部署配置提供完整代理项集合。

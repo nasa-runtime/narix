@@ -1,0 +1,35 @@
+# Prometheus 全局采集配置。
+global:
+  # 每 5 秒抓取一次指标；与 Grafana 仪表盘的默认刷新周期保持一致。
+  scrape_interval: 5s
+  # 每 5 秒计算一次告警规则；当前模板未附带告警规则，但保留统一周期。
+  evaluation_interval: 5s
+
+# 单个 narix 进程的指标采集任务。
+# 多个 narix 进程组成协调集群时，请改用同目录下的 prometheus-cluster.yml。
+scrape_configs:
+  # 任务名会成为 Prometheus 的 job 标签，仪表盘用它判断采集是否正常。
+  - job_name: narix
+    # narix 管理端通过 HTTP 暴露指标。
+    scheme: http
+    # 管理端指标接口的固定路径。
+    metrics_path: /metrics
+    # /metrics 默认需要与 narix 的 admin.token 一致的 Bearer token。
+    authorization:
+      # 使用标准 Bearer 鉴权方式。
+      type: Bearer
+      # 部署前必须替换为 narix 配置中的真实 admin.token。
+      credentials: replace-with-narix-admin-token
+    # 静态目标适合节点地址固定的单机或小规模部署。
+    static_configs:
+      # 每个目标都是一个 narix 管理端监听地址，可以继续追加其他节点。
+      - targets:
+          # 默认表示 Prometheus 与 narix 在同一台主机上运行。
+          - 127.0.0.1:18080
+        labels:
+          # 环境标签用于区分生产、预发布和开发采集数据，可按部署实际值修改。
+          environment: production
+          # 集群标签用于 Grafana 顶部的集群筛选；单实例也必须填写，可使用 standalone。
+          narix_cluster: standalone
+          # 节点标签是当前进程在 Grafana 中显示的名称；同一集群内必须唯一。
+          narix_node: narix-1

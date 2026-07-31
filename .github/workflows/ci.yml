@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安装格式化与静态分析组件
+        run: rustup component add rustfmt clippy
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 全目标编译检查
+        run: cargo check --locked --all-targets
+
+      - name: 常规测试
+        run: cargo test --locked
+
+      - name: 静态分析
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: 文档与注释完整性
+        env:
+          RUSTDOCFLAGS: -D warnings -D missing-docs
+        run: cargo doc --locked --no-deps

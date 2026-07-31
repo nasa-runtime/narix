@@ -1,0 +1,22 @@
+# Grafana provisioning 配置版本。
+apiVersion: 1
+
+# 自动从文件系统加载 narix 仪表盘。
+providers:
+  # provider 的内部名称。
+  - name: narix
+    # 把仪表盘导入默认组织。
+    orgId: 1
+    # 在 Grafana 中归入 NARIX 文件夹。
+    folder: NARIX
+    # 使用文件 provider 读取 JSON 仪表盘。
+    type: file
+    # JSON 文件暂时消失时不自动删除已导入的仪表盘。
+    disableDeletion: true
+    # 每 10 秒检查一次 JSON 文件变化。
+    updateIntervalSeconds: 10
+    # 禁止界面修改覆盖文件版本，仪表盘变更应回写仓库中的 JSON。
+    allowUiUpdates: false
+    options:
+      # 把 narix-overview.json 复制到此目录，或改成部署环境中的实际目录。
+      path: /var/lib/grafana/dashboards

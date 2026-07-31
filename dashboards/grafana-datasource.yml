@@ -1,0 +1,22 @@
+# Grafana provisioning 配置版本。
+apiVersion: 1
+
+# 自动创建 Prometheus 数据源。
+datasources:
+  # 数据源显示名称。
+  - name: Prometheus
+    # 固定 UID 必须与 narix-overview.json 中引用的 UID 保持一致。
+    uid: prometheus
+    # 使用 Grafana 内置 Prometheus 数据源类型。
+    type: prometheus
+    # 由 Grafana 服务端访问 Prometheus，浏览器无需直接连接 Prometheus。
+    access: proxy
+    # Prometheus 地址；两者不在同一主机时必须改成 Grafana 可访问的真实地址。
+    url: http://127.0.0.1:9090
+    # 将该数据源设为默认数据源。
+    isDefault: true
+    # 禁止在界面中修改文件预置的数据源，避免重启后配置漂移。
+    editable: false
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 保持一致，避免 Grafana 选择过小步长。
+      timeInterval: 5s

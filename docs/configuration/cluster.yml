@@ -1,0 +1,90 @@
+# 标准槽位 Cluster 单入口模式全量示例。
+# backend_profile 可换成 README 中 cluster 模式允许的已验证档案。
+
+reload: # 配置文件、证书依赖和显式请求的热更新策略。
+  enabled: true # 是否允许文件检查、SIGHUP 和管理接口触发热更新。
+  poll_interval_ms: 1000 # 检查配置来源和 TLS 依赖文件内容的周期，单位毫秒。
+  stable_observations: 2 # 同一有效摘要连续出现多少次后自动发布，最小为 2。
+  transaction_timeout_ms: 60000 # 单次加载、预检、协调和发布事务的总预算，单位毫秒。
+
+coordination: # NARIX 内置协调控制面；单进程 Cluster 入口示例保持关闭。
+  enabled: false # false 不启动协调 gRPC listener，并要求 peers 为空。
+  cluster_id: "" # 协调集群唯一标识；关闭时使用空字符串。
+  node_id: 0 # 当前协调成员编号；关闭时使用 0。
+  listen: 127.0.0.1:19090 # 协调服务本地监听地址；关闭时不会绑定。
+  advertise: 127.0.0.1:19090 # 其他成员访问本节点的地址；关闭时不会使用。
+  data_dir: "" # 协调状态目录；关闭时使用空字符串。
+  bootstrap_node_id: 0 # 首次建群成员编号；关闭时使用 0。
+  peers: [] # 完整静态成员表；关闭时必须为空。
+  heartbeat_interval_ms: 500 # 领导者心跳周期，单位毫秒；仅启用协调器后生效。
+  election_timeout_min_ms: 1500 # 选举超时下界，单位毫秒；必须大于两倍心跳周期。
+  election_timeout_max_ms: 3000 # 选举超时上界，单位毫秒；必须大于下界。
+  rpc_timeout_ms: 1000 # 成员间单次 gRPC 请求超时，单位毫秒。
+  route_guard_timeout_ms: 5000 # 未确认协调权威后允许沿用路由的保护窗口，单位毫秒。
+  action_timeout_ms: 30000 # HA 控制动作令牌的最长有效时间，单位毫秒。
+  snapshot_log_entries: 10000 # 触发协调状态快照的已提交日志条数。
+  pair_election_retry_ms: 500 # 双节点竞选失败后的重试间隔，单位毫秒。
+  pair_allow_single_survivor: false # 是否允许双节点可靠隔离对端后单存活接管。
+  pair_peer_fencing_command: [] # 双节点隔离失联 NARIX 对端的外部命令数组。
+  pair_peer_fencing_timeout_ms: 5000 # 双节点对端隔离命令超时，单位毫秒。
+  tls: # 协调通道双向 TLS 配置。
+    enabled: false # 是否启用服务端和客户端证书双向校验。
+    certificate_path: null # 当前节点证书链 PEM 文件；启用 TLS 时必填。
+    private_key_path: null # 当前节点私钥 PEM 文件；启用 TLS 时必填。
+    client_ca_path: null # 验证其他成员客户端证书的 CA PEM 文件；启用 TLS 时必填。
+
+admin: # 管理端 HTTP 服务配置。
+  enabled: true # 是否启动管理端；关闭后健康检查、状态和指标接口均不可用。
+  listen: 127.0.0.1:18080 # 管理端监听地址；生产建议绑定回环或受信管理网卡。
+  token: "replace-with-a-long-random-admin-token" # 受保护接口使用的管理令牌，部署前必须替换。
+  allow_unauthenticated: false # 是否允许管理接口免认证；生产必须保持 false。
+
+proxies: # 业务代理项列表；一个元素对应一个独立单入口 Cluster 代理。
+  - name: redis-cluster # 代理项唯一名称，也是日志、指标和多层配置合并的身份。
+    backend_profile: redis # 标准槽位后端能力档案；可替换为 README 中 cluster 允许的档案。
+    mode: cluster # 标准槽位 Cluster 单入口代理模式。
+
+    listen_host: 0.0.0.0 # 业务 listener 绑定主机；0.0.0.0 表示全部 IPv4 网卡。
+    listen: 7001 # Cluster Client 连接 NARIX 的单一业务端口。
+    nodes: 192.0.2.11:6379,192.0.2.12:6379,192.0.2.13:6379 # 逗号分隔的 Cluster seed；示例使用 RFC 文档专用地址。
+
+    username: null # NARIX 访问所有 Cluster 节点使用的 ACL 用户名。
+    password: null # NARIX 访问所有 Cluster 节点使用的后端密码。
+    backend_tls_enabled: false # 是否对 seed、拓扑节点和重定向目标启用受证书校验的 RESP TLS。
+    backend_tls_ca_path: null # 验证 Cluster 节点证书链的 PEM CA 文件；启用 TLS 时必填。
+    backend_tls_server_name: null # Cluster 节点证书 SNI；null 时从每个实际目标地址提取。
+    backend_tls_certificate_path: null # 可选 mTLS 客户端证书 PEM 文件；必须与私钥同时配置。
+    backend_tls_private_key_path: null # 可选 mTLS 客户端私钥 PEM 文件；必须与证书同时配置。
+    frontend_password: "replace-with-a-long-random-client-password" # Cluster Client 连接 NARIX 时使用的前端密码。
+    auth_mode: terminate # NARIX 终止前端认证，再用独立后端凭据访问各 Cluster 节点。
+    allow_unauthenticated: false # 是否允许客户端跳过代理侧认证；生产保持 false。
+    read_only: false # 是否启用统一只读门禁；true 会拒绝写入和无法安全判定的命令。
+
+    dedicated_tunnel_max_active: 1024 # 连接绑定型命令允许占用的专用后端连接上限；0 表示不限制。
+    dedicated_tunnel_queue_size: 1024 # 专用连接达到上限后的等待队列容量；0 表示立即失败。
+    dedicated_tunnel_acquire_timeout_ms: 1000 # 从专用连接队列获取许可的最长等待时间，单位毫秒。
+    dedicated_tunnel_pool_max_idle: 1000 # 每个真实 Cluster 节点最多保留的 clean idle tunnel 数。
+    dedicated_tunnel_pool_idle_timeout_ms: 30000 # clean tunnel 的最大空闲时间，单位毫秒；0 关闭复用。
+
+    connect_timeout_ms: 3000 # NARIX 连接 Cluster 节点的 TCP 超时，单位毫秒。
+    backend_request_timeout_ms: 10000 # 普通后端请求的响应超时，单位毫秒。
+    frontend_auth_timeout_ms: 10000 # 前端完成 AUTH/HELLO 初始化的超时，单位毫秒。
+    client_idle_timeout_ms: 0 # 已认证客户端的空闲关闭时间，单位毫秒；0 表示不主动关闭。
+    tcp_keepalive_ms: 0 # TCP keepalive 周期，单位毫秒；0 使用系统默认行为。
+    max_connections: 65535 # 当前代理项允许的最大前端连接数。
+    max_auth_bytes: 16384 # 认证阶段允许累计读取的最大字节数。
+
+    pipeline_max_commands: 1000 # 单批 pipeline 允许的最大命令数量。
+    pipeline_max_bytes: 4194304 # 单批 pipeline 允许的最大输入字节数。
+    pipeline_backend_max_active: 5000 # pipeline 后端连接池最大活跃连接数。
+    pipeline_backend_queue_size: 4096 # pipeline 池耗尽后的等待队列容量。
+    pipeline_backend_submit_timeout_ms: 1000 # 等待向 pipeline 池提交任务的超时，单位毫秒。
+    pipeline_backend_idle_timeout_ms: 60000 # pipeline 后端连接的最大空闲时间，单位毫秒。
+
+    frame_max_bytes: 4194304 # 单个 RESP frame 的最大字节数，不能大于 pipeline_max_bytes。
+    bulk_max_bytes: 4194304 # 单个 RESP bulk string 的最大字节数。
+    aggregate_max_concurrency: 32 # 跨 Cluster 节点聚合请求的最大并发数。
+    aggregate_max_items: 10000 # 聚合命令允许拆分或返回的最大元素数。
+    pending_response_bytes: 16777216 # 单前端连接尚未写回的响应字节上限。
+    graceful_shutdown_timeout_ms: 10000 # 收到退出信号后等待连接和任务收敛的时间，单位毫秒。
+    cluster_topology_refresh_ms: 60000 # 后台刷新 Cluster 槽位拓扑的周期，单位毫秒。

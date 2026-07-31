@@ -1,0 +1,79 @@
+# Prometheus 全局采集配置。
+global:
+  # 每 5 秒抓取一次指标；与 Grafana 仪表盘的默认刷新周期保持一致。
+  scrape_interval: 5s
+  # 每 5 秒计算一次告警规则；当前模板未附带告警规则，但保留统一周期。
+  evaluation_interval: 5s
+
+# NARIX 集群中的每个进程都拥有独立的管理端和 /metrics。
+# 本模板按三个 NARIX 节点编写；双节点集群删除第三段，更多节点按相同结构继续追加。
+# targets 必须填写 admin.listen 对应的可达地址，不能填写业务代理端口或 coordination.rpc_addr。
+scrape_configs:
+  # 节点 1 使用独立任务，允许它拥有不同于其他节点的 admin.token。
+  - job_name: narix-node-1
+    # 管理端未配置 TLS 时使用 HTTP；若前方部署了 HTTPS 反向代理，应改为 https。
+    scheme: http
+    # NARIX 管理端指标接口的固定路径。
+    metrics_path: /metrics
+    # /metrics 默认受 admin.token 保护。
+    authorization:
+      # 使用标准 Bearer 鉴权方式。
+      type: Bearer
+      # 必须替换为节点 1 配置中的 admin.token，不要把真实值提交到仓库。
+      credentials: replace-with-node-1-admin-token
+    static_configs:
+      - targets:
+          # 节点 1 的 admin.listen 地址，必须能从 Prometheus 所在网络访问。
+          - narix-1.internal:18080
+        labels:
+          # 同一部署环境的所有节点必须相同。
+          environment: production
+          # 同一个 NARIX 协调集群的所有节点必须相同；不同集群必须使用不同值。
+          narix_cluster: production-narix
+          # 当前 NARIX 节点的稳定名称；同一集群内必须唯一。
+          narix_node: narix-1
+    relabel_configs:
+      # 三个采集任务使用不同 job_name 以配置独立 token，但写入时统一成 job="narix"。
+      # 仪表盘只依赖统一后的 job 标签，因此增加或删除节点时不需要修改 JSON。
+      - target_label: job
+        replacement: narix
+
+  # 节点 2 的配置；字段含义与节点 1 相同。
+  - job_name: narix-node-2
+    scheme: http
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      # 必须替换为节点 2 配置中的 admin.token。
+      credentials: replace-with-node-2-admin-token
+    static_configs:
+      - targets:
+          # 节点 2 的 admin.listen 地址。
+          - narix-2.internal:18080
+        labels:
+          environment: production
+          narix_cluster: production-narix
+          narix_node: narix-2
+    relabel_configs:
+      - target_label: job
+        replacement: narix
+
+  # 节点 3 的配置；双节点 NARIX 集群应完整删除这一段。
+  - job_name: narix-node-3
+    scheme: http
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      # 必须替换为节点 3 配置中的 admin.token。
+      credentials: replace-with-node-3-admin-token
+    static_configs:
+      - targets:
+          # 节点 3 的 admin.listen 地址。
+          - narix-3.internal:18080
+        labels:
+          environment: production
+          narix_cluster: production-narix
+          narix_node: narix-3
+    relabel_configs:
+      - target_label: job
+        replacement: narix

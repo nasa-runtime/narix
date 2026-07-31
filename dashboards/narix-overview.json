@@ -1,0 +1,193 @@
+{
+  "annotations": {"list": []},
+  "description": "展示 NARIX 集群中每个节点的健康状态、CPU、内存、请求吞吐、连接、背压、错误和响应流量；支持按环境、集群、节点和代理筛选。",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "每个 Narix 节点对应一个状态圆点：绿色表示 Prometheus 抓取正常，红色表示抓取失败。",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [{"options": {"0": {"color": "red", "text": "●"}, "1": {"color": "green", "text": "●"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {"titleSize": 16, "valueSize": 36}, "textMode": "value_and_name", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "min by (narix_node) (up{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\"})", "legendFormat": "{{narix_node}}", "range": true, "refId": "A"}],
+      "title": "各节点抓取状态",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "每个 Narix 节点对应一个状态圆点：绿色表示就绪，红色表示未就绪、指标缺失或节点抓取失败。",
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [{"options": {"0": {"color": "red", "text": "●"}, "1": {"color": "green", "text": "●"}}, "type": "value"}], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {"titleSize": 16, "valueSize": 36}, "textMode": "value_and_name", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "min by (narix_node) (narix_ready{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\"}) or (min by (narix_node) (up{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\"}) * 0)", "legendFormat": "{{narix_node}}", "range": true, "refId": "A"}],
+      "title": "各节点就绪状态",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"editorMode": "code", "expr": "sum(narix_active_connections{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"})", "legendFormat": "活跃连接", "range": true, "refId": "A"}],
+      "title": "当前前端连接",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "description": "基于单调 counter 计算的集群已解析命令速率；进入不透明专用隧道后的字节流不会冒充单条 Redis 命令。",
+      "targets": [{"editorMode": "code", "expr": "sum(irate(narix_parsed_commands_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"}[$__rate_interval]))", "legendFormat": "已解析命令/秒", "range": true, "refId": "A"}],
+      "title": "集群已解析命令速率",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "每条曲线代表一个 Narix 节点。数值采用单核口径：1.0 等于持续占用一个 CPU 核心，多线程进程可能超过 100%。",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "CPU", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 16, "gradientMode": "opacity", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "min": 0, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 4},
+      "id": 9,
+      "options": {"legend": {"calcs": ["lastNotNull", "max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (narix_node) (rate(narix_process_cpu_seconds_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\"}[$__rate_interval]))", "legendFormat": "{{narix_node}}", "range": true, "refId": "A"}],
+      "title": "每节点 Narix CPU",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "每条曲线代表一个 Narix 节点当前驻留物理内存（RSS），不会把集群节点内存简单合并成一个无法定位的总值。",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "RSS", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 16, "gradientMode": "opacity", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "min": 0, "unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 4},
+      "id": 10,
+      "options": {"legend": {"calcs": ["lastNotNull", "max", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "max by (narix_node) (narix_process_resident_memory_bytes{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\"})", "legendFormat": "{{narix_node}}", "range": true, "refId": "A"}],
+      "title": "每节点 Narix 内存",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 18, "gradientMode": "opacity", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 13},
+      "id": 5,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (narix_node, proxy) (rate(narix_parsed_commands_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"}[1m]))", "legendFormat": "{{narix_node}} / {{proxy}} 已解析命令/秒", "range": true, "refId": "A"}, {"editorMode": "code", "expr": "sum by (narix_node, proxy) (rate(narix_accepted_connections_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"}[1m]))", "legendFormat": "{{narix_node}} / {{proxy}} 新连接/秒", "range": true, "refId": "B"}],
+      "title": "请求与连接速率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 15, "gradientMode": "opacity", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 13},
+      "id": 6,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (narix_node, proxy) (narix_backend_active_connections{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"})", "legendFormat": "{{narix_node}} / {{proxy}} 后端连接", "range": true, "refId": "A"}, {"editorMode": "code", "expr": "sum by (narix_node, proxy) (narix_pending_pipeline_commands{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"})", "legendFormat": "{{narix_node}} / {{proxy}} 待处理命令", "range": true, "refId": "B"}, {"editorMode": "code", "expr": "sum by (narix_node, proxy) (narix_pending_response_bytes{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"})", "legendFormat": "{{narix_node}} / {{proxy}} 待回写字节", "range": true, "refId": "C"}],
+      "title": "连接与背压",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 12, "gradientMode": "opacity", "hideFrom": {"legend": false, "tooltip": false, "viz": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 23},
+      "id": 7,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (narix_node, proxy) (rate(narix_command_errors_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"}[5m]))", "legendFormat": "{{narix_node}} / {{proxy}} 命令错误/秒", "range": true, "refId": "A"}, {"editorMode": "code", "expr": "sum by (narix_node, proxy) (rate(narix_connection_errors_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"}[5m]))", "legendFormat": "{{narix_node}} / {{proxy}} 连接错误/秒", "range": true, "refId": "B"}, {"editorMode": "code", "expr": "sum by (narix_node, proxy) (rate(narix_backend_connection_failures_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"}[5m]))", "legendFormat": "{{narix_node}} / {{proxy}} 后端连接失败/秒", "range": true, "refId": "C"}],
+      "title": "错误趋势",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 23},
+      "id": 8,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"hideZeros": false, "mode": "multi", "sort": "desc"}},
+      "targets": [{"editorMode": "code", "expr": "sum by (narix_node, proxy) (rate(narix_response_bytes_total{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"}[1m]))", "legendFormat": "{{narix_node}} / {{proxy}} 响应字节/秒", "range": true, "refId": "A"}, {"editorMode": "code", "expr": "sum by (narix_node, proxy) (narix_max_pending_response_bytes{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\",proxy=~\"$proxy\"})", "legendFormat": "{{narix_node}} / {{proxy}} 历史最大待回写", "range": true, "refId": "B"}],
+      "title": "响应流量",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 41,
+  "tags": ["narix"],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {"selected": true, "text": ["全部"], "value": ["$__all"]},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(up{job=\"narix\"}, environment)",
+        "includeAll": true,
+        "label": "环境",
+        "multi": true,
+        "name": "environment",
+        "options": [],
+        "query": {"query": "label_values(up{job=\"narix\"}, environment)", "refId": "PrometheusVariableQueryEditor-Environment"},
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"selected": true, "text": ["全部"], "value": ["$__all"]},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(up{job=\"narix\",environment=~\"$environment\"}, narix_cluster)",
+        "includeAll": true,
+        "label": "NARIX 集群",
+        "multi": true,
+        "name": "narix_cluster",
+        "options": [],
+        "query": {"query": "label_values(up{job=\"narix\",environment=~\"$environment\"}, narix_cluster)", "refId": "PrometheusVariableQueryEditor-Cluster"},
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"selected": true, "text": ["全部"], "value": ["$__all"]},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(up{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\"}, narix_node)",
+        "includeAll": true,
+        "label": "NARIX 节点",
+        "multi": true,
+        "name": "narix_node",
+        "options": [],
+        "query": {"query": "label_values(up{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\"}, narix_node)", "refId": "PrometheusVariableQueryEditor-Node"},
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {"selected": true, "text": ["全部"], "value": ["$__all"]},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(narix_listener_info{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\"}, proxy)",
+        "includeAll": true,
+        "label": "代理",
+        "multi": true,
+        "name": "proxy",
+        "options": [],
+        "query": {"query": "label_values(narix_listener_info{job=\"narix\",environment=~\"$environment\",narix_cluster=~\"$narix_cluster\",narix_node=~\"$narix_node\"}, proxy)", "refId": "PrometheusVariableQueryEditor-Proxy"},
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "narix 监控总览",
+  "uid": "narix-overview",
+  "version": 5
+}

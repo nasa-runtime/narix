@@ -1,0 +1,226 @@
+syntax = "proto3";
+
+package narix.coordinator.v1;
+
+// CoordinatorRpc 承载代理节点之间的共识消息和双节点复制消息。
+// 两类协议共用同一监听端口，但服务端会依据持久化的集群创世信息拒绝跨协议请求。
+service CoordinatorRpc {
+  // RaftAppend 复制三节点及以上集群的日志和心跳。
+  rpc RaftAppend (RpcEnvelope) returns (RpcEnvelope);
+  // RaftVote 处理三节点及以上集群的预投票和正式投票。
+  rpc RaftVote (RpcEnvelope) returns (RpcEnvelope);
+  // RaftInstallSnapshot 安装已经由多数派提交的状态机快照。
+  rpc RaftInstallSnapshot (RpcEnvelope) returns (RpcEnvelope);
+  // PairCampaign 交换双节点候选信息并完成同任期的确定性排序。
+  rpc PairCampaign (PairCampaignRequest) returns (PairCampaignResponse);
+  // PairReplicate 将双节点协调记录持久化到另一节点，只有收到确认后才能提交。
+  rpc PairReplicate (PairReplicateRequest) returns (PairReplicateResponse);
+  // PairCommit 通知另一节点把已经双写成功的记录推进为已提交状态。
+  rpc PairCommit (PairCommitRequest) returns (PairCommitResponse);
+  // PairHeartbeat 维持双节点领导权，并携带提交位置供落后节点拒绝旧领导者。
+  rpc PairHeartbeat (PairHeartbeatRequest) returns (PairHeartbeatResponse);
+  // SubmitCommand 把业务协调命令转发给当前领导者，跟随者自身不得直接产生动作令牌。
+  rpc SubmitCommand (RpcEnvelope) returns (RpcEnvelope);
+  // ProposeClusterConfig 把任意成员接收的热更新提案转交当前领导者统一编排。
+  rpc ProposeClusterConfig (ClusterConfigRequest) returns (ClusterConfigResponse);
+  // GetClusterConfig 从当前领导节点读取线性一致的已提交配置，供启动和落后成员追平。
+  rpc GetClusterConfig (ClusterConfigRequest) returns (ClusterConfigResponse);
+  // PrepareClusterConfig 要求成员安全落盘并预检同一候选配置。
+  rpc PrepareClusterConfig (ClusterConfigRequest) returns (ClusterConfigResponse);
+  // ActivateClusterConfig 要求成员提交磁盘版本并发布已由协调日志确认的配置。
+  rpc ActivateClusterConfig (ClusterConfigRequest) returns (ClusterConfigResponse);
+  // AbortClusterConfig 删除尚未提交的候选版本。
+  rpc AbortClusterConfig (ClusterConfigRequest) returns (ClusterConfigResponse);
+}
+
+// RpcEnvelope 保存共识库消息的 JSON 编码；使用信封可以保持协议字段随库版本演进而不破坏服务方法编号。
+message RpcEnvelope {
+  // cluster_id 防止误连到其它代理集群后交换任期或日志。
+  string cluster_id = 1;
+  // sender_node_id 标识发起请求的静态成员。
+  uint64 sender_node_id = 2;
+  // payload 是具体共识请求或响应的 JSON 字节。
+  bytes payload = 3;
+  // error 保存远端拒绝原因；非空时调用方必须把请求视为失败。
+  string error = 4;
+}
+
+// ClusterConfigRequest 携带集群热更新阶段所需的同一规范化配置版本。
+message ClusterConfigRequest {
+  // cluster_id 防止配置被广播到其他协调集群。
+  string cluster_id = 1;
+  // sender_node_id 由静态成员表和可选客户端证书共同校验。
+  uint64 sender_node_id = 2;
+  // expected_revision 是提案开始时协调日志已经提交的旧版本。
+  uint64 expected_revision = 3;
+  // revision 是领导节点分配且必须严格递增一的候选版本。
+  uint64 revision = 4;
+  // digest 是 payload 的小写 SHA-256 摘要。
+  string digest = 5;
+  // payload 是移除节点本地身份字段后的规范化 JSON 配置；Abort 阶段可以为空。
+  bytes payload = 6;
+  // schema_version 标识规范化配置载荷契约；不兼容版本必须在落盘前拒绝。
+  uint32 schema_version = 7;
+  // transaction_timeout_ms 是发起节点配置对完整 prepare、提交和发布事务的时间预算。
+  uint64 transaction_timeout_ms = 8;
+  // force_revision 表示正文不变但代理 TLS 依赖已轮换，全部成员仍需重读本地依赖并推进版本。
+  bool force_revision = 9;
+}
+
+// ClusterConfigResponse 返回成员完成指定配置阶段后的确认信息。
+message ClusterConfigResponse {
+  // accepted 只在本地落盘、预检或发布阶段完整成功时为真。
+  bool accepted = 1;
+  // responder_node_id 是实际处理请求的静态成员编号。
+  uint64 responder_node_id = 2;
+  // revision 是本次响应确认的候选或活动配置版本。
+  uint64 revision = 3;
+  // digest 是本次响应确认的规范化配置摘要。
+  string digest = 4;
+  // error 保存不含配置正文和凭据的拒绝原因。
+  string error = 5;
+  // payload 只在 GetClusterConfig 成功时返回已经由协调状态机提交的规范化配置正文。
+  bytes payload = 6;
+  // pending_members 是响应时尚未发布该 revision 的静态成员数量。
+  uint32 pending_members = 7;
+}
+
+// PairCampaignRequest 是双节点发起新任期时交换的候选状态。
+message PairCampaignRequest {
+  // cluster_id 用于隔离不同代理集群。
+  string cluster_id = 1;
+  // sender_node_id 是候选节点的静态编号。
+  uint64 sender_node_id = 2;
+  // term 是候选节点已先行持久化的新任期。
+  uint64 term = 3;
+  // election_time_ns 是本轮候选时间，数值较小者只在双方状态一致后优先。
+  uint64 election_time_ns = 4;
+  // startup_nonce 区分同一进程编号的不同启动实例，避免旧请求覆盖新实例。
+  string startup_nonce = 5;
+  // last_sequence 是本地最后一条持久化记录的位置。
+  uint64 last_sequence = 6;
+  // last_hash 是最后一条记录的哈希，用于发现同位置内容分叉。
+  string last_hash = 7;
+  // committed_sequence 是本地最后已提交位置。
+  uint64 committed_sequence = 8;
+  // committed_hash 是已提交位置对应的哈希，用于在双方落盘位置相同但提交水位不同时安全追赶。
+  string committed_hash = 9;
+}
+
+// PairCampaignResponse 返回对端状态以及是否接受本轮候选。
+message PairCampaignResponse {
+  // accepted 表示双方日志状态一致且对端接受该任期候选。
+  bool accepted = 1;
+  // term 是对端持久化的当前任期，较大时请求方必须退位。
+  uint64 term = 2;
+  // responder_node_id 是应答节点编号。
+  uint64 responder_node_id = 3;
+  // election_time_ns 是对端在同一任期内保存的候选时间。
+  uint64 election_time_ns = 4;
+  // startup_nonce 是对端当前启动实例标识。
+  string startup_nonce = 5;
+  // last_sequence 是对端最后持久化位置。
+  uint64 last_sequence = 6;
+  // last_hash 是对端最后记录哈希。
+  string last_hash = 7;
+  // committed_sequence 是对端最后已提交位置。
+  uint64 committed_sequence = 8;
+  // reason 说明拒绝原因，便于运维判断是落后、分叉还是成员配置错误。
+  string reason = 9;
+  // winner_node_id 是对端持久化的本任期优胜候选节点，双方必须收敛到同一值。
+  uint64 winner_node_id = 10;
+  // winner_startup_nonce 是优胜候选的启动实例标识，防止旧进程恢复后冒充当前领导者。
+  string winner_startup_nonce = 11;
+  // committed_hash 是对端已提交位置对应的哈希，请求方只能在本地存在相同记录时追赶提交水位。
+  string committed_hash = 12;
+}
+
+// PairReplicateRequest 携带一条需要双节点同时落盘的业务记录。
+message PairReplicateRequest {
+  // cluster_id 用于隔离不同代理集群。
+  string cluster_id = 1;
+  // leader_node_id 标识发起复制的领导节点。
+  uint64 leader_node_id = 2;
+  // term 是生成该记录的领导任期。
+  uint64 term = 3;
+  // leader_startup_nonce 防止上一启动实例继续发送动作。
+  string leader_startup_nonce = 4;
+  // sequence 是严格连续的记录位置。
+  uint64 sequence = 5;
+  // previous_hash 连接上一条记录，形成可校验的哈希链。
+  string previous_hash = 6;
+  // record_hash 是本条记录的确定性哈希。
+  string record_hash = 7;
+  // payload 是协调业务命令的 JSON 字节。
+  bytes payload = 8;
+}
+
+// PairReplicateResponse 表示复制记录是否已经在对端稳定落盘。
+message PairReplicateResponse {
+  // persisted 仅在文件落盘并同步成功后为真。
+  bool persisted = 1;
+  // term 是对端当前任期。
+  uint64 term = 2;
+  // last_sequence 是对端最后持久化位置。
+  uint64 last_sequence = 3;
+  // last_hash 是对端最后记录哈希。
+  string last_hash = 4;
+  // reason 说明拒绝或落盘失败原因。
+  string reason = 5;
+}
+
+// PairCommitRequest 推进双方共同确认的提交位置。
+message PairCommitRequest {
+  // cluster_id 用于隔离不同代理集群。
+  string cluster_id = 1;
+  // leader_node_id 标识提交发起者。
+  uint64 leader_node_id = 2;
+  // term 是本次提交所属领导任期。
+  uint64 term = 3;
+  // leader_startup_nonce 标识领导者当前启动实例。
+  string leader_startup_nonce = 4;
+  // sequence 是需要提交的记录位置。
+  uint64 sequence = 5;
+  // record_hash 必须与该位置已持久化记录一致。
+  string record_hash = 6;
+}
+
+// PairCommitResponse 返回对端提交进度。
+message PairCommitResponse {
+  // committed 表示对端已经持久化新的提交位置并应用状态机。
+  bool committed = 1;
+  // term 是对端当前任期。
+  uint64 term = 2;
+  // committed_sequence 是对端最新提交位置。
+  uint64 committed_sequence = 3;
+  // reason 说明拒绝或应用失败原因。
+  string reason = 4;
+}
+
+// PairHeartbeatRequest 是双节点领导者定期发送的权威状态摘要。
+message PairHeartbeatRequest {
+  // cluster_id 用于隔离不同代理集群。
+  string cluster_id = 1;
+  // leader_node_id 是当前领导节点编号。
+  uint64 leader_node_id = 2;
+  // term 是领导者当前任期。
+  uint64 term = 3;
+  // leader_startup_nonce 标识领导者当前启动实例。
+  string leader_startup_nonce = 4;
+  // committed_sequence 是领导者最后提交位置。
+  uint64 committed_sequence = 5;
+  // committed_hash 是提交位置对应的哈希。
+  string committed_hash = 6;
+}
+
+// PairHeartbeatResponse 返回跟随者是否仍承认该领导者。
+message PairHeartbeatResponse {
+  // accepted 表示任期、实例和日志摘要均通过校验。
+  bool accepted = 1;
+  // term 是跟随者当前任期，较大时领导者必须立即退位。
+  uint64 term = 2;
+  // committed_sequence 是跟随者最后提交位置。
+  uint64 committed_sequence = 3;
+  // reason 说明心跳被拒绝的原因。
+  string reason = 4;
+}

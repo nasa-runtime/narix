@@ -1,0 +1,11 @@
+target/
+.DS_Store
+.idea/
+.env
+.env.*
+*.log
+*.tmp
+target-*/
+tests/
+scripts/
+**/__pycache__/
