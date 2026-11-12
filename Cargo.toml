@@ -31,6 +31,7 @@ include = [
     "/command-matrix.md",
     "/command-matrix.en.md",
     "/dashboards/**/*.json",
+    "/dashboards/**/*.yml",
     "/docs/**/*.md",
     "/docs/**/*.yml",
     "/docker/Dockerfile",
