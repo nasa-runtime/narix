@@ -1,3 +1,5 @@
+use crate::infrastructure::lifecycle::{TaskScope, TaskSpawner};
+use crate::infrastructure::time::duration_micros as duration_micros_u64;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -5,9 +7,10 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use bytes::Bytes;
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::admin::ProxyMetrics;
+use crate::backend::BackendProfile;
 use crate::cluster::backend::{
     BackendConnectOptions, BackendConnection, BackendRawResponses, BackendTlsConfig,
 };
@@ -23,6 +26,8 @@ pub struct PipelineBackendPool {
     queue_size: usize,
     submit_timeout_ms: u64,
     idle_timeout: Option<Duration>,
+    tasks: TaskSpawner,
+    owned_tasks: Option<TaskScope>,
 }
 
 /// 业务作用: 记录一次连接池请求的排队、建连、写入和读取耗时。
@@ -41,8 +46,9 @@ pub struct PipelinePoolProfile {
 #[derive(Debug)]
 // 表示 BackendConnectionFactory 的数据结构，用于创建 pipeline pool 的后端连接。
 struct BackendConnectionFactory {
+    profile: BackendProfile,
     username: Option<String>,
-    password: Option<String>,
+    password: Option<crate::infrastructure::credentials::SecretText>,
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
     tcp_keepalive_ms: u64,
@@ -99,10 +105,26 @@ impl PipelineBackendPool {
     /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
     /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
     ///
+    /// 返回: 由池自身持有后台任务作用域的节点池集合，释放池时同步撤销周期任务。
     pub fn new(item: &ProxyItem, metrics: ProxyMetrics) -> Self {
+        let scope = TaskScope::default();
+        let mut pool = Self::with_tasks(item, metrics, scope.spawner());
+        pool.owned_tasks = Some(scope);
+        pool
+    }
+
+    /// 业务作用: 将节点池的周期回收任务绑定到代理运行代，由该代在连接排空后统一等待。
+    /// 参数说明:
+    /// - `item`: 后端连接、认证和池容量配置。
+    /// - `metrics`: 当前代理共享计数单元。
+    /// - `tasks`: 运行代持有的弱任务入口，不参与命令转发。
+    ///
+    /// 返回: 尚未建连的池集合；后台任务只在节点池首次建立时登记。
+    pub(crate) fn with_tasks(item: &ProxyItem, metrics: ProxyMetrics, tasks: TaskSpawner) -> Self {
         let (username, password) = backend_credentials(item);
         Self {
             factory: Arc::new(BackendConnectionFactory {
+                profile: item.backend_profile,
                 username,
                 password,
                 connect_timeout_ms: item.connect_timeout_ms,
@@ -117,6 +139,8 @@ impl PipelineBackendPool {
             queue_size: item.pipeline_backend_queue_size,
             submit_timeout_ms: item.pipeline_backend_submit_timeout_ms,
             idle_timeout: optional_idle_timeout(item.pipeline_backend_idle_timeout_ms),
+            tasks,
+            owned_tasks: None,
         }
     }
 
@@ -246,7 +270,7 @@ impl PipelineBackendPool {
 
     /// 业务作用: 初始化指定节点的 pool 状态，用于路由拓扑预热但不预创建后端连接。
     /// 参数说明:
-    /// - `nodes`: 节点集合，用于拓扑发现、候选选择、批量验证或测试环境清理。
+    /// - `nodes`: 需要预热 pool 状态的后端节点地址集合。
     ///
     // 初始化指定节点的 pool 状态，用于路由拓扑预热但不预创建后端连接。
     pub fn warmup_nodes(&self, nodes: &[String]) {
@@ -278,28 +302,29 @@ impl PipelineBackendPool {
                     self.idle_timeout,
                     self.factory.clone(),
                 ));
-                spawn_idle_reaper(&pool);
+                spawn_idle_reaper(&pool, &self.tasks);
                 pool
             })
             .clone()
     }
 }
 
-/// 业务作用: 启动节点级 idle 回收任务:持 Weak 引用,pool 被丢弃后自动退出;无 TTL 或无运行时(单元测试)则不启动。
+/// 业务作用: 在运行代的任务集合内启动节点级 idle 回收，池释放后自动结束，不反向保活池。
 /// 参数说明:
 /// - `pool`: 后端连接池句柄，用于受限获取、复用和回收连接。
+/// - `tasks`: 池所属运行代的任务创建入口。
 ///
-// 启动节点级 idle 回收任务:持 Weak 引用,pool 被丢弃后自动退出;无 TTL 或无运行时(单元测试)则不启动。
-fn spawn_idle_reaper(pool: &Arc<NodePipelinePool>) {
+/// 返回: 启用 TTL 且运行时代仍存活时登记周期任务，否则不创建后台工作。
+fn spawn_idle_reaper(pool: &Arc<NodePipelinePool>, tasks: &TaskSpawner) {
     let Some(idle_timeout) = pool.idle_timeout else {
         return;
     };
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+    let Ok(_) = tokio::runtime::Handle::try_current() else {
         return;
     };
     let weak = Arc::downgrade(pool);
     let interval = (idle_timeout / 2).clamp(Duration::from_millis(200), Duration::from_secs(10));
-    handle.spawn(async move {
+    let _ = tasks.spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
             let Some(pool) = weak.upgrade() else {
@@ -547,6 +572,7 @@ impl NodePipelinePool {
     }
 
     /// 业务作用: 借出一条连接，用于实现 idle-first、没有 idle 才按 max_active 新建、满池时有界等待。 等待使用进入本函数时起算的总预算(deadline),被唤醒后再度落空不会重置超时。
+    ///
     /// 返回: 优先返回健康 idle 连接，必要时新建；池满等待超时或建连失败时返回错误。
     // 借出一条连接，用于实现 idle-first、没有 idle 才按 max_active 新建、满池时有界等待。
     // 等待使用进入本函数时起算的总预算(deadline),被唤醒后再度落空不会重置超时。
@@ -675,11 +701,6 @@ impl NodePipelinePool {
         let count = purged.len();
         drop(purged);
         if count > 0 {
-            debug!(
-                backend = %self.node,
-                count,
-                "cluster pipeline backend pool reaped expired idle connections"
-            );
             for _ in 0..count {
                 self.notify.notify_one();
             }
@@ -744,13 +765,7 @@ async fn connect_with_retry(
     for attempt in 1..=CONNECT_ATTEMPTS {
         match factory.connect(node, protocol_version).await {
             Ok(conn) => return Ok(conn),
-            Err(err) if attempt < CONNECT_ATTEMPTS => {
-                debug!(
-                    backend = %node,
-                    attempt,
-                    error = %err,
-                    "cluster pipeline backend pool connect failed, retrying"
-                );
+            Err(_) if attempt < CONNECT_ATTEMPTS => {
                 tokio::time::sleep(Duration::from_millis((attempt * 20) as u64)).await;
             }
             Err(err) => return Err(err),
@@ -784,6 +799,7 @@ impl BackendConnectionFactory {
             tls: self.tls.as_ref(),
         })
         .await?;
+        conn.prepare_command_compatibility(self.profile).await?;
         if let Some(protocol_version) = protocol_version {
             conn.set_protocol_version(protocol_version).await?;
         }
@@ -830,20 +846,17 @@ fn pool_key(node: &str, protocol_version: Option<u8>) -> String {
     }
 }
 
-/// 业务作用: 把连接池阶段耗时饱和转换为 u64 微秒指标。
-/// 参数说明:
-/// - `duration`: 时间跨度，用于统计窗口、等待上限或吞吐计算。
-///
-fn duration_micros_u64(duration: Duration) -> u64 {
-    duration.as_micros().min(u128::from(u64::MAX)) as u64
-}
-
 /// 业务作用: 生成后端认证配置，用于确保 pass-through 模式不会被 mux/pool 连接提前认证。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 ///
 // 生成后端认证配置，用于确保 pass-through 模式不会被 mux/pool 连接提前认证。
-fn backend_credentials(item: &ProxyItem) -> (Option<String>, Option<String>) {
+fn backend_credentials(
+    item: &ProxyItem,
+) -> (
+    Option<String>,
+    Option<crate::infrastructure::credentials::SecretText>,
+) {
     if item.effective_auth_mode() == AuthMode::PassThrough {
         (None, None)
     } else {

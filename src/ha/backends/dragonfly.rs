@@ -1,4 +1,5 @@
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::infrastructure::time::display_millis as now_ms;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use tracing::info;
@@ -776,13 +777,16 @@ fn parse_role(info: &str) -> HaRole {
 
 /// 业务作用: 从 Dragonfly 复制信息计算秒级候选门禁值。
 ///
-/// Dragonfly 的 `master_last_io_seconds_ago` 是秒级链路心跳年龄，不是字节偏移差；
-/// 正常链路会在 0 和 1 之间跳动。因此把一个秒级采样误差归零，超过一个心跳周期
-/// 的部分才作为候选门禁延迟；断链或全量同步仍使用不可选哨兵值。
+/// Dragonfly 的 `master_last_io_seconds_ago` 是秒级 I/O 年龄，不是字节偏移差；
+/// 复制流量及 ACK 周期都会影响其取值。门禁只扣除一秒采样粒度，不能假设所有
+/// 后端默认 ACK 周期都使年龄停留在 0 和 1。严格零延迟策略需要后端采用足够短的
+/// ACK 周期；断链或全量同步仍使用不可选哨兵值。
 ///
-/// 参数:
+/// 参数说明:
 /// - `info`: Dragonfly 返回的 replication 信息文本。
 /// - `role`: 已解析的节点角色。
+///
+/// 返回: 副本返回已归一的门禁值，断链或同步中返回不可选哨兵；非副本或缺少可用字段返回 `None`。
 fn parse_replica_lag_seconds(info: &str, role: HaRole) -> Option<u64> {
     if role != HaRole::Replica {
         return None;
@@ -868,13 +872,4 @@ fn native_dbfilename(value: &str) -> String {
     } else {
         safe
     }
-}
-
-/// 业务作用: 返回当前 Unix 毫秒时间，系统时间异常时返回零。
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| duration.as_millis().try_into().ok())
-        .unwrap_or(0)
 }

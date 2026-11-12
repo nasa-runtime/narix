@@ -1,5 +1,6 @@
+use crate::infrastructure::time::unix_nanos_u64 as now_unix_nanos;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use sha2::{Digest, Sha256};
@@ -161,18 +162,21 @@ impl PairCoordinator {
     }
 
     /// 业务作用: 返回当前持久化领导节点编号，供跟随者把观察和动作请求转发到唯一写入者。
+    ///
     /// 返回: 已确认领导者存在时返回节点编号，否则返回空值。
     pub fn leader_node_id(&self) -> anyhow::Result<Option<u64>> {
         Ok(self.store.pair_status()?.leader_node_id)
     }
 
     /// 业务作用: 返回双节点存储已经稳定落盘的当前任期，供动作令牌阻止同一节点跨任期复用旧批准。
+    ///
     /// 返回: 返回持久化任期；存储失败关闭时返回错误。
     pub fn current_term(&self) -> anyhow::Result<u64> {
         Ok(self.store.pair_status()?.current_term)
     }
 
     /// 业务作用: 判断本节点是否具有可提交业务命令的领导角色。
+    ///
     /// 返回: 普通领导者或已完成外部隔离的领导者返回真。
     pub async fn is_local_leader(&self) -> bool {
         matches!(
@@ -182,6 +186,7 @@ impl PairCoordinator {
     }
 
     /// 业务作用: 检查本代理的数据路由是否仍有新鲜协调权威；失去领导心跳后跟随者会在保护窗口到期时关闭路由。
+    ///
     /// 返回: 最近与对端确认仍在保护窗口内，或本节点持有外部隔离领导权时返回真。
     pub async fn route_authoritative(&self) -> bool {
         // 即使外部隔离仍有效，任期和状态机也必须来自可读的持久化镜像。一次落盘失败会把
@@ -523,6 +528,7 @@ impl PairCoordinator {
     }
 
     /// 业务作用: 发起一个已经先行持久化的新任期，与对端交换日志摘要并只确认双方相同的优胜候选。
+    ///
     /// 返回: 双方确认本节点后建立普通领导权；对端不可达且外部 fencing 成功时建立隔离领导权。
     async fn campaign(&self) -> anyhow::Result<()> {
         let election_time_ns = now_unix_nanos()?;
@@ -547,7 +553,7 @@ impl PairCoordinator {
                 .pair_campaign(request)
                 .await
                 .map(|reply| reply.into_inner()),
-            Err(error) => Err(tonic::Status::unavailable(error.to_string())),
+            Err(error) => Err(nasa::grpc::Status::unavailable(error.to_string())),
         };
         let response = match response {
             Ok(response) => response,
@@ -647,6 +653,7 @@ impl PairCoordinator {
     }
 
     /// 业务作用: 向对端发送当前任期和提交摘要，接受响应后刷新普通领导权的联系时间。
+    ///
     /// 返回: 对端接受心跳返回真，业务拒绝返回假，网络错误返回错误。
     async fn send_heartbeat(&self) -> anyhow::Result<bool> {
         let status = self.store.pair_status()?;
@@ -675,6 +682,7 @@ impl PairCoordinator {
     }
 
     /// 业务作用: 在允许单存活接管时执行外部对端隔离命令，只有成功退出才授予隔离领导权。
+    ///
     /// 返回: 命令在时限内成功退出时返回成功，超时、启动失败或非零退出均拒绝接管。
     async fn fence_peer(&self) -> anyhow::Result<()> {
         let (program, arguments) = self
@@ -716,29 +724,17 @@ impl PairCoordinator {
     }
 }
 
-/// 业务作用: 生成包含时间、进程和节点信息的启动实例标识，旧进程延迟请求无法冒充同编号新进程。
+/// 业务作用: 生成绑定节点、进程和独立随机材料的启动实例标识，隔离同编号旧进程的延迟请求。
 /// 参数说明:
 /// - `node_id`: 当前静态节点编号。
 ///
-/// 返回: 返回经过哈希压缩的实例标识；系统时间早于纪元时返回错误。
+/// 返回: 返回经过哈希压缩的实例标识；系统时间早于纪元或随机源不可用时返回错误。
 fn startup_nonce(node_id: u64) -> anyhow::Result<String> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_nanos();
-    let source = format!("{node_id}:{}:{nanos}", std::process::id());
+    let nanos = crate::infrastructure::time::unix_nanos()?;
+    // 墙钟只保留原有时间有效性边界；随机材料使同一时刻和 PID 复用不再重复启动身份。
+    let nonce = crate::infrastructure::identity::instance_nonce()?;
+    let source = format!("{node_id}:{}:{nanos}:{nonce}", std::process::id());
     Ok(hex_digest(&Sha256::digest(source.as_bytes())))
-}
-
-/// 业务作用: 读取当前纪元纳秒并收窄为协议字段，数值只参与候选全序比较而不作为租约时钟。
-/// 参数说明: 无。
-/// 返回: 返回饱和到 u64 的纪元纳秒值。
-fn now_unix_nanos() -> anyhow::Result<u64> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_nanos();
-    Ok(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
 /// 业务作用: 计算双节点日志记录哈希，把前序哈希、任期、位置、领导身份和业务内容绑定为一条不可换序链。

@@ -1,16 +1,20 @@
 # NARIX 部署
 
+[English](deployment.en.md)
+
+NARIX 支持多种 KV 后端与代理模式。其特色 Dragonfly HA 模式由数据节点负责复制与存储，NARIX 负责安全主路由、故障切换、副本收敛和持久化责任。Dragonfly 部署使用 `backend_profile: dragonfly` 与 `mode: replication-ha`；架构与拓扑见 [Dragonfly HA](../README.md#dragonfly-hanarix-的特色模式)。
+
 ## 选择数据面模式
 
 | 模式 | 入口形态 | 适用后端 |
 |---|---|---|
+| `replication-ha` | 一个业务 listener 接入一组受 NARIX 管理的主从节点 | Redis、Valkey、Dragonfly、Redict、Kvrocks、KeyDB |
 | `standalone` | 一个 NARIX listener 对应一个固定后端 | Redis、Valkey、Dragonfly、Kvrocks、Garnet、KeyDB、Redict、Pika、Tendis |
 | `sentinel` | 一个 NARIX listener 跟随 Sentinel 已提交的当前主节点 | Redis、Valkey、Redict |
 | `cluster` | 一个 NARIX listener 接入完整标准槽位 Cluster | Redis、Valkey、Kvrocks、Garnet、KeyDB、Redict、Tendis |
 | `cluster-node-proxy` | 每个真实 Cluster 节点对应一个 NARIX listener | Redis、Valkey、Kvrocks、Garnet、KeyDB、Redict、Tendis |
-| `replication-ha` | 一个业务 listener 接入一组受 NARIX 管理的主从节点 | Redis、Valkey、Dragonfly、Redict、Kvrocks、KeyDB |
 
-模式准入是产品级安全上限；正式支持范围以 [README 固定版本验证矩阵](../README.md#已验证的-kv) 为准，不能从配置可启动外推为所有版本和部署形态均已认证。
+模式准入是产品级安全上限；部署须同时满足 [README 版本与模式合同](../README.md#支持的后端与版本) 中的最低版本、原生命令与拓扑要求。配置可启动不代表后端具有所有控制能力。
 
 各模式的可复制全量配置：
 
@@ -30,7 +34,7 @@
 
 ## 进程与入口
 
-每个 `proxies[]` 配置项独立拥有连接限制、pipeline 池、DedicatedTunnel 池、队列、指标和 `read_only` 策略。不同代理项不共享这些运行时配额。
+每个 `proxies[]` 配置项独立拥有连接限制、指标和 `read_only` 策略。解析转发模式的 pipeline 池、DedicatedTunnel 池与队列也按代理项隔离；Dragonfly HA 普通读写使用一对一透明连接，不经过这些池。容量配置的适用路径见[配置参考](configuration.md#连接容量和超时)。
 
 生产通常使用外部四层入口：
 
@@ -47,7 +51,7 @@ NARIX 不内置业务 VIP。多节点部署需要 Keepalived VIP、云负载均�
 启动：
 
 ```bash
-RUST_LOG=narix=info target/release/narix --config=/etc/narix/narix.yml
+target/release/narix --config=/etc/narix/narix.yml
 ```
 
 负载均衡健康检查：
@@ -89,7 +93,7 @@ Pika/Codis 槽接口不是标准 Redis Cluster 协议，不能用这两个模式
 
 各节点只保留以下本地引导差异：节点编号、协调监听/通告地址、数据目录、协调 TLS 路径、管理监听地址，以及业务监听或节点代理公布地址中的主机部分。代理项、业务端口、后端、认证和运行策略属于集群托管层。不要在落后节点上用旧文件执行独立提交；启动门禁会优先恢复协调日志版本。
 
-配置事务协议要求全部协调成员运行相同的 NARIX 配置 schema 版本。滚动升级期间可以逐节点替换程序，但在全部成员完成升级前不要提交热更新；混合 schema 的成员会明确拒绝配置 RPC，不能静默按缺省字段继续提交。静态协调成员表本阶段不支持热更新，成员增删需要按维护窗口修改全部节点本地引导配置并重启；在实现联合成员集合迁移前，不能通过普通配置热更修改 `coordination.peers`。
+配置事务协议要求全部协调成员运行相同的 NARIX 配置 schema 版本。滚动升级期间可以逐节点替换程序，但在全部成员完成升级前不要提交热更新；混合 schema 的成员会明确拒绝配置 RPC，不能静默按缺省字段继续提交。静态协调成员表不支持热更新，成员增删需要在维护窗口统一修改节点引导配置并重启；不能通过普通配置热更修改 `coordination.peers`。
 
 ## Fencing
 
@@ -117,5 +121,5 @@ Kvrocks 不使用上述动态责任：必须设置 `ha.persistence.enabled: fals
 - 根据文件描述符、内存和后端 `maxclients` 调整连接与队列上限。
 - Prometheus 逐个抓取所有 NARIX 成员，而不是抓业务 LB。
 - 对 Cluster 执行槽迁移、`MOVED`、`ASK` 和节点故障演练。
-- 核对 replication-ha 后端部署版本与 README 支持矩阵一致（复制语义由固定版本认证保障，无需自行验证）；随后演练部署接线：主故障端到端切换与告警、`external-command` 隔离脚本、协调集群失权保护、持久化交接的落盘位置与磁盘容量；Kvrocks 改为验证各节点自身磁盘恢复。
+- 核对 replication-ha 后端部署版本、复制与持久化能力符合 README 和控制能力合同，并确认部署接线：主故障端到端切换与告警、`external-command` 隔离脚本、协调集群失权保护、持久化交接的落盘位置与磁盘容量；Kvrocks 改为验证各节点自身磁盘恢复。
 - 确认 `/ready`、`/status`、`/metrics` 和 Grafana 的节点维度均正确。

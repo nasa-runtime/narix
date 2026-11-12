@@ -1,6 +1,9 @@
 # replication-ha + Redict 7.3.6 单 NARIX 节点、软隔离自动切换的全量示例。
 # 地址、密码、端口和持久化策略都是待替换示例；生产应配置可靠 external-command fencing，多机多 NARIX 再使用跨节点协调器。
 
+# 本模式为每个前端绑定独立后端连接，以 max_connections 限制连接总量。
+# 下列通用 pipeline 池与 DedicatedTunnel 池参数不参与本模式的数据转发。
+
 reload: # 配置文件、证书依赖和显式请求的热更新策略。
   enabled: true # 是否允许文件检查、SIGHUP 和管理接口触发热更新。
   poll_interval_ms: 1000 # 检查配置来源和 TLS 依赖文件内容的周期，单位毫秒。

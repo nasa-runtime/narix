@@ -21,7 +21,7 @@ use crate::ha::protocol::{
 
 /// Redis 协议家族的 RDB/AOF 动态持久化目标配置。
 ///
-/// 配置只属于经过逐版本认证的产品适配器，通用 HA 状态机不识别 `save`、`appendonly` 或
+/// 配置只属于具有对应原生能力的产品适配器，通用 HA 状态机不识别 `save`、`appendonly` 或
 /// `appendfsync` 等产品字段。
 #[derive(Debug, Clone)]
 pub(crate) struct RedisPersistenceSettings {
@@ -75,10 +75,10 @@ impl Default for RedisPersistenceSettings {
     }
 }
 
-/// 经过逐版本认证的 Redis 协议家族托管复制 HA 适配器内核。
+/// Redis 协议家族的单主托管复制 HA 适配器内核。
 ///
-/// 当前仅允许 Redis 8.2.2、Valkey 9.1.1、Redict 7.3.6 与 KeyDB 6.3.4 构造该类型。
-/// 它们共享已经实测一致的角色探测、`FAILOVER TO`、`REPLICAOF` 和 RDB/AOF 命令，
+/// 当前仅允许 Redis、Valkey、Redict 与 KeyDB 的封闭产品驱动构造该类型。
+/// 它们依赖一致的角色探测、`FAILOVER TO`、`REPLICAOF` 和 RDB/AOF 命令语义，
 /// 但仍由封闭驱动保留独立产品身份。
 #[derive(Debug, Clone)]
 pub(crate) struct RedisHaBackend {
@@ -498,6 +498,36 @@ impl RedisHaBackend {
         }
     }
 
+    /// 业务作用: 在角色变更前将节点的复制认证绑定到当前运行代，确保新建复制连接使用已提交身份。
+    ///
+    /// 参数说明:
+    /// - `node`: 即将承担副本职责、需要更新复制认证的节点。
+    /// - `authority`: 控制本次复制配置写入的有效动作权威。
+    ///
+    /// 返回: 两项配置均与当前身份一致且写后复验成功时完成；失权、认证或配置失败时停止，错误不包含凭据。
+    async fn reconcile_replication_credentials(
+        &self,
+        node: &HaNode,
+        authority: &dyn HaActionAuthority,
+    ) -> anyhow::Result<()> {
+        self.reconcile_config_value(
+            node,
+            "masteruser",
+            self.control.username().unwrap_or_default(),
+            authority,
+        )
+        .await
+        .with_context(|| format!("set `{}` masteruser", node.client_addr))?;
+        self.reconcile_config_value(
+            node,
+            "masterauth",
+            self.control.password().unwrap_or_default(),
+            authority,
+        )
+        .await
+        .with_context(|| format!("set `{}` masterauth", node.client_addr))
+    }
+
     /// 业务作用: 判断运行时配置是否等于 Redis owner 的 RDB/AOF 目标。
     ///
     /// 参数:
@@ -532,9 +562,12 @@ impl ReplicationHaBackend for RedisHaBackend {
 
     /// 业务作用: 使用 Redis 原生 `FAILOVER TO` 执行有旧主参与的计划切换。
     ///
-    /// 参数:
+    /// 参数说明:
     /// - `current_primary`: 当前健康且可协调切换的 Redis 主节点。
     /// - `candidate`: 要接管写流量的 Redis 副本。
+    /// - `authority`: 覆盖复制凭据写入、原生切换和角色复验的动作权威。
+    ///
+    /// 返回: 候选成为主节点且旧主使用当前复制身份跟随时成功；任一步失败停止后续动作。
     async fn planned_switchover(
         &self,
         current_primary: &HaNode,
@@ -542,6 +575,10 @@ impl ReplicationHaBackend for RedisHaBackend {
         authority: &dyn HaActionAuthority,
     ) -> anyhow::Result<()> {
         self.verify_failover_target_announced(current_primary, candidate)
+            .await?;
+        // 原生 FAILOVER 会自行把旧主改成副本，不经过 configure_replica。必须先准备其
+        // 复制身份，否则密码轮换后角色虽已切换，旧主重连仍会使用已撤销的凭据。
+        self.reconcile_replication_credentials(current_primary, authority)
             .await?;
         let (host, port) = split_host_port(&candidate.replication_addr)?;
         let timeout_ms = self.role_transition_timeout().as_millis().to_string();
@@ -606,31 +643,21 @@ impl ReplicationHaBackend for RedisHaBackend {
 
     /// 业务作用: 写入复制凭据并使用 `REPLICAOF` 把节点收敛为副本。
     ///
-    /// 参数:
+    /// 参数说明:
     /// - `node`: 要改为副本的 Redis 节点。
     /// - `primary`: 该节点必须跟随的 Redis 主节点。
+    /// - `authority`: 覆盖复制身份配置与副本指派的有效动作权威。
+    ///
+    /// 返回: 当前复制身份配置完成且原生 REPLICAOF 接受指派时成功；失败不继续指派。
     async fn configure_replica(
         &self,
         node: &HaNode,
         primary: &HaNode,
         authority: &dyn HaActionAuthority,
     ) -> anyhow::Result<()> {
-        self.reconcile_config_value(
-            node,
-            "masteruser",
-            self.control.username().unwrap_or_default(),
-            authority,
-        )
-        .await
-        .with_context(|| format!("set `{}` masteruser", node.client_addr))?;
-        self.reconcile_config_value(
-            node,
-            "masterauth",
-            self.control.password().unwrap_or_default(),
-            authority,
-        )
-        .await
-        .with_context(|| format!("set `{}` masterauth", node.client_addr))?;
+        // 复制握手必须使用当前运行代材料，身份准备失败时不能留下已指派但无法认证的副本。
+        self.reconcile_replication_credentials(node, authority)
+            .await?;
         let (host, port) = split_host_port(&primary.replication_addr)?;
         authority
             .ensure_active("before Redis-family REPLICAOF")

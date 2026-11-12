@@ -237,6 +237,7 @@ impl CoordinatorLogStore {
     }
 
     /// 业务作用: 获取持久化镜像互斥区，并把锁中毒转换成明确错误而不是继续使用可能不完整的内存状态。
+    ///
     /// 返回: 返回镜像保护对象；先前持锁代码异常退出时返回错误。
     fn lock_image(&self) -> anyhow::Result<MutexGuard<'_, PersistedStoreImage>> {
         if self.core.failed.load(Ordering::Acquire) {
@@ -281,6 +282,7 @@ fn acquire_directory_lock(data_dir: &Path) -> anyhow::Result<File> {
 
 impl CoordinatorStateMachineStore {
     /// 业务作用: 返回最近已经由复制协议提交并持久化的业务状态副本，供路由保护和管理面读取。
+    ///
     /// 返回: 返回克隆后的协调状态；先前发生持久化错误或锁异常时返回错误，调用方必须保持失败关闭。
     pub fn read_state(&self) -> anyhow::Result<CoordinationState> {
         // 只读路径同样必须经过 failed 门禁。否则写入在重命名或目录同步阶段失败后，
@@ -318,6 +320,7 @@ impl CoordinatorStateMachineStore {
     }
 
     /// 业务作用: 获取状态机共享镜像的互斥保护对象。
+    ///
     /// 返回: 返回镜像保护对象；锁异常时返回错误。
     fn lock_image(&self) -> anyhow::Result<MutexGuard<'_, PersistedStoreImage>> {
         if self.core.failed.load(Ordering::Acquire) {
@@ -330,6 +333,7 @@ impl CoordinatorStateMachineStore {
     }
 
     /// 业务作用: 读取双节点协议最后持久化的任期、候选、领导者和日志水位摘要。
+    ///
     /// 返回: 返回可跨异步边界传递的状态副本。
     pub fn pair_status(&self) -> anyhow::Result<PairStorageStatus> {
         let image = self.lock_image()?;
@@ -390,7 +394,7 @@ impl CoordinatorStateMachineStore {
         Ok(pair_status_from_image(&image))
     }
 
-    /// 业务作用: 在竞选响应证明对端提交水位更高时应用本地已经存在的同哈希记录，修复“双方均已落盘但一侧未收到提交通知”的崩溃窗口。
+    /// 业务作用: 在竞选响应证明对端提交水位更高时应用本地已经存在的同哈希记录，使“双方均已落盘但一侧未收到提交通知”的崩溃状态恢复一致。
     /// 参数说明:
     /// - `sequence`: 对端已经提交的位置。
     /// - `record_hash`: 对端已提交位置的哈希。
@@ -987,6 +991,7 @@ impl RaftLogStorage<CoordinatorTypeConfig> for CoordinatorLogStore {
     type LogReader = Self;
 
     /// 业务作用: 返回最后清理位置和最后现存日志位置，供共识核心恢复日志边界。
+    ///
     /// 返回: 返回满足 `last_purged <= last_log` 的日志状态。
     async fn get_log_state(
         &mut self,
@@ -1006,6 +1011,7 @@ impl RaftLogStorage<CoordinatorTypeConfig> for CoordinatorLogStore {
     }
 
     /// 业务作用: 创建一个共享同一持久化核心的日志读取句柄。
+    ///
     /// 返回: 返回可供独立复制任务使用的读取句柄。
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
@@ -1028,6 +1034,7 @@ impl RaftLogStorage<CoordinatorTypeConfig> for CoordinatorLogStore {
     }
 
     /// 业务作用: 读取最后同步落盘的投票状态，供节点恢复任期和投票约束。
+    ///
     /// 返回: 返回最后投票；从未投票时返回空值。
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         let image = self
@@ -1056,6 +1063,7 @@ impl RaftLogStorage<CoordinatorTypeConfig> for CoordinatorLogStore {
     }
 
     /// 业务作用: 读取最后持久化的提交位置。
+    ///
     /// 返回: 返回最后提交位置；尚无提交时返回空值。
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
         let image = self
@@ -1156,6 +1164,7 @@ impl RaftLogStorage<CoordinatorTypeConfig> for CoordinatorLogStore {
 
 impl RaftSnapshotBuilder<CoordinatorTypeConfig> for CoordinatorStateMachineStore {
     /// 业务作用: 从同一互斥时刻复制已提交状态并生成快照，避免元数据与业务内容来自不同日志位置。
+    ///
     /// 返回: 返回可传输快照，并在返回前把它同步保存为当前快照。
     async fn build_snapshot(
         &mut self,
@@ -1199,6 +1208,7 @@ impl RaftStateMachine<CoordinatorTypeConfig> for CoordinatorStateMachineStore {
     type SnapshotBuilder = Self;
 
     /// 业务作用: 返回状态机最后应用位置与成员关系，供启动恢复校验日志和快照边界。
+    ///
     /// 返回: 返回状态机应用进度和最后成员配置。
     async fn applied_state(
         &mut self,
@@ -1248,12 +1258,14 @@ impl RaftStateMachine<CoordinatorTypeConfig> for CoordinatorStateMachineStore {
     }
 
     /// 业务作用: 创建快照构建句柄；克隆后仍共享同一持久化核心，因此快照元数据与状态不会分叉。
+    ///
     /// 返回: 返回快照构建句柄。
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
     }
 
     /// 业务作用: 为接收远端快照创建空的内存游标，共识核心会在安装前完整写入快照字节。
+    ///
     /// 返回: 返回可异步读写和定位的空快照缓冲区。
     async fn begin_receiving_snapshot(
         &mut self,
@@ -1296,6 +1308,7 @@ impl RaftStateMachine<CoordinatorTypeConfig> for CoordinatorStateMachineStore {
     }
 
     /// 业务作用: 返回当前持久化快照的独立读取游标，供落后节点安装。
+    ///
     /// 返回: 存在快照时返回其元数据和字节副本，否则返回空值。
     async fn get_current_snapshot(
         &mut self,
@@ -1418,7 +1431,7 @@ fn persist_image(path: &Path, image: &PersistedStoreImage) -> anyhow::Result<()>
 /// 业务作用: 把协调目录或状态文件权限收紧到仅进程所属用户可访问。
 ///
 /// 参数说明:
-/// - `path`: 已经创建且需要修复权限的目录或文件。
+/// - `path`: 已经创建且需要收紧权限的目录或文件。
 /// - `mode`: Unix 权限位，目录使用 `0700`，状态和锁文件使用 `0600`。
 ///
 /// 返回: 权限修改成功时返回空结果；无法收紧权限时拒绝继续启动或提交。

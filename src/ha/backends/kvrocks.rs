@@ -14,7 +14,7 @@ use crate::ha::persistence::{
 };
 use crate::ha::protocol::{
     ensure_ok, parse_bulk_string, parse_config_get_value, parse_info_string, parse_info_u64,
-    parse_replica_master_addr,
+    parse_integer_response, parse_replica_master_addr,
 };
 
 /// Kvrocks 计划切换期间角色与复制状态的轮询间隔。
@@ -23,7 +23,7 @@ use crate::ha::protocol::{
 /// 本地角色变化额外量化到 50 毫秒，同时不会在业务数据面引入轮询。
 const TRANSITION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Kvrocks 2.16.0 的主从切换适配器。
+/// Kvrocks 的主从切换适配器，要求原生支持 `CLIENT PAUSE WRITE`。
 ///
 /// Kvrocks 使用 RocksDB 作为每个节点的持久化存储。NARIX 只编排 `SLAVEOF` 主从关系，
 /// 不关闭任何节点的持久化，也不把节点划分成热备和快照 owner。
@@ -340,11 +340,47 @@ impl KvrocksHaBackend {
             .await
     }
 
+    /// 业务作用: 在候选已成为主节点后，结束旧主的出站复制关系，使旧主可以反向跟随新主。
+    ///
+    /// 参数说明:
+    /// - `current_primary`: 业务写入仍被暂停、即将降级的 Kvrocks 旧主。
+    /// - `authority`: 每次外部动作前必须复验的切换控制权威。
+    ///
+    /// 返回: 原生确认关闭复制连接后成功；失权、通信失败或响应不合法时停止后续降级。
+    async fn detach_primary_replicas(
+        &self,
+        current_primary: &HaNode,
+        authority: &dyn HaActionAuthority,
+    ) -> anyhow::Result<()> {
+        // 候选提升不会同步移除旧主中的复制线程；保留该记录会触发原生防复制环拒绝。
+        // 此时数据已经追平且旧主仍禁止写入，关闭旧复制链后由新拓扑重新分配其余副本。
+        authority
+            .ensure_active("before closing Kvrocks old-primary replication links")
+            .await?;
+        let frame = self
+            .control
+            .send_command(
+                current_primary,
+                &[
+                    b"CLIENT".as_slice(),
+                    b"KILL".as_slice(),
+                    b"TYPE".as_slice(),
+                    b"replica".as_slice(),
+                ],
+            )
+            .await?;
+        parse_integer_response(&frame, "Kvrocks CLIENT KILL TYPE replica")?;
+        Ok(())
+    }
+
     /// 业务作用: 执行已经进入写暂停窗口的 Kvrocks 主从切换。
     ///
-    /// 参数:
+    /// 参数说明:
     /// - `current_primary`: 已暂停业务写入的旧主节点。
     /// - `candidate`: 已选定的新主候选节点。
+    /// - `authority`: 覆盖追平、提升、断开旧复制链及角色校验的切换控制权威。
+    ///
+    /// 返回: 新主和旧主的反向复制关系完成验证后成功；任一步失败交由调用方恢复拓扑。
     async fn execute_paused_switchover(
         &self,
         current_primary: &HaNode,
@@ -353,7 +389,10 @@ impl KvrocksHaBackend {
     ) -> anyhow::Result<()> {
         self.wait_candidate_caught_up(current_primary, candidate, authority)
             .await?;
+        // 必须先确认候选完整追平并已提升，才可断开旧复制链；旧主降级完成前保持写暂停。
         self.promote_candidate(candidate, authority).await?;
+        self.detach_primary_replicas(current_primary, authority)
+            .await?;
         self.configure_replica(current_primary, candidate, authority)
             .await?;
         self.verify_replication(current_primary, candidate, authority)

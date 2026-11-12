@@ -1,6 +1,25 @@
 # NARIX 内置最小安全配置。
-# 业务代理项必须通过 --config、NARIX_CONFIG、profile 文件或 NARIX_ 环境变量提供。
+# 业务代理项必须通过 --config、APP_CONFIG_FILE、NARIX_CONFIG、profile 文件或 NARIX_ 环境变量提供。
 # 所有字段、默认值、约束和各模式全量示例见 docs/configuration.md。
+
+application:
+  # 应用名称用于默认日志目录，进程按服务模式运行。
+  name: narix
+
+log:
+  # 整段支持热更新：文件稳定变化、SIGHUP 或管理接口触发；候选无效时保留当前输出。
+  # 默认保留 WARN、ERROR 及 narix 的关键 INFO；RUST_LOG 显式设置时优先。
+  # 需要通过 YAML 热更级别时，不要设置 RUST_LOG 或 NARIX_LOG_LEVEL 覆盖它。
+  level: ${NARIX_LOG_LEVEL:warn,narix=info}
+  # 目录必须可写；NARIX_LOG_PATH 显式为空时只输出控制台。
+  path: ${NARIX_LOG_PATH:/usr/local/logs/${application.name}}
+  # 单文件大小、归档总容量及保留天数；同名环境变量覆盖期间，修改 YAML 不改变有效值。
+  max_file_size: 100MB
+  total_size_cap: 1GB
+  max_history_days: 7
+  clean_history_on_start: true
+  split_error_file: true
+  color: false
 
 admin: # 管理端 HTTP 服务配置。
   enabled: true # 启用健康、就绪、状态、指标和配置热更新接口。
@@ -10,6 +29,7 @@ admin: # 管理端 HTTP 服务配置。
 
 reload: # 配置热更新的最小运维配置。
   enabled: true # 启用文件检查、SIGHUP 和管理接口热更新。
+  poll_interval_ms: 1000 # 配置文件及 TLS 依赖内容的检查周期，单位毫秒，默认 1 秒。
 
 coordination: # 集群配置恢复需要保留的本机 TLS 引导字段。
   tls: # 默认关闭协调通道 TLS，跨机器协调时由节点外部配置完整覆盖。

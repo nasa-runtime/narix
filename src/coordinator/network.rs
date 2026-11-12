@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use nasa::grpc::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -15,11 +16,10 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 use super::wire::coordinator_rpc_client::CoordinatorRpcClient;
 use super::wire::RpcEnvelope;
-use super::{wire_cluster_id, CoordinatorTypeConfig, MAX_COORDINATION_GRPC_MESSAGE_BYTES};
+use super::{wire_cluster_id, CoordinatorTypeConfig};
 use crate::config::ProxyClusterCoordinationConfig;
 
 /// 业务作用: 为共识网络错误固定节点和远端错误类型，确保不可达、传输失败和远端协议拒绝得到不同处理。
@@ -34,15 +34,6 @@ struct PeerTransport {
     server_name: Option<String>,
 }
 
-/// 业务作用: 保存客户端双向 TLS 所需的原始证书材料，每次创建端点时据此构造独立连接配置。
-/// 字段说明: 只在进程启动时读取文件，运行期间证书内容不会因路径文件被替换而半更新。
-#[derive(Debug, Clone)]
-struct ClientTlsMaterials {
-    certificate: Vec<u8>,
-    private_key: Vec<u8>,
-    ca_certificate: Vec<u8>,
-}
-
 /// 业务作用: 创建并缓存节点间 gRPC 通道，为共识核心提供按静态节点编号寻址的网络工厂。
 /// 字段说明: 通道可以安全克隆并由传输层自动重连，缓存避免每次心跳重复进行握手。
 #[derive(Debug, Clone)]
@@ -50,8 +41,9 @@ pub struct CoordinatorNetworkFactory {
     cluster_id: Arc<str>,
     local_node_id: u64,
     rpc_timeout: Duration,
+    max_message_bytes: usize,
     peers: Arc<BTreeMap<u64, PeerTransport>>,
-    tls: Option<Arc<ClientTlsMaterials>>,
+    tls: Option<crate::config::ProxyClusterTlsConfig>,
     channels: Arc<RwLock<BTreeMap<u64, Channel>>>,
 }
 
@@ -96,9 +88,7 @@ impl CoordinatorNetworkFactory {
             .certificate_path
             .as_deref()
             .context("coordination TLS certificate path is missing")?;
-        let certificate_pem = std::fs::read(certificate_path)
-            .with_context(|| format!("read coordination TLS certificate `{certificate_path}`"))?;
-        let mut reader = certificate_pem.as_slice();
+        let mut reader = config.tls.materials.file(certificate_path)?;
         let certificate = rustls_pemfile::certs(&mut reader)
             .next()
             .transpose()
@@ -141,40 +131,12 @@ impl CoordinatorNetworkFactory {
                 )
             })
             .collect();
-        let tls = if config.tls.enabled {
-            let certificate_path = config
-                .tls
-                .certificate_path
-                .as_deref()
-                .context("coordination TLS certificate path is missing")?;
-            let private_key_path = config
-                .tls
-                .private_key_path
-                .as_deref()
-                .context("coordination TLS private key path is missing")?;
-            let client_ca_path = config
-                .tls
-                .client_ca_path
-                .as_deref()
-                .context("coordination TLS client CA path is missing")?;
-            Some(Arc::new(ClientTlsMaterials {
-                certificate: std::fs::read(certificate_path).with_context(|| {
-                    format!("read coordination TLS certificate `{certificate_path}`")
-                })?,
-                private_key: std::fs::read(private_key_path).with_context(|| {
-                    format!("read coordination TLS private key `{private_key_path}`")
-                })?,
-                ca_certificate: std::fs::read(client_ca_path).with_context(|| {
-                    format!("read coordination TLS client CA `{client_ca_path}`")
-                })?,
-            }))
-        } else {
-            None
-        };
+        let tls = config.tls.enabled.then(|| config.tls.clone());
         Ok(Self {
             cluster_id: Arc::from(wire_cluster_id(config)),
             local_node_id: config.node_id,
             rpc_timeout: Duration::from_millis(config.rpc_timeout_ms),
+            max_message_bytes: config.grpc.max_message_bytes,
             peers: Arc::new(peers),
             tls,
             channels: Arc::new(RwLock::new(BTreeMap::new())),
@@ -205,10 +167,27 @@ impl CoordinatorNetworkFactory {
                 format!("coordination peer `{target_node_id}` has no TLS server name")
             })?;
             let tls = ClientTlsConfig::new()
-                .ca_certificate(Certificate::from_pem(materials.ca_certificate.clone()))
+                .ca_certificate(Certificate::from_pem(
+                    materials.materials.file(
+                        materials
+                            .client_ca_path
+                            .as_deref()
+                            .context("coordination CA path is missing")?,
+                    )?,
+                ))
                 .identity(Identity::from_pem(
-                    materials.certificate.clone(),
-                    materials.private_key.clone(),
+                    materials.materials.file(
+                        materials
+                            .certificate_path
+                            .as_deref()
+                            .context("coordination certificate path is missing")?,
+                    )?,
+                    materials.materials.file(
+                        materials
+                            .private_key_path
+                            .as_deref()
+                            .context("coordination key path is missing")?,
+                    )?,
                 ))
                 .domain_name(server_name.to_string());
             endpoint = endpoint.tls_config(tls).with_context(|| {
@@ -235,9 +214,10 @@ impl CoordinatorNetworkFactory {
         &self,
         target_node_id: u64,
     ) -> anyhow::Result<CoordinatorRpcClient<Channel>> {
-        Ok(configure_client(CoordinatorRpcClient::new(
-            self.channel(target_node_id).await?,
-        )))
+        Ok(configure_client(
+            CoordinatorRpcClient::new(self.channel(target_node_id).await?),
+            self.max_message_bytes,
+        ))
     }
 
     /// 业务作用: 为可能包含磁盘同步和后端预检的配置事务创建不使用普通心跳超时的独立客户端。
@@ -266,10 +246,27 @@ impl CoordinatorNetworkFactory {
             endpoint = endpoint
                 .tls_config(
                     ClientTlsConfig::new()
-                        .ca_certificate(Certificate::from_pem(materials.ca_certificate.clone()))
+                        .ca_certificate(Certificate::from_pem(
+                            materials.materials.file(
+                                materials
+                                    .client_ca_path
+                                    .as_deref()
+                                    .context("coordination CA path is missing")?,
+                            )?,
+                        ))
                         .identity(Identity::from_pem(
-                            materials.certificate.clone(),
-                            materials.private_key.clone(),
+                            materials.materials.file(
+                                materials
+                                    .certificate_path
+                                    .as_deref()
+                                    .context("coordination certificate path is missing")?,
+                            )?,
+                            materials.materials.file(
+                                materials
+                                    .private_key_path
+                                    .as_deref()
+                                    .context("coordination key path is missing")?,
+                            )?,
                         ))
                         .domain_name(server_name.to_string()),
                 )
@@ -281,7 +278,10 @@ impl CoordinatorNetworkFactory {
             .connect()
             .await
             .with_context(|| format!("connect coordination peer `{target_node_id}`"))?;
-        Ok(configure_client(CoordinatorRpcClient::new(channel)))
+        Ok(configure_client(
+            CoordinatorRpcClient::new(channel),
+            self.max_message_bytes,
+        ))
     }
 
     /// 业务作用: 将一个共识请求编码进集群隔离信封，调用对应 gRPC 方法，再还原远端业务结果。
@@ -308,7 +308,8 @@ impl CoordinatorNetworkFactory {
             let source = std::io::Error::other(error.to_string());
             RPCError::Unreachable(Unreachable::new(&source))
         })?;
-        let mut client = configure_client(CoordinatorRpcClient::new(channel));
+        let mut client =
+            configure_client(CoordinatorRpcClient::new(channel), self.max_message_bytes);
         let envelope = RpcEnvelope {
             cluster_id: self.cluster_id.to_string(),
             sender_node_id: self.local_node_id,
@@ -347,12 +348,16 @@ impl CoordinatorNetworkFactory {
 ///
 /// 参数说明:
 /// - `client`: 已绑定目标成员 HTTP/2 通道的生成客户端。
+/// - `max_message_bytes`: 启动时已校验的单消息编解码预算。
 ///
 /// 返回: 编码与解码上限一致的协调客户端。
-fn configure_client(client: CoordinatorRpcClient<Channel>) -> CoordinatorRpcClient<Channel> {
+fn configure_client(
+    client: CoordinatorRpcClient<Channel>,
+    max_message_bytes: usize,
+) -> CoordinatorRpcClient<Channel> {
     client
-        .max_decoding_message_size(MAX_COORDINATION_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_COORDINATION_GRPC_MESSAGE_BYTES)
+        .max_decoding_message_size(max_message_bytes)
+        .max_encoding_message_size(max_message_bytes)
 }
 
 impl RaftNetworkFactory<CoordinatorTypeConfig> for CoordinatorNetworkFactory {

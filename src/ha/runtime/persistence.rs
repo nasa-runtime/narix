@@ -1,5 +1,5 @@
 impl ReplicationHaRuntime {
-/// 业务作用: 收敛 replication-ha 动态持久化拓扑，确保单节点 master 或多节点 replica 的 snapshot owner、热备和非 owner 配置符合当前健康节点数量。
+    /// 业务作用: 收敛 replication-ha 动态持久化拓扑，确保单节点 master 或多节点 replica 的 snapshot owner、热备和非 owner 配置符合当前健康节点数量。
     /// 参数说明:
     /// - `masters`: 本轮探测到的 master 节点列表，用于确认当前可服务 master 和 master fallback。
     /// - `replicas`: 本轮探测到的副本候选，函数会按 lag、稳定时间和跟随关系筛选。
@@ -97,57 +97,55 @@ impl ReplicationHaRuntime {
             }
         }
 
-        let (lease, mut cluster_action) =
-            if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
-                match self.acquire_cluster_persistence_action(&desired).await {
-                    Ok(action) => (None, Some(action)),
-                    Err(error) => {
-                        return self
-                            .handle_persistence_failure(format!(
+        let (lease, mut cluster_action) = if self.coordinator.mode
+            == HaCoordinatorMode::ProxyCluster
+        {
+            match self.acquire_cluster_persistence_action(&desired).await {
+                Ok(action) => (None, Some(action)),
+                Err(error) => {
+                    return self
+                        .handle_persistence_failure(format!(
                             "HA persistence handoff cannot acquire proxy-cluster action: {error}"
                         ))
-                            .await;
-                    }
+                        .await;
                 }
-            } else {
-                let lease = match self.acquire_failover_lease("persistence handoff").await {
-                    Ok(lease) => lease,
-                    Err(err) => {
-                        if self
-                            .adopt_observed_persistence_topology(&desired, masters, replicas)
-                            .await
-                        {
-                            return Ok(());
-                        }
-                        if matches!(
-                            self.coordinator_lease_held_by_other_result().await,
-                            Ok(true)
+            }
+        } else {
+            let lease = match self.acquire_failover_lease("persistence handoff").await {
+                Ok(lease) => lease,
+                Err(err) => {
+                    if self
+                        .adopt_observed_persistence_topology(&desired, masters, replicas)
+                        .await
+                    {
+                        return Ok(());
+                    }
+                    if matches!(self.coordinator_lease_is_occupied_result().await, Ok(true)) {
+                        // 其它 proxy 持锁只证明“有人正在处理”，不证明持久化已经
+                        // 收敛。已有已验证 owner 时可等待远端 handoff；冷启动尚无
+                        // 已验证 owner 时必须建立 fail-closed，不能先开放业务路由。
+                        if !previous_topology_has_verified_owner(
+                            &*self.persistence_topology.read().await,
                         ) {
-                            // 其它 proxy 持锁只证明“有人正在处理”，不证明持久化已经
-                            // 收敛。已有已验证 owner 时可等待远端 handoff；冷启动尚无
-                            // 已验证 owner 时必须建立 fail-closed，不能先开放业务路由。
-                            if !previous_topology_has_verified_owner(
-                                &*self.persistence_topology.read().await,
-                            ) {
-                                return self
+                            return self
                                     .handle_persistence_failure(format!(
                                         "HA persistence handoff is owned by another proxy and no verified owner is available locally: {err}"
                                     ))
                                     .await;
-                            }
-                            // 保留既有错误/保护原因，直到远端状态可被 adopt；否则
-                            // 本轮返回后 ensure_serving 会提前解除 fail-closed。
-                            return Ok(());
                         }
-                        return self
-                            .handle_persistence_failure(format!(
-                                "HA persistence handoff cannot acquire coordinator lease: {err}"
-                            ))
-                            .await;
+                        // 保留既有错误/保护原因，直到远端状态可被 adopt；否则
+                        // 本轮返回后 ensure_serving 会提前解除 fail-closed。
+                        return Ok(());
                     }
-                };
-                (lease, None)
+                    return self
+                        .handle_persistence_failure(format!(
+                            "HA persistence handoff cannot acquire coordinator lease: {err}"
+                        ))
+                        .await;
+                }
             };
+            (lease, None)
+        };
         self.ensure_persistence_authority(
             lease.as_ref(),
             cluster_action.as_ref(),
@@ -233,11 +231,7 @@ impl ReplicationHaRuntime {
                     match self
                         .ha
                         .backend()
-                        .force_checkpoint(
-                            &owner.node,
-                            CheckpointReason::Handoff,
-                            &authority,
-                        )
+                        .force_checkpoint(&owner.node, CheckpointReason::Handoff, &authority)
                         .await
                     {
                         Ok(token) => {
@@ -347,9 +341,7 @@ impl ReplicationHaRuntime {
             }
             if let Some(rollback_error) = rollback_failure {
                 return self
-                    .handle_persistence_failure(format!(
-                        "{error}; HA persistence {rollback_error}"
-                    ))
+                    .handle_persistence_failure(format!("{error}; HA persistence {rollback_error}"))
                     .await;
             }
             if has_previous_owner {
@@ -511,12 +503,7 @@ impl ReplicationHaRuntime {
         let mut checked = Vec::new();
         for master in masters {
             if !self
-                .persistence_non_owner_disabled(
-                    desired,
-                    master,
-                    HaRole::Master,
-                    &mut checked,
-                )
+                .persistence_non_owner_disabled(desired, master, HaRole::Master, &mut checked)
                 .await
             {
                 return false;
@@ -539,15 +526,15 @@ impl ReplicationHaRuntime {
         // handoff 期间失联，不能因为它缺席于观测集合就被当作已停用；否则新
         // owner 会先发布，旧 owner 恢复后仍继续执行快照。缓存中的 owner 是
         // 我们确知可能带有持久化职责的最小集合，必须逐个确认已停用。
-        let previous_owners = self.persistence_topology.read().await.snapshot_owners.clone();
+        let previous_owners = self
+            .persistence_topology
+            .read()
+            .await
+            .snapshot_owners
+            .clone();
         for owner in previous_owners {
             if !self
-                .persistence_non_owner_disabled(
-                    desired,
-                    &owner.node,
-                    owner.role,
-                    &mut checked,
-                )
+                .persistence_non_owner_disabled(desired, &owner.node, owner.role, &mut checked)
                 .await
             {
                 return false;
@@ -573,7 +560,11 @@ impl ReplicationHaRuntime {
         masters: &[HaNode],
         replicas: &[ReplicaCandidate],
     ) -> bool {
-        for owner in previous.snapshot_owners.iter().filter(|owner| owner.verified) {
+        for owner in previous
+            .snapshot_owners
+            .iter()
+            .filter(|owner| owner.verified)
+        {
             // 先用本轮角色视图淘汰失联或已换角色的历史 owner；副本还必须继续
             // 直连唯一主并满足延迟门禁，历史 verified 标志不参与这一事实判断。
             let current_role = if masters
@@ -746,7 +737,12 @@ impl ReplicationHaRuntime {
         // 角色发现会省略不可达节点，但上一版 owner 不能因此从停用事务中消失。
         // 对它的写若因失联失败，调用方会保持旧本地拓扑并按 fail-closed 策略
         // 保护；绝不能先发布新 owner、等旧节点恢复后再碰运气收敛。
-        let previous_owners = self.persistence_topology.read().await.snapshot_owners.clone();
+        let previous_owners = self
+            .persistence_topology
+            .read()
+            .await
+            .snapshot_owners
+            .clone();
         for owner in previous_owners {
             self.disable_non_owner_node(
                 desired,
@@ -952,8 +948,7 @@ impl ReplicationHaRuntime {
         let current = self.persistence_topology.read().await.clone();
         if matches!(
             current.kind,
-            PersistenceTopologyKind::None
-                | PersistenceTopologyKind::SingleMasterSnapshot
+            PersistenceTopologyKind::None | PersistenceTopologyKind::SingleMasterSnapshot
         ) {
             return None;
         }
@@ -1081,12 +1076,7 @@ impl ReplicationHaRuntime {
                 .as_ref()
                 .is_ok_and(|observation| observation.follows(&link.upstream));
             if !already_following {
-                self.replicate_from(
-                    &link.node,
-                    &link.upstream,
-                    lease_guard,
-                    cluster_action,
-                )
+                self.replicate_from(&link.node, &link.upstream, lease_guard, cluster_action)
                     .await
                     .with_context(|| {
                         format!(
@@ -1223,10 +1213,7 @@ impl ReplicationHaRuntime {
     /// - `reason`: 触发拓扑保护的具体原因，会写入状态接口和保护态说明。
     ///
     /// 返回: 始终进入保护态并返回错误，阻止后续逻辑重新发布主节点路由。
-    async fn handle_persistence_topology_unavailable(
-        &self,
-        reason: String,
-    ) -> anyhow::Result<()> {
+    async fn handle_persistence_topology_unavailable(&self, reason: String) -> anyhow::Result<()> {
         self.set_persistence_error(Some(reason.clone())).await;
         let same_reason =
             self.persistence_protected_reason.read().await.as_deref() == Some(reason.as_str());
@@ -1302,7 +1289,8 @@ impl ReplicationHaRuntime {
     ) -> anyhow::Result<()> {
         if let Some(lease_guard) = lease_guard {
             if let Err(err) = lease_guard.ensure_active().await {
-                let reason = format!("replication HA persistence lost coordinator lease {step}: {err}");
+                let reason =
+                    format!("replication HA persistence lost coordinator lease {step}: {err}");
                 self.handle_persistence_failure(reason.clone()).await?;
                 bail!(reason);
             }

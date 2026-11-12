@@ -2,10 +2,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::debug;
-
 use crate::admin::ProxyMetrics;
 use crate::cluster::backend::BackendConnection;
+use crate::infrastructure::lifecycle::{TaskScope, TaskSpawner};
 
 /// 单个后端的独占 tunnel 连接池。
 ///
@@ -21,6 +20,7 @@ pub struct TunnelPool {
     idle_timeout: Option<Duration>,
     /// 当前代理实例的共享指标句柄，用于累计池命中、淘汰和 idle 总量。
     metrics: ProxyMetrics,
+    owned_tasks: Mutex<Option<TaskScope>>,
 }
 
 /// 单个后端 tunnel pool 的受锁可变状态。
@@ -73,6 +73,29 @@ impl TunnelPool {
     /// 返回:
     /// - 返回可共享的池句柄。池只在特殊 tunnel 路径使用，不进入普通 pipeline 热路径。
     pub fn new(max_idle: usize, idle_timeout_ms: u64, metrics: ProxyMetrics) -> Arc<Self> {
+        let scope = TaskScope::default();
+        let pool = Self::with_tasks(max_idle, idle_timeout_ms, metrics, scope.spawner());
+        *pool
+            .owned_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(scope);
+        pool
+    }
+
+    /// 业务作用: 把后端隧道池的周期回收绑定到代理运行代，避免池释放后留下独立后台任务。
+    /// 参数说明:
+    /// - `max_idle`: 当前后端可保留的空闲连接上限。
+    /// - `idle_timeout_ms`: 空闲连接存活毫秒数；零表示禁用复用。
+    /// - `metrics`: 当前代理共享计数单元。
+    /// - `tasks`: 运行代负责关闭和等待的弱任务入口。
+    ///
+    /// 返回: 按协议隔离的连接池，周期任务由运行代统一回收。
+    pub(crate) fn with_tasks(
+        max_idle: usize,
+        idle_timeout_ms: u64,
+        metrics: ProxyMetrics,
+        tasks: TaskSpawner,
+    ) -> Arc<Self> {
         let max_idle = if idle_timeout_ms == 0 { 0 } else { max_idle };
         let idle_timeout = (max_idle > 0).then(|| Duration::from_millis(idle_timeout_ms));
         let pool = Arc::new(Self {
@@ -80,9 +103,10 @@ impl TunnelPool {
             max_idle,
             idle_timeout,
             metrics,
+            owned_tasks: Mutex::new(None),
         });
         pool.metrics.register_tunnel_pool(max_idle);
-        spawn_idle_reaper(&pool);
+        spawn_idle_reaper(&pool, &tasks);
         pool
     }
 
@@ -377,6 +401,7 @@ fn reap_queue(
 ///
 /// 参数说明:
 /// - `pool`: 当前后端专属池；后台任务只持 Weak，不阻止运行时释放池。
+/// - `tasks`: 池所属运行代的任务创建入口。
 ///
 /// 返回:
 /// - 无返回值。没有 Tokio runtime 或复用关闭时不创建任务。
@@ -384,28 +409,22 @@ fn reap_queue(
 /// 关键步骤:
 /// 1. 扫描周期取 idle 阈值一半，并限制在 200ms 到 10s，兼顾回收及时性与空转成本。
 /// 2. 每次先在短锁内移出连接，再在锁外关闭，避免 socket 析构阻塞借还路径。
-fn spawn_idle_reaper(pool: &Arc<TunnelPool>) {
+fn spawn_idle_reaper(pool: &Arc<TunnelPool>, tasks: &TaskSpawner) {
     let Some(idle_timeout) = pool.idle_timeout else {
         return;
     };
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+    let Ok(_) = tokio::runtime::Handle::try_current() else {
         return;
     };
     let weak = Arc::downgrade(pool);
     let interval = (idle_timeout / 2).clamp(Duration::from_millis(200), Duration::from_secs(10));
-    handle.spawn(async move {
+    let _ = tasks.spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
             let Some(pool) = weak.upgrade() else {
                 return;
             };
             let expired = pool.reap_expired();
-            if !expired.is_empty() {
-                debug!(
-                    count = expired.len(),
-                    "tunnel pool reaped expired idle backend connections"
-                );
-            }
             // 连接析构可能触发 socket close，必须在池锁之外执行。
             drop(expired);
         }

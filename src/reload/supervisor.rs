@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
+use crate::infrastructure::lifecycle::{TaskScope, TaskSpawner};
 use anyhow::Context;
 use futures_util::FutureExt;
+use nasa::application::ConfigPoller;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{self, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::coordinator::runtime::CoordinatorHandle;
@@ -172,7 +173,7 @@ impl Drop for ReloadTransactionLease {
     }
 }
 
-/// 管理端、信号任务和测试入口共享的配置热更新请求句柄。
+/// 管理端和信号任务共享的配置热更新请求句柄。
 #[derive(Clone)]
 pub struct ReloadHandle {
     requests: mpsc::Sender<SupervisorRequest>,
@@ -527,7 +528,7 @@ impl ConfigSupervisor {
 /// - `shutdown`: 进程级关闭信号。
 /// - `signal`: Unix SIGHUP 接收器。
 ///
-/// 返回: 收到关闭信号或全部请求发送端释放时成功退出。
+/// 返回: 收到关闭信号或全部请求发送端释放时成功退出；周期加载任务异常退出时返回失败。
 #[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     source: ConfigSource,
@@ -541,7 +542,7 @@ async fn run_supervisor(
     mut shutdown: watch::Receiver<bool>,
     mut signal: tokio::signal::unix::Signal,
 ) -> anyhow::Result<()> {
-    let mut poll = reload_interval(&current);
+    let mut poll = reload_interval(&current)?;
     let mut pending_digest: Option<String> = None;
     let mut stable_observations = 0_u32;
     let mut last_load_error: Option<String> = None;
@@ -551,11 +552,22 @@ async fn run_supervisor(
     let mut suppressed_local_digest: Option<String> = None;
     let (proposal_result_tx, mut proposal_result_rx) = mpsc::channel(2);
     let mut cluster_proposal_running = false;
+    let proposal_tasks = TaskScope::default();
 
     loop {
         tokio::select! {
             _ = poll.tick(), if current.config().reload.enabled && !cluster_proposal_running => {
-                match source.load() {
+                // 周期加载只构造候选，不持有发布权威；使用阻塞池避免移交正在处理 RESP 的工作线程。
+                // 逐次等待本轮结果，保持来源观察和候选发布的串行顺序。
+                let poll_source = source.clone();
+                let loaded = poll.read(move || poll_source.load())
+                    .await
+                    .context("configuration polling task failed")?;
+                // 文件读取期间可能收到停机；尚未发布的候选必须丢弃，不能在停机后开始新配置事务。
+                if shutdown.has_changed().is_err() || *shutdown.borrow() {
+                    break;
+                }
+                match loaded {
                     Ok(candidate) if candidate.digest() == current.digest() => {
                         pending_digest = None;
                         stable_observations = 0;
@@ -608,6 +620,7 @@ async fn run_supervisor(
                                         proposal_result_tx.clone(),
                                         &transaction_busy,
                                         &state,
+                                        proposal_tasks.spawner(),
                                     )
                                     .await
                                     .map(|scheduled| {
@@ -634,7 +647,7 @@ async fn run_supervisor(
                             }
                             pending_digest = None;
                             stable_observations = 0;
-                            poll = reload_interval(&current);
+                            poll = reload_interval(&current)?;
                         }
                     }
                     Err(error) => {
@@ -661,6 +674,7 @@ async fn run_supervisor(
                         ReloadTrigger::AdminValidate,
                         &apply_tx,
                         &state,
+                        &shutdown,
                     ).await,
                     SupervisorOperation::Reload => execute_from_source(
                         &source,
@@ -669,6 +683,7 @@ async fn run_supervisor(
                         ReloadTrigger::AdminReload,
                         &apply_tx,
                         &state,
+                        &shutdown,
                     ).await,
                     SupervisorOperation::ClusterValidate {
                         payload,
@@ -684,6 +699,7 @@ async fn run_supervisor(
                             None,
                             &apply_tx,
                             &state,
+                            &shutdown,
                         ).await
                     }
                     SupervisorOperation::ClusterPrecommit {
@@ -700,6 +716,7 @@ async fn run_supervisor(
                             None,
                             &apply_tx,
                             &state,
+                            &shutdown,
                         ).await
                     }
                     SupervisorOperation::ClusterReload {
@@ -718,10 +735,12 @@ async fn run_supervisor(
                             Some(ClusterCommit { revision, digest }),
                             &apply_tx,
                             &state,
+                            &shutdown,
                         ).await;
                         if result.is_ok() {
-                            suppressed_local_digest = source
-                                .load()
+                            // 已提交版本先保持有效；磁盘补读只决定旧来源抑制，不再占用业务工作线程。
+                            suppressed_local_digest = read_reload_candidate(&source, None, &shutdown)
+                                .await
                                 .ok()
                                 .filter(|local| local.digest() != current.digest())
                                 .map(|local| local.digest().to_string());
@@ -731,7 +750,7 @@ async fn run_supervisor(
                     }
                 };
                 let _ = request.response.send(result);
-                poll = reload_interval(&current);
+                poll = reload_interval(&current)?;
             }
             Some(finished) = proposal_result_rx.recv(), if cluster_proposal_running => {
                 cluster_proposal_running = false;
@@ -763,7 +782,7 @@ async fn run_supervisor(
                         warn!(error = %error, "cluster configuration proposal failed");
                     }
                 }
-                poll = reload_interval(&current);
+                poll = reload_interval(&current)?;
             }
             Some(request) = cluster_candidate_rx.recv() => {
                 let result =
@@ -772,12 +791,13 @@ async fn run_supervisor(
                         &current,
                         &transaction_busy,
                         &state,
+                        &shutdown,
                     ).await;
                 let _ = request.response.send(result);
             }
             _ = signal.recv(), if current.config().reload.enabled && !cluster_proposal_running => {
                 let result = match installed_coordinator(&coordinator) {
-                    Some(coordinator) => match source.load() {
+                    Some(coordinator) => match read_reload_candidate(&source, None, &shutdown).await {
                         Ok(candidate) => schedule_cluster_proposal(
                             &current,
                             candidate,
@@ -786,6 +806,7 @@ async fn run_supervisor(
                             proposal_result_tx.clone(),
                             &transaction_busy,
                             &state,
+                            proposal_tasks.spawner(),
                         )
                         .await
                         .map(|scheduled| {
@@ -807,6 +828,7 @@ async fn run_supervisor(
                         ReloadTrigger::Signal,
                         &apply_tx,
                         &state,
+                        &shutdown,
                     )
                     .await
                     .map(|_| ()),
@@ -814,16 +836,22 @@ async fn run_supervisor(
                 if let Err(error) = result {
                     warn!(error = %error, "SIGHUP configuration reload failed");
                 }
-                poll = reload_interval(&current);
+                poll = reload_interval(&current)?;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
+                    break;
                 }
             }
-            else => return Ok(()),
+            else => break,
         }
     }
+    // 停止后拒绝尚未消费及后来到达的配置阶段，避免提案收尾等待本节点已经不再消费的队列。
+    drop(request_rx);
+    drop(cluster_candidate_rx);
+    drop(proposal_result_rx);
+    // 提案已进入跨成员事务后不能由文件监听任务的结束直接撤销，收尾继续消费进程统一预算。
+    proposal_tasks.finish().await
 }
 
 /// 业务作用: 从共享槽位读取当前已经安装的进程级协调器。
@@ -851,8 +879,13 @@ fn installed_coordinator(
 /// - `result_tx`: 把事务终态送回串行 supervisor 的通道。
 /// - `transaction_busy`: 与管理端请求共享的进程级外部事务门禁。
 /// - `state`: 管理状态和累计指标。
+/// - `tasks`: 配置 supervisor 持有的事务任务入口，跨请求收尾仍由原父任务等待。
 ///
 /// 返回: 已启动异步提案时返回真；无操作返回假；本地身份字段变化时返回错误。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "候选、协调器、事务门禁和任务入口分别保留所有权，提案脱离请求后仍由 supervisor 收尾"
+)]
 async fn schedule_cluster_proposal(
     current: &LoadedConfig,
     candidate: LoadedConfig,
@@ -861,6 +894,7 @@ async fn schedule_cluster_proposal(
     result_tx: mpsc::Sender<ClusterProposalFinished>,
     transaction_busy: &Arc<AtomicBool>,
     state: &ReloadState,
+    tasks: TaskSpawner,
 ) -> Result<bool, String> {
     if !coordinator.cluster_configuration_proposals_ready() {
         return Ok(false);
@@ -895,41 +929,74 @@ async fn schedule_cluster_proposal(
         .await;
     let transaction_timeout =
         Duration::from_millis(candidate.config().reload.transaction_timeout_ms);
-    tokio::spawn(async move {
-        let _transaction_lease = transaction_lease;
-        let result = AssertUnwindSafe(coordinator.propose_cluster_config(
-            expected_revision,
-            transaction_timeout,
-            force_revision,
-            cluster_digest,
-            payload,
-        ))
-        .catch_unwind()
-        .await;
-        let result = match result {
-            Ok(Ok(response)) => Ok(response.pending_members),
-            Ok(Err(error)) => Err(format!("{error:#}")),
-            Err(_) => Err("cluster configuration proposal task panicked".to_string()),
-        };
-        let _ = result_tx
-            .send(ClusterProposalFinished {
-                source_digest,
-                trigger,
-                transaction,
-                result,
-            })
+    tasks
+        .spawn(async move {
+            let _transaction_lease = transaction_lease;
+            let result = AssertUnwindSafe(coordinator.propose_cluster_config(
+                expected_revision,
+                transaction_timeout,
+                force_revision,
+                cluster_digest,
+                payload,
+            ))
+            .catch_unwind()
             .await;
-    });
+            let result = match result {
+                Ok(Ok(response)) => Ok(response.pending_members),
+                Ok(Err(error)) => Err(format!("{error:#}")),
+                Err(_) => Err("cluster configuration proposal task panicked".to_string()),
+            };
+            let _ = result_tx
+                .send(ClusterProposalFinished {
+                    source_digest,
+                    trigger,
+                    transaction,
+                    result,
+                })
+                .await;
+        })
+        .map_err(|_| "configuration proposal task scope is closed".to_string())?;
     Ok(true)
 }
 
-/// 业务作用: 加载本地配置来源并生成一次规范化集群提案。
+/// 业务作用: 通过共享阻塞池读取显式热更候选，读取期间不占用业务调度线程且不持有发布权限。
+/// 参数说明:
+/// - `source`: 当前节点的本地来源及引导身份。
+/// - `payload`: 集群阶段已收到的完整载荷；为空时加载本地完整配置。
+/// - `shutdown`: 当前 supervisor 的关闭权威，读取前后都必须保持有效。
+///
+/// 返回: 加载与静态校验成功且尚未停机时交还候选；读取、任务或关闭错误均不允许开始发布。
+async fn read_reload_candidate(
+    source: &ConfigSource,
+    payload: Option<Vec<u8>>,
+    shutdown: &watch::Receiver<bool>,
+) -> anyhow::Result<LoadedConfig> {
+    // 已经进入关闭流程时不再开始磁盘读取，避免关闭期间新增候选及无用的阻塞任务。
+    if shutdown.has_changed().is_err() || *shutdown.borrow() {
+        anyhow::bail!("configuration supervisor is stopping");
+    }
+    let source = source.clone();
+    let candidate = nasa::application::read_config_candidate(move || match payload {
+        Some(payload) => source.load_cluster_payload(&payload),
+        None => source.load(),
+    })
+    .await
+    .context("configuration candidate reader failed")??;
+    // 同步读取一旦开始不能强制取消；闭包只构造候选，必须回到持有权威的调用方复验后才能发布。
+    if shutdown.has_changed().is_err() || *shutdown.borrow() {
+        anyhow::bail!("configuration supervisor stopped while reading candidate");
+    }
+    Ok(candidate)
+}
+
+/// 业务作用: 异步加载本地配置来源并生成一次规范化集群提案，停机后的候选不得发起协调事务。
 ///
 /// 参数说明:
 /// - `source`: 当前节点可重复读取的配置来源。
 /// - `current`: 当前活动配置，用于计算无操作和差异。
 /// - `transaction_busy`: 与文件、信号和其他管理请求共享的外部事务门禁。
 /// - `state`: 管理状态和累计指标。
+/// - `shutdown`: 配置来源读取前后需要复验的进程关闭权威。
 ///
 /// 返回: 无变化状态或需要交给协调领导者的摘要及载荷。
 async fn prepare_cluster_candidate(
@@ -937,6 +1004,7 @@ async fn prepare_cluster_candidate(
     current: &LoadedConfig,
     transaction_busy: &Arc<AtomicBool>,
     state: &ReloadState,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<ClusterProposalCandidate, String> {
     let transaction_lease = try_acquire_reload_transaction(transaction_busy)?;
     state.begin(ReloadTrigger::AdminReload).await;
@@ -947,7 +1015,7 @@ async fn prepare_cluster_candidate(
             .await;
         return Err(error);
     }
-    let candidate = match source.load() {
+    let candidate = match read_reload_candidate(source, None, shutdown).await {
         Ok(candidate) => candidate,
         Err(error) => {
             let error = format!("{error:#}");
@@ -1004,7 +1072,7 @@ fn try_acquire_reload_transaction(
     Ok(ReloadTransactionLease { busy: busy.clone() })
 }
 
-/// 业务作用: 使用领导节点广播的规范化载荷执行本地集群配置阶段。
+/// 业务作用: 异步加载领导节点载荷及本地引导来源，在关闭权威有效时执行本地集群配置阶段。
 ///
 /// 参数说明:
 /// - `source`: 提供本节点协调身份字段的本地引导配置来源。
@@ -1016,6 +1084,7 @@ fn try_acquire_reload_transaction(
 /// - `cluster_commit`: activate 阶段由协调日志确认的精确版本和摘要。
 /// - `apply_tx`: 运行时事务发送通道。
 /// - `state`: 管理状态和累计指标。
+/// - `shutdown`: 配置来源读取前后需要复验的进程关闭权威。
 ///
 /// 返回: 本节点完成预检或发布后的状态；载荷解析、校验或运行时事务失败时返回错误。
 #[allow(clippy::too_many_arguments)]
@@ -1029,9 +1098,10 @@ async fn execute_cluster_payload(
     cluster_commit: Option<ClusterCommit>,
     apply_tx: &mpsc::Sender<ApplyConfigRequest>,
     state: &ReloadState,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<ReloadOperationResponse, String> {
     state.begin(trigger).await;
-    let candidate = match source.load_cluster_payload(&payload) {
+    let candidate = match read_reload_candidate(source, Some(payload), shutdown).await {
         Ok(candidate) => candidate,
         Err(error) => {
             let error = format!("{error:#}");
@@ -1057,7 +1127,7 @@ async fn execute_cluster_payload(
     .await
 }
 
-/// 业务作用: 从本地来源加载候选配置并执行校验或发布。
+/// 业务作用: 异步读取本地候选并执行校验或发布，停机后不再把读取结果交给运行时。
 ///
 /// 参数说明:
 /// - `source`: 本次请求要读取的配置来源。
@@ -1066,6 +1136,7 @@ async fn execute_cluster_payload(
 /// - `trigger`: 本次请求的触发入口。
 /// - `apply_tx`: 运行时事务发送通道。
 /// - `state`: 管理状态和累计指标。
+/// - `shutdown`: 配置来源读取前后需要复验的进程关闭权威。
 ///
 /// 返回: 请求完成后的状态；任一阶段失败时返回脱敏错误。
 async fn execute_from_source(
@@ -1075,6 +1146,7 @@ async fn execute_from_source(
     trigger: ReloadTrigger,
     apply_tx: &mpsc::Sender<ApplyConfigRequest>,
     state: &ReloadState,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<ReloadOperationResponse, String> {
     state.begin(trigger).await;
     if !current.config().reload.enabled {
@@ -1082,7 +1154,7 @@ async fn execute_from_source(
         state.finish_failure(trigger, None, error.clone()).await;
         return Err(error);
     }
-    let candidate = match source.load() {
+    let candidate = match read_reload_candidate(source, None, shutdown).await {
         Ok(candidate) => candidate,
         Err(error) => {
             let error = format!("{error:#}");
@@ -1280,18 +1352,20 @@ struct ClusterCommit {
     digest: String,
 }
 
-/// 业务作用: 创建会丢弃延迟 tick 的动态轮询计时器，避免任务暂停后集中补发检查。
+/// 业务作用: 将当前领域配置交给共享补读计时器，保持候选发布由本 supervisor 串行裁决。
 ///
 /// 参数说明:
 /// - `current`: 当前活动配置，提供轮询周期。
 ///
-/// 返回: 首次 tick 立即可用的 Tokio interval。
-fn reload_interval(current: &LoadedConfig) -> time::Interval {
-    let mut interval = time::interval(Duration::from_millis(
-        current.config().reload.poll_interval_ms.max(1),
-    ));
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    interval
+/// 返回: 首次检查立即可用的框架计时器；非法周期拒绝创建，禁用状态不消费配置中的周期。
+fn reload_interval(current: &LoadedConfig) -> anyhow::Result<ConfigPoller> {
+    let configuration = current.config();
+    let interval_ms = if configuration.reload.enabled {
+        configuration.reload.poll_interval_ms
+    } else {
+        nasa::application::DEFAULT_CONFIG_POLL_INTERVAL_MS
+    };
+    ConfigPoller::new(interval_ms).context("configure configuration polling")
 }
 
 /// 业务作用: 创建 Unix SIGHUP 接收器，供进程不退出地触发配置事务。

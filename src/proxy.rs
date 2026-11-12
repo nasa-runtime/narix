@@ -1,3 +1,7 @@
+use crate::infrastructure::lifecycle::{DomainTask, TaskScope, TaskSpawner};
+use crate::infrastructure::time::{
+    duration_micros as duration_micros_u64, duration_millis_saturating,
+};
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, IoSlice};
 use std::pin::Pin;
@@ -11,9 +15,9 @@ use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
 
 use crate::admin::{
     DedicatedTunnelGuard, DedicatedTunnelQueueMetricsGuard, ProxyGenerationActivity, ProxyMetrics,
@@ -75,10 +79,15 @@ impl StandaloneRuntime {
     /// 参数说明:
     /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
     /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
+    /// - `tasks`: 运行代负责等待的后端周期任务入口。
     ///
     /// 返回: 建连、认证、协议协商和资源初始化全部成功时返回可用实例；任一步失败时返回错误。
-    fn from_proxy_item(item: &ProxyItem, metrics: ProxyMetrics) -> anyhow::Result<Self> {
-        Self::for_backend(item, item.backend_addr()?, metrics)
+    fn from_proxy_item(
+        item: &ProxyItem,
+        metrics: ProxyMetrics,
+        tasks: TaskSpawner,
+    ) -> anyhow::Result<Self> {
+        Self::for_backend(item, item.backend_addr()?, metrics, tasks)
     }
 
     /// 业务作用: 为一个已经通过控制面验证的固定路由代次创建私有连接资源。
@@ -87,20 +96,27 @@ impl StandaloneRuntime {
     /// - `item`：当前代理配置，提供连接池容量、认证、TLS、超时和 tunnel 回收参数。
     /// - `backend`：本资源代次唯一允许连接的已规范化数据节点地址。
     /// - `metrics`：当前代理共享指标句柄，新建的 pipeline/tunnel 池均归属该代理。
+    /// - `tasks`：运行代负责等待的后端周期任务入口。
     ///
     /// 返回：成功时返回绑定指定后端的完整 standalone 数据面资源。
     fn for_backend(
         item: &ProxyItem,
         backend: String,
         metrics: ProxyMetrics,
+        tasks: TaskSpawner,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             backend,
-            pipeline_pool: Arc::new(PipelineBackendPool::new(item, metrics.clone())),
-            tunnel_pool: TunnelPool::new(
+            pipeline_pool: Arc::new(PipelineBackendPool::with_tasks(
+                item,
+                metrics.clone(),
+                tasks.clone(),
+            )),
+            tunnel_pool: TunnelPool::with_tasks(
                 item.dedicated_tunnel_pool_max_idle,
                 item.dedicated_tunnel_pool_idle_timeout_ms,
                 metrics,
+                tasks,
             ),
         })
     }
@@ -109,6 +125,7 @@ impl StandaloneRuntime {
 /// Sentinel 当前主节点代次的数据面资源。路由切换时原子替换整组 pool，旧代不再接受新批次。
 #[derive(Debug)]
 struct SentinelDataRuntime {
+    tasks: TaskSpawner,
     /// 当前已发布主节点地址、路由代次及该代次独占的数据面资源。
     current: StdMutex<Option<(String, u64, Arc<StandaloneRuntime>)>>,
     /// 当前代理共享指标句柄，供后续每个动态代次创建连接池。
@@ -120,10 +137,12 @@ impl SentinelDataRuntime {
     ///
     /// 参数说明：
     /// - `metrics`：当前 sentinel 代理的共享指标句柄，后续每代连接池均使用它记账。
+    /// - `tasks`：所属运行代的弱任务入口，路由切换创建的池也纳入同一责任范围。
     ///
     /// 返回：返回空的代次容器；首次安全路由发布后再按需创建连接池。
-    fn new(metrics: ProxyMetrics) -> Self {
+    fn new(metrics: ProxyMetrics, tasks: TaskSpawner) -> Self {
         Self {
+            tasks,
             current: StdMutex::new(None),
             metrics,
         }
@@ -156,6 +175,7 @@ impl SentinelDataRuntime {
             item,
             master.to_string(),
             self.metrics.clone(),
+            self.tasks.clone(),
         )?);
         *current = Some((master.to_string(), generation, runtime.clone()));
         Ok(runtime)
@@ -203,10 +223,20 @@ struct ProxyRuntimes {
 
 /// 透明隧道和阻塞命令统一使用的动态后端路由观察器。
 enum DynamicRoutingReceiver {
-    /// replication HA 当前主节点路由变化。
-    ReplicationHa(watch::Receiver<HaRoutingState>),
-    /// Sentinel 当前已验证主节点路由变化。
-    Sentinel(watch::Receiver<SentinelRoutingState>),
+    /// replication HA 路由观察及当前连接不可逆的失效状态。
+    ReplicationHa {
+        /// 从连接准入时确认的路由开始观察变化。
+        receiver: watch::Receiver<HaRoutingState>,
+        /// 保护与恢复可能被 watch 合并，旧连接不能因此重新获得转发资格。
+        invalidated: bool,
+    },
+    /// Sentinel 路由变化与当前连接绑定的原始代次。
+    Sentinel {
+        /// 当前已验证路由及保护状态。
+        receiver: watch::Receiver<SentinelRoutingState>,
+        /// 连接绑定的代次；恢复到同一地址也不能复用失效代。
+        generation: u64,
+    },
 }
 
 /// 单条可复用阻塞命令等待期间需要观察的后端路由。
@@ -218,28 +248,60 @@ struct BlockingRouteContext<'a> {
 }
 
 impl DynamicRoutingReceiver {
+    /// 业务作用: 将 HA 连接绑定到准入时确认的路由，随后任何路由发布都使旧连接失效。
+    /// 参数说明:
+    /// - `receiver`: 已在准入时确认 Serving 的路由接收器，保留其已见通知位置。
+    ///
+    /// 返回: 新的连接观察器；不消费准入后可能已发生的路由变化。
+    fn replication_ha(receiver: watch::Receiver<HaRoutingState>) -> Self {
+        Self::ReplicationHa {
+            receiver,
+            invalidated: false,
+        }
+    }
+
     /// 业务作用: 判断旧后端是否仍属于当前动态路由的可服务节点。
     ///
     /// 参数说明：
     /// - `old_backend`：现有透明隧道或阻塞命令实际连接的后端地址。
     ///
-    /// 返回：旧连接必须关闭时返回原因；路由仍指向原地址时返回 `None`。
+    /// 返回：旧连接必须关闭时返回原因；原地址及绑定的路由代次仍有效时返回 `None`。
     fn close_reason(&self, old_backend: &str) -> Option<String> {
         match self {
-            Self::ReplicationHa(receiver) => ha_relay_close_reason(&receiver.borrow(), old_backend),
-            Self::Sentinel(receiver) => {
-                sentinel_relay_close_reason(&receiver.borrow(), old_backend)
+            Self::ReplicationHa {
+                receiver,
+                invalidated,
+            } => {
+                if *invalidated {
+                    Some("replication HA connection route invalidated".to_string())
+                } else {
+                    ha_relay_close_reason(receiver, old_backend)
+                }
             }
+            Self::Sentinel {
+                receiver,
+                generation,
+            } => sentinel_relay_close_reason(&receiver.borrow(), old_backend, *generation),
         }
     }
 
     /// 业务作用: 等待动态路由 watch 发布下一个版本。
     ///
-    /// 返回：路由发生变化时成功；发送端销毁时返回 watch 接收错误。
+    /// 参数说明: 无。
+    ///
+    /// 返回：路由发生变化时成功；发送端销毁时返回 watch 接收错误；HA 旧连接同步标记为失效。
     async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         match self {
-            Self::ReplicationHa(receiver) => receiver.changed().await,
-            Self::Sentinel(receiver) => receiver.changed().await,
+            Self::ReplicationHa {
+                receiver,
+                invalidated,
+            } => {
+                let result = receiver.changed().await;
+                // HA 只在保护或可服务路由变化时发布；即使最终地址相同，已发生的保护也不能被恢复覆盖。
+                *invalidated = true;
+                result
+            }
+            Self::Sentinel { receiver, .. } => receiver.changed().await,
         }
     }
 }
@@ -380,11 +442,10 @@ impl Drop for DedicatedTunnelQueueGuard<'_> {
 /// 业务作用: 启动单个代理监听并管理其激活、连接准入和优雅关闭生命周期。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
-/// - `generation`: 当前代理名称下由 supervisor 分配的配置运行代编号。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并排空所属连接与任务。
 ///
-/// 返回: 连接或批次完整结束并完成资源回收时返回成功；认证、路由、后端或 I/O 失败时返回错误。
-// 无注册表入口用于嵌入式/测试启动，不产生管理面运行时登记。
+/// 返回: 监听及所属资源正常关闭时返回成功；初始化、关键任务或资源排空失败时返回错误。
+// 无注册表入口供嵌入式调用使用，不产生管理面运行时登记。
 pub async fn serve_listener(
     item: ProxyItem,
     shutdown: watch::Receiver<bool>,
@@ -395,7 +456,7 @@ pub async fn serve_listener(
 /// 业务作用: 在可选管理注册表下启动代理运行代，使监听发布、状态注册和旧代排空遵循同一生命周期。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `registry`: 进程内代理注册表，用于汇总状态并按名称定位运行时。
 ///
 /// 返回: 连接或批次完整结束并完成资源回收时返回成功；认证、路由、后端或 I/O 失败时返回错误。
@@ -527,6 +588,7 @@ pub fn proxy_generation_channel() -> (
 
 /// 表示已经完成模式运行时构造、可以发布给稳定 listener 的代理运行代。
 struct PreparedProxyGeneration {
+    data_tasks: TaskScope,
     item: Arc<ProxyItem>,
     runtimes: ProxyRuntimes,
     metrics: ProxyMetrics,
@@ -534,7 +596,7 @@ struct PreparedProxyGeneration {
     limiter: Arc<Semaphore>,
     shutdown: watch::Sender<bool>,
     /// 当前配置代独占的拓扑控制任务；切换代次前必须等待旧任务完全退出，禁止旧配置继续改写后端。
-    control_tasks: AsyncMutex<Vec<JoinHandle<()>>>,
+    control_tasks: AsyncMutex<Vec<DomainTask>>,
     generation: u64,
 }
 
@@ -556,9 +618,10 @@ impl PreparedProxyGeneration {
         coordinator: Option<Arc<CoordinatorHandle>>,
         cluster_config_digest: Option<String>,
     ) -> anyhow::Result<Self> {
+        let data_tasks = TaskScope::default();
         let cluster = match item.mode {
             ProxyMode::Cluster => Some(Arc::new(
-                ClusterRuntime::from_proxy_item(&item, metrics.clone()).await?,
+                ClusterRuntime::with_tasks(&item, metrics.clone(), data_tasks.spawner()).await?,
             )),
             _ => None,
         };
@@ -566,6 +629,7 @@ impl PreparedProxyGeneration {
             ProxyMode::Standalone => Some(Arc::new(StandaloneRuntime::from_proxy_item(
                 &item,
                 metrics.clone(),
+                data_tasks.spawner(),
             )?)),
             _ => None,
         };
@@ -584,13 +648,17 @@ impl PreparedProxyGeneration {
             ProxyMode::Sentinel => Some(Arc::new(SentinelRuntime::from_proxy_item(&item)?)),
             _ => None,
         };
-        let sentinel_data = sentinel
-            .as_ref()
-            .map(|_| Arc::new(SentinelDataRuntime::new(metrics.clone())));
+        let sentinel_data = sentinel.as_ref().map(|_| {
+            Arc::new(SentinelDataRuntime::new(
+                metrics.clone(),
+                data_tasks.spawner(),
+            ))
+        });
         let limiter = Arc::new(Semaphore::new(item.max_connections));
         let tunnel_limiter = Arc::new(DedicatedTunnelLimiter::from_item(&item));
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
+            data_tasks,
             item: Arc::new(item),
             runtimes: ProxyRuntimes {
                 cluster,
@@ -628,22 +696,32 @@ impl PreparedProxyGeneration {
         }
         let mut control_tasks = self.control_tasks.lock().await;
         if let Some(runtime) = &self.runtimes.replication_ha {
-            control_tasks.push(tokio::spawn(
-                runtime.clone().watch(self.shutdown.subscribe()),
-            ));
+            let runtime = runtime.clone();
+            let shutdown = self.shutdown.subscribe();
+            control_tasks.push(
+                tokio::spawn(async move {
+                    runtime.watch(shutdown).await;
+                    Ok(())
+                })
+                .into(),
+            );
         }
         if let Some(runtime) = &self.runtimes.sentinel {
-            control_tasks.push(tokio::spawn(
-                runtime.clone().watch(self.shutdown.subscribe()),
-            ));
+            control_tasks
+                .push(tokio::spawn(runtime.clone().watch(self.shutdown.subscribe())).into());
         }
         if let Some(runtime) = &self.runtimes.cluster {
-            control_tasks.push(tokio::spawn(watch_cluster_topology(
-                self.item.name.clone(),
-                runtime.clone(),
-                Duration::from_millis(self.item.cluster_topology_refresh_ms),
-                self.shutdown.subscribe(),
-            )));
+            let runtime = runtime.clone();
+            let name = self.item.name.clone();
+            let interval = Duration::from_millis(self.item.cluster_topology_refresh_ms);
+            let shutdown = self.shutdown.subscribe();
+            control_tasks.push(
+                tokio::spawn(async move {
+                    watch_cluster_topology(name, runtime, interval, shutdown).await;
+                    Ok(())
+                })
+                .into(),
+            );
         }
         drop(control_tasks);
         log_proxy_generation_started(&self.item, self.generation);
@@ -662,23 +740,68 @@ impl PreparedProxyGeneration {
 
     /// 业务作用: 停止当前配置代并等待全部后端控制任务退出，形成代次之间的后端副作用屏障。
     ///
-    /// 返回: HA、Sentinel 和 Cluster 拓扑任务均确认退出后返回。
-    async fn stop_and_wait_control_tasks(&self) {
+    /// 参数说明: 无。
+    ///
+    /// 返回: HA、Sentinel 和 Cluster 拓扑任务均确认退出后成功；任务异常保留为运行代失败。
+    async fn stop_and_wait_control_tasks(&self) -> anyhow::Result<()> {
         self.stop();
         let tasks = {
             let mut control_tasks = self.control_tasks.lock().await;
             std::mem::take(&mut *control_tasks)
         };
+        let mut failed = false;
         for task in tasks {
-            if let Err(error) = task.await {
-                warn!(
-                    proxy = %self.item.name,
-                    generation = self.generation,
-                    error = %error,
-                    "proxy generation control task stopped with join error"
-                );
+            failed |= !matches!(task.await, Ok(Ok(())));
+        }
+        let cleanup = if let Some(runtime) = &self.runtimes.replication_ha {
+            runtime.finish_control_cleanup().await
+        } else {
+            Ok(())
+        };
+        anyhow::ensure!(
+            !failed,
+            "proxy generation control task did not exit normally"
+        );
+        cleanup
+    }
+
+    /// 业务作用: 在运行期间观察关键拓扑任务，防止探测或调和停止后继续使用缓存路由。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 全部控制任务仍运行时成功；提前退出或 panic 时先退休运行代，再向进程监督报告失败。
+    async fn ensure_control_tasks_running(&self) -> anyhow::Result<()> {
+        if let Some(runtime) = &self.runtimes.replication_ha {
+            if let Err(error) = runtime.check_control_cleanup() {
+                self.stop();
+                return Err(error);
             }
         }
+        if let Err(error) = self.data_tasks.check() {
+            self.stop();
+            return Err(error);
+        }
+        let mut tasks = self.control_tasks.lock().await;
+        if let Some(index) = tasks.iter().position(DomainTask::is_finished) {
+            // 控制循环缺席时不能继续依赖此前的健康观察，先撤销 HA 副作用与连接准入。
+            self.stop();
+            let task = tasks.swap_remove(index);
+            let ended_normally = matches!(task.await, Ok(Ok(())));
+            bail!(
+                "proxy generation control task exited before shutdown (normal exit: {ended_normally})"
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PreparedProxyGeneration {
+    /// 业务作用: 父监听任务异常取消时同步退休当前代并撤销其控制任务，阻止后台动作脱管。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 关闭该代连接信号并请求取消剩余控制任务；正常关闭仍通过显式等待完成排空。
+    fn drop(&mut self) {
+        self.stop();
+        self.control_tasks.get_mut().clear();
     }
 }
 
@@ -907,23 +1030,42 @@ pub(crate) async fn serve_reloadable_listener_with_registry_coordinator_and_publ
         .with_context(|| format!("proxy `{}` bind `{bind}`", initial.item.name))?;
     let _ = ready.send(());
     if !wait_for_proxy_activation(&[&listener], &mut activation, &mut shutdown).await {
-        initial.stop();
         drop(listener);
         let _ = listener_closed.send(());
+        initial.stop_and_wait_control_tasks().await?;
+        initial.data_tasks.cancel_and_wait().await?;
         return Ok(());
     }
     initial.activate(registry.clone()).await;
     let _ = activated.send(());
     let mut current = Arc::new(initial);
+    let mut retired: Vec<Arc<PreparedProxyGeneration>> = Vec::new();
     let mut prepared: Option<PreparedProxyGeneration> = None;
     let mut updates_open = true;
 
     let mut connections = JoinSet::new();
+    let mut control_health = tokio::time::interval(Duration::from_millis(100));
+    control_health.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
+        let mut index = 0;
+        while index < retired.len() {
+            if Arc::strong_count(&retired[index]) == 1 {
+                // 旧连接全部释放运行代后才停止其池任务，避免提前关闭仍在收尾的后端连接。
+                let generation = retired.swap_remove(index);
+                generation.data_tasks.cancel_and_wait().await?;
+            } else {
+                index += 1;
+            }
+        }
         tokio::select! {
+            _ = control_health.tick() => {
+                if !*shutdown.borrow() {
+                    current.ensure_control_tasks_running().await?;
+                }
+            }
             _ = shutdown.changed() => {
                 info!(proxy = %current.item.name, "proxy listener stopping");
-                current.stop_and_wait_control_tasks().await;
+                current.stop_and_wait_control_tasks().await?;
                 break;
             }
             update = updates.recv(), if updates_open => {
@@ -993,9 +1135,9 @@ pub(crate) async fn serve_reloadable_listener_with_registry_coordinator_and_publ
                         }
                         // 发布门禁已经暂停新连接。先等待旧代控制任务完全退出，再激活候选，
                         // 防止旧 HA 持久化收敛在新代发布后把后端恢复成旧配置。
-                        current.stop_and_wait_control_tasks().await;
+                        current.stop_and_wait_control_tasks().await?;
                         next.activate(registry.clone()).await;
-                        current = Arc::new(next);
+                        retired.push(std::mem::replace(&mut current, Arc::new(next)));
                         let _ = response.send(Ok(()));
                     }
                     ProxyGenerationCommand::Abort {
@@ -1014,7 +1156,8 @@ pub(crate) async fn serve_reloadable_listener_with_registry_coordinator_and_publ
                             ));
                             continue;
                         }
-                        candidate.stop();
+                        candidate.stop_and_wait_control_tasks().await?;
+                        candidate.data_tasks.cancel_and_wait().await?;
                         let _ = response.send(Ok(()));
                     }
                 }
@@ -1058,7 +1201,7 @@ pub(crate) async fn serve_reloadable_listener_with_registry_coordinator_and_publ
                     generation.generation_activity.connection_finished();
                     generation.metrics.connection_finished(has_error);
                     if let Err(err) = result {
-                        debug!(client = %peer, error = %err, "connection closed with error");
+                        error!(client = %peer, error = %err, "connection closed with error");
                     }
                 });
             }
@@ -1070,7 +1213,15 @@ pub(crate) async fn serve_reloadable_listener_with_registry_coordinator_and_publ
 
     drop(listener);
     let _ = listener_closed.send(());
+    if let Some(candidate) = prepared {
+        candidate.stop_and_wait_control_tasks().await?;
+        candidate.data_tasks.cancel_and_wait().await?;
+    }
     drain_connections(&current.item, connections).await;
+    for generation in retired {
+        generation.data_tasks.cancel_and_wait().await?;
+    }
+    current.data_tasks.cancel_and_wait().await?;
     Ok(())
 }
 
@@ -1200,39 +1351,50 @@ async fn wait_for_cluster_configuration_stale(guard: &mut watch::Receiver<bool>)
 ///
 /// 返回: 对应模式的 TLS、认证、后端角色或槽位拓扑全部可用时返回成功。
 pub async fn preflight_proxy_item(item: &ProxyItem) -> anyhow::Result<()> {
-    match item.mode {
-        ProxyMode::Standalone => preflight_backend_ping(item, &item.backend_addr()?).await,
-        ProxyMode::Sentinel => {
-            let runtime = SentinelRuntime::from_proxy_item(item)?;
-            runtime
-                .refresh()
-                .await
-                .with_context(|| format!("proxy `{}` sentinel preflight", item.name))
-        }
-        ProxyMode::Cluster => {
-            ClusterRuntime::from_proxy_item(item, ProxyMetrics::default())
-                .await
-                .with_context(|| {
-                    format!("proxy `{}` cluster slot topology preflight", item.name)
-                })?;
-            Ok(())
-        }
-        ProxyMode::ClusterNodeProxy => {
-            ClusterNodeProxyRuntime::from_proxy_item(item, ProxyMetrics::default())?;
-            for node in item.cluster_node_proxies()? {
-                preflight_backend_ping(item, &node.backend)
+    let tasks = TaskScope::default();
+    let result = async {
+        match item.mode {
+            ProxyMode::Standalone => preflight_backend_ping(item, &item.backend_addr()?).await,
+            ProxyMode::Sentinel => {
+                let runtime = SentinelRuntime::from_proxy_item(item)?;
+                runtime
+                    .refresh()
+                    .await
+                    .with_context(|| format!("proxy `{}` sentinel preflight", item.name))
+            }
+            ProxyMode::Cluster => {
+                ClusterRuntime::with_tasks(item, ProxyMetrics::default(), tasks.spawner())
                     .await
                     .with_context(|| {
-                        format!(
-                            "proxy `{}` cluster node `{}` preflight",
-                            item.name, node.backend
-                        )
+                        format!("proxy `{}` cluster slot topology preflight", item.name)
                     })?;
+                Ok(())
             }
-            Ok(())
+            ProxyMode::ClusterNodeProxy => {
+                ClusterNodeProxyRuntime::from_proxy_item(
+                    item,
+                    ProxyMetrics::default(),
+                    tasks.spawner(),
+                )?;
+                for node in item.cluster_node_proxies()? {
+                    preflight_backend_ping(item, &node.backend)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "proxy `{}` cluster node `{}` preflight",
+                                item.name, node.backend
+                            )
+                        })?;
+                }
+                Ok(())
+            }
+            ProxyMode::ReplicationHa => preflight_replication_ha(item).await,
         }
-        ProxyMode::ReplicationHa => preflight_replication_ha(item).await,
     }
+    .await;
+    // 候选从未获得业务准入；无论预检成功还是失败，都先等待准备阶段的周期资源释放。
+    let stopped = tasks.cancel_and_wait().await;
+    result.and(stopped)
 }
 
 /// 业务作用: 建立一次带认证和可选 TLS 的后端连接并执行 `PING`。
@@ -1292,17 +1454,19 @@ pub(crate) async fn preflight_replication_ha_transition(
     preflight_replication_ha_with_transition(item, Some(transition_master)).await
 }
 
-/// 业务作用: 执行托管复制 HA 的严格终态或删主过渡态探测。
+/// 业务作用: 验证托管复制 HA 的独立租约凭据，并探测严格终态或删主过渡态。
 ///
 /// 参数说明:
 /// - `item`: 提供候选节点、产品、认证、TLS 和复制延迟门禁的代理配置。
 /// - `transition_master`: 允许全部候选仍跟随的旧主；普通预检为空。
 ///
-/// 返回: 节点角色、上游和复制延迟满足对应状态约束时返回成功。
+/// 返回: Redis 租约只读认证通过且节点角色、上游和复制延迟满足约束时成功；失败不发布候选或获取租约。
 async fn preflight_replication_ha_with_transition(
     item: &ProxyItem,
     transition_master: Option<&HaNode>,
 ) -> anyhow::Result<()> {
+    // 数据后端和租约服务使用独立身份；候选必须先通过租约只读认证，不能发布后才发现控制凭据不可用。
+    ReplicationHaRuntime::preflight_redis_coordinator(item).await?;
     let raw_nodes = item
         .nodes
         .as_deref()
@@ -1411,9 +1575,14 @@ impl ClusterNodeProxyRuntime {
     /// 参数说明:
     /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
     /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
+    /// - `tasks`: 多监听器共同所属运行代的后台任务入口。
     ///
     /// 返回: 建连、认证、协议协商和资源初始化全部成功时返回可用实例；任一步失败时返回错误。
-    fn from_proxy_item(item: &ProxyItem, metrics: ProxyMetrics) -> anyhow::Result<Self> {
+    fn from_proxy_item(
+        item: &ProxyItem,
+        metrics: ProxyMetrics,
+        tasks: TaskSpawner,
+    ) -> anyhow::Result<Self> {
         let mut rewrite_map = HashMap::new();
         let mut tunnel_pools = HashMap::new();
         for node in item.cluster_node_proxies()? {
@@ -1423,16 +1592,17 @@ impl ClusterNodeProxyRuntime {
                 rewrite_map.insert(normalize_addr(alias)?, advertised.clone());
             }
             tunnel_pools.entry(node.backend.clone()).or_insert_with(|| {
-                TunnelPool::new(
+                TunnelPool::with_tasks(
                     item.dedicated_tunnel_pool_max_idle,
                     item.dedicated_tunnel_pool_idle_timeout_ms,
                     metrics.clone(),
+                    tasks.clone(),
                 )
             });
         }
         Ok(Self {
             rewrite_map,
-            pipeline_pool: Arc::new(PipelineBackendPool::new(item, metrics)),
+            pipeline_pool: Arc::new(PipelineBackendPool::with_tasks(item, metrics, tasks)),
             tunnel_pools,
         })
     }
@@ -1872,7 +2042,10 @@ fn read_only_batch_response(item: &ProxyItem, commands: &[ClientCommand]) -> Opt
         return None;
     }
     // 只有整批命令都能证明为只读时才继续转发；批次中任一命令不安全就整批失败，避免产生部分执行结果。
-    if commands.iter().all(command_allowed_in_read_only) {
+    if commands
+        .iter()
+        .all(|command| command_allowed_in_read_only(command, item.backend_profile))
+    {
         return None;
     }
     Some(vec![read_only_error(&item.name); commands.len()])
@@ -1881,15 +2054,32 @@ fn read_only_batch_response(item: &ProxyItem, commands: &[ClientCommand]) -> Opt
 /// 业务作用: 对单条命令执行关闭式只读分类；只有代理能够从命令名和子命令证明不会执行脚本、修改数据或切换到不可继续检查的连接态时才放行。
 /// 参数说明:
 /// - `command`: 已解析的客户端命令；空命令、未知命令和参数不足的子命令都按不安全处理。
+/// - `backend_profile`: 当前后端的协议语义，用于隔离同名命令在不同后端上的副作用。
 ///
 /// 返回: 明确安全的普通读命令、只读元数据查询或本地 `QUIT` 返回 `true`，其余命令返回 `false`。
-fn command_allowed_in_read_only(command: &ClientCommand) -> bool {
+fn command_allowed_in_read_only(command: &ClientCommand, backend_profile: BackendProfile) -> bool {
     // QUIT 只关闭前端连接，不触碰后端数据或运行状态，可以在只读会话中安全放行。
     if command_name_eq(command, b"QUIT") {
         return true;
     }
     // 脚本可能在运行时动态选择写命令，无法仅凭命令名或只读后缀证明安全，因此优先于普通只读表拒绝。
     if command_is_lua_execution(command) {
+        return false;
+    }
+    // BACKUP 在其他后端可能直接创建备份目录；Redis 专有查询的语义不能套用到其他后端。
+    if backend_profile != BackendProfile::Redis
+        && (command_name_eq(command, b"BACKUP")
+            || command_name_eq(command, b"HOTKEYS")
+            || command_name_eq(command, b"SEARCH.CLUSTERINFO"))
+    {
+        return false;
+    }
+    // Tendis 的版本元数据、HLL 诊断和槽位检查采用特定参数语义，只读权限不能扩散到其他后端的同名入口。
+    if backend_profile != BackendProfile::Tendis
+        && (command_name_eq(command, b"SYNCVERSION")
+            || command_name_eq(command, b"PFDEBUG")
+            || command_name_eq(command, b"SLOTSEMPTY"))
+    {
         return false;
     }
     // 隧道建立后代理不再逐帧分类后续请求，所以任何会切换到连接绑定路径的命令都必须失败关闭。
@@ -1946,12 +2136,17 @@ fn command_is_read_only_request_response(command: &ClientCommand) -> bool {
             b"RANDOMKEY",
             b"TYPE",
             b"EXISTS",
+            b"TOUCH",
             b"TTL",
             b"PTTL",
+            b"EXPIRETIME",
+            b"PEXPIRETIME",
             b"GET",
             b"MGET",
             b"STRLEN",
             b"GETRANGE",
+            b"SUBSTR",
+            b"DIGEST",
             b"GETBIT",
             b"BITCOUNT",
             b"BITPOS",
@@ -1967,6 +2162,9 @@ fn command_is_read_only_request_response(command: &ClientCommand) -> bool {
             b"HSTRLEN",
             b"HRANDFIELD",
             b"HSCAN",
+            b"HTTL",
+            b"HPEXPIRETIME",
+            b"FIELDTTL",
             b"LLEN",
             b"LRANGE",
             b"LINDEX",
@@ -1979,11 +2177,17 @@ fn command_is_read_only_request_response(command: &ClientCommand) -> bool {
             b"SSCAN",
             b"SDIFF",
             b"SINTER",
+            b"SINTERCARD",
             b"SUNION",
             b"ZCARD",
             b"ZCOUNT",
             b"ZLEXCOUNT",
             b"ZRANGE",
+            b"ZRANGEBYLEX",
+            b"ZRANGEBYSCORE",
+            b"ZREVRANGE",
+            b"ZREVRANGEBYLEX",
+            b"ZREVRANGEBYSCORE",
             b"ZRANK",
             b"ZREVRANK",
             b"ZMSCORE",
@@ -1992,6 +2196,7 @@ fn command_is_read_only_request_response(command: &ClientCommand) -> bool {
             b"ZSCAN",
             b"ZDIFF",
             b"ZINTER",
+            b"ZINTERCARD",
             b"ZUNION",
             b"GEODIST",
             b"GEOHASH",
@@ -2001,10 +2206,26 @@ fn command_is_read_only_request_response(command: &ClientCommand) -> bool {
             b"XRANGE",
             b"XREVRANGE",
             b"XLEN",
+            b"XPENDING",
             b"XINFO",
             b"XREAD",
             b"PUBSUB",
             b"OBJECT",
+            b"GETWITHETAG",
+            b"GETIFNOTMATCH",
+            b"BF.EXISTS",
+            b"BF.MEXISTS",
+            b"BF.INFO",
+            b"CF.EXISTS",
+            b"CF.MEXISTS",
+            b"CF.COUNT",
+            b"CF.INFO",
+            b"CMS.QUERY",
+            b"CMS.INFO",
+            b"TOPK.QUERY",
+            b"TOPK.COUNT",
+            b"TOPK.LIST",
+            b"TOPK.INFO",
         ],
     ) {
         return true;
@@ -2020,6 +2241,101 @@ fn command_is_read_only_request_response(command: &ClientCommand) -> bool {
     }
     if name.eq_ignore_ascii_case(b"SCRIPT") {
         return command_subcommand_matches(command, &[b"EXISTS", b"HELP"]);
+    }
+    if name.eq_ignore_ascii_case(b"CACHE") {
+        return command_subcommand_matches(command, &[b"RANDOMKEY"]);
+    }
+    if name.eq_ignore_ascii_case(b"DISK") {
+        return command_subcommand_matches(command, &[b"USAGE"]);
+    }
+    if name.eq_ignore_ascii_case(b"NAMESPACE") {
+        // 命名空间查询沿用后端认证权限；令牌变更和命名空间增删必须留在写入入口。
+        return command_subcommand_matches(command, &[b"GET", b"CURRENT"]);
+    }
+    if name.eq_ignore_ascii_case(b"PERFLOG") {
+        return command_subcommand_matches(command, &[b"GET", b"LEN"]);
+    }
+    if name.eq_ignore_ascii_case(b"KPROFILE") {
+        // 状态查询不启停采样或导出文件；必须同时限制两级子命令及参数数量，避免开放管理副作用。
+        return command_subcommand_matches(command, &[b"MEMORY"])
+            && command
+                .arg(2)
+                .is_some_and(|value| value.eq_ignore_ascii_case(b"STATUS"))
+            && command.arg(3).is_none();
+    }
+    if name.eq_ignore_ascii_case(b"SHOW") {
+        // 仅开放已知的进程和锁查询形态；缺少子命令及未知参数不能进入后端管理分派。
+        return (command.arg_count() == 2
+            && command_subcommand_matches(command, &[b"PROCESSLIST", b"LOCKS"]))
+            || (command.arg_count() == 3
+                && command_subcommand_matches(command, &[b"PROCESSLIST"])
+                && command
+                    .arg(2)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(b"ALL")));
+    }
+    // 管理命令同时承载查询与外部副作用，只放行明确的查询子命令，未知变体保持关闭。
+    if name.eq_ignore_ascii_case(b"SLOWLOG") || name.eq_ignore_ascii_case(b"COMMANDLOG") {
+        return command_subcommand_matches(command, &[b"GET", b"LEN", b"HELP"]);
+    }
+    if name.eq_ignore_ascii_case(b"LATENCY") {
+        return command_subcommand_matches(
+            command,
+            &[
+                b"LATEST",
+                b"HISTORY",
+                b"DOCTOR",
+                b"GRAPH",
+                b"HISTOGRAM",
+                b"HELP",
+            ],
+        );
+    }
+    if name.eq_ignore_ascii_case(b"HOTKEYS") {
+        // 查询不会启停热点采样或清除统计；限制完整形态，避免后续参数扩展越过只读门禁。
+        return command.arg_count() == 2 && command_subcommand_matches(command, &[b"GET", b"HELP"]);
+    }
+    if name.eq_ignore_ascii_case(b"BACKUP") {
+        // 状态、文件清单和帮助不改变备份状态；创建、封存、中止与清理都必须留在写入入口。
+        return command.arg_count() == 2
+            && command_subcommand_matches(command, &[b"STATUS", b"LIST", b"HELP"]);
+    }
+    if name.eq_ignore_ascii_case(b"SEARCH.CLUSTERINFO") {
+        // 只允许读取搜索拓扑；设置、刷新和未来带参数的扩展不能继承该查询权限。
+        return command.arg_count() == 1;
+    }
+    if name.eq_ignore_ascii_case(b"SYNCVERSION") {
+        // 两个问号表示读取已有同步元数据；任一数值参数都会转入持久化更新，必须拒绝。
+        return command.arg_count() == 5
+            && command.arg(2) == Some(b"?")
+            && command.arg(3) == Some(b"?")
+            && command.arg(4) == Some(b"v1");
+    }
+    if name.eq_ignore_ascii_case(b"PFDEBUG") {
+        // GETREG 也会把稀疏 HLL 写成稠密编码，不能按名称误认为纯查询。
+        return command.arg_count() == 3
+            && command_subcommand_matches(command, &[b"ENCODING", b"DECODE"]);
+    }
+    if name.eq_ignore_ascii_case(b"SLOTSEMPTY") {
+        // 槽位空集检查不删除数据；限定完整且有效的区间，避免异常范围触发后端无界扫描或整数回绕。
+        if command.arg_count() != 3 {
+            return false;
+        }
+        return match (
+            parse_command_usize(command, 1, "slot range start"),
+            parse_command_usize(command, 2, "slot range end"),
+        ) {
+            (Ok(start), Ok(end)) => start <= end && end < 16384,
+            _ => false,
+        };
+    }
+    if name.eq_ignore_ascii_case(b"MODULE") {
+        return command_subcommand_matches(command, &[b"LIST", b"HELP"]);
+    }
+    if name.eq_ignore_ascii_case(b"ACL") {
+        return command_subcommand_matches(
+            command,
+            &[b"CAT", b"GETUSER", b"LIST", b"USERS", b"WHOAMI", b"HELP"],
+        );
     }
     if name.eq_ignore_ascii_case(b"FUNCTION") {
         return command_subcommand_matches(command, &[b"LIST", b"DUMP", b"STATS", b"HELP"]);
@@ -2043,14 +2359,208 @@ fn command_is_read_only_request_response(command: &ClientCommand) -> bool {
             ],
         );
     }
+    if name.eq_ignore_ascii_case(b"CLUSTERX") {
+        return clusterx_is_read_only_query(command);
+    }
     if name.eq_ignore_ascii_case(b"GEORADIUS") || name.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER") {
         return !command_has_arg(command, b"STORE") && !command_has_arg(command, b"STOREDIST");
+    }
+    if name.eq_ignore_ascii_case(b"SORT_RO") {
+        return !read_query_has_write_destination(command, 2);
+    }
+    if name.eq_ignore_ascii_case(b"GEORADIUS_RO") {
+        return !read_query_has_write_destination(command, 6);
+    }
+    if name.eq_ignore_ascii_case(b"GEORADIUSBYMEMBER_RO") {
+        return !read_query_has_write_destination(command, 5);
+    }
+    if name.eq_ignore_ascii_case(b"STRALGO") {
+        return command_subcommand_matches(command, &[b"LCS"]);
     }
     if starts_with_ignore_ascii_case(name, b"JSON.") {
         return json_command_is_read_only(name);
     }
-    if starts_with_ignore_ascii_case(name, b"FT.") {
+    if starts_with_ignore_ascii_case(name, b"FT.") || name.eq_ignore_ascii_case(b"_FT.CONFIG") {
         return search_command_is_read_only(name, command);
+    }
+    is_additional_stateless_query(name)
+        || (name.eq_ignore_ascii_case(b"TS.READ") && timeseries_read_is_nonblocking(command))
+}
+
+/// 业务作用: 登记各后端的无会话状态查询扩展，供只读门禁与普通响应路径共用，防止查询被误送进不可逐帧检查的透明隧道。
+/// 参数说明:
+/// - `name`: 完整命令名，按 ASCII 大小写无关匹配，不因模块前缀或命名相似而放行其他命令。
+///
+/// 返回: 命中明确不修改键值、有效期或连接状态的查询时返回 `true`；后端是否实现该命令仍由其原生响应决定。
+fn is_additional_stateless_query(name: &[u8]) -> bool {
+    matches_ignore_ascii_case(
+        name,
+        &[
+            b"HEXPIRETIME",
+            b"HPTTL",
+            b"LCS",
+            b"SDIFFCARD",
+            b"SUNIONCARD",
+            b"ARCOUNT",
+            b"ARGET",
+            b"ARGETRANGE",
+            b"ARGREP",
+            b"ARINFO",
+            b"ARLASTITEMS",
+            b"ARLEN",
+            b"ARMGET",
+            b"ARNEXT",
+            b"AROP",
+            b"ARSCAN",
+            b"KEYDB.MEXISTS",
+            b"KEYDB.NHGET",
+            b"HRANGEBYLEX",
+            b"SICARD",
+            b"SIEXISTS",
+            b"SIRANGE",
+            b"SIRANGEBYVALUE",
+            b"SIREVRANGE",
+            b"SIREVRANGEBYVALUE",
+            b"ZEXPIRETIME",
+            b"ZPEXPIRETIME",
+            b"ZPTTL",
+            b"ZTTL",
+            b"HSCANX",
+            b"PKHRSCANRANGE",
+            b"PKHSCANRANGE",
+            b"PKRSCANRANGE",
+            b"PKSCANRANGE",
+            b"SCANX",
+            b"GETVSN",
+            b"HMGETVSN",
+            b"TBITCOUNT",
+            b"TBITPOS",
+            b"TGETBIT",
+            b"ZSCANBYSCORE",
+            b"HSIZE",
+            b"LSIZE",
+            b"SSIZE",
+            b"ZSIZE",
+            b"DBEMPTY",
+            b"ITERALL",
+            b"ITERALLKEYS",
+            b"ADMINGET",
+            b"BF.CARD",
+            b"BF.DEBUG",
+            b"BF.SCANDUMP",
+            b"CF.DEBUG",
+            b"CF.SCANDUMP",
+            b"TDIGEST.MIN",
+            b"TDIGEST.MAX",
+            b"TDIGEST.QUANTILE",
+            b"TDIGEST.CDF",
+            b"TDIGEST.TRIMMED_MEAN",
+            b"TDIGEST.RANK",
+            b"TDIGEST.REVRANK",
+            b"TDIGEST.BYRANK",
+            b"TDIGEST.BYREVRANK",
+            b"TDIGEST.INFO",
+            b"TS.GET",
+            b"TS.INFO",
+            b"TS.RANGE",
+            b"TS.REVRANGE",
+            b"TS.MGET",
+            b"TS.MRANGE",
+            b"TS.MREVRANGE",
+            b"TS.NRANGE",
+            b"TS.NREVRANGE",
+            b"TS.QUERYINDEX",
+            b"TS.QUERYLABELS",
+            b"VCARD",
+            b"VDIM",
+            b"VEMB",
+            b"VGETATTR",
+            b"VINFO",
+            b"VISMEMBER",
+            b"VLINKS",
+            b"VRANDMEMBER",
+            b"VRANGE",
+            b"VSIM",
+            b"RI.EXISTS",
+            b"RI.GET",
+            b"RI.SCAN",
+            b"RI.RANGE",
+            b"RI.CONFIG",
+            b"RI.METRICS",
+            b"LASTSAVE",
+            b"LOLWUT",
+            b"STATS",
+            b"POLLUPDATES",
+            b"KMETADATA",
+            b"ECHOKEY",
+            b"COMMANDLIST",
+            b"ROCKSPROPERTY",
+            b"BINLOGPOS",
+            b"BINLOGSTART",
+            b"BINLOGTIME",
+            b"BINLOGMETA",
+            b"RECYCLESTATUS",
+            b"REPLSTATUS",
+            b"TENDISSTAT",
+            b"CUSTOMOBJECTSCAN",
+            b"SLOTSHASHKEY",
+            b"SLOTSINFO",
+            b"SLOTSSCAN",
+            b"SLOTSMGRT-ASYNC-STATUS",
+        ],
+    )
+}
+
+/// 业务作用: 仅将明确不等待后续样本的时序读取放入池化请求路径，避免阻塞读取占用共享连接或使只读会话失去逐帧门禁。
+/// 参数说明:
+/// - `command`: 完整 TS.READ 命令，键和游标后只接受无可选参数或一组 MAX_COUNT 参数。
+///
+/// 返回: 参数形状属于已确认的非阻塞查询时返回 `true`；BLOCK、未知选项和不完整参数返回 `false`，游标和数量的合法性由后端验证。
+fn timeseries_read_is_nonblocking(command: &ClientCommand) -> bool {
+    if command.arg(1).is_none() || command.arg(2).is_none() {
+        return false;
+    }
+    // 仅检查可选参数区；键名为 BLOCK 不表示阻塞，但任何实际 BLOCK 选项都不得进入共享请求路径。
+    match command.arg(3) {
+        None => true,
+        Some(option) => {
+            option.eq_ignore_ascii_case(b"MAX_COUNT")
+                && command.arg(4).is_some()
+                && command.arg(5).is_none()
+        }
+    }
+}
+
+/// 业务作用: 为 Kvrocks 集群标识和配置版本查询统一只读范围，避免拓扑修改和同步迁移进入查询通道。
+/// 参数说明:
+/// - `command`: 调用方已经确认主命令为 CLUSTERX 的完整请求。
+///
+/// 返回: 仅完整的 MYID 或 VERSION 查询返回 `true`；缺少子命令、多余参数及其他动作返回 `false`。
+fn clusterx_is_read_only_query(command: &ClientCommand) -> bool {
+    command.arg_count() == 2 && command_subcommand_matches(command, &[b"MYID", b"VERSION"])
+}
+
+/// 业务作用: 在排序和地理查询的可选参数区拒绝写入目标，防止只读后缀掩盖写入意图，同时保留名为 STORE 的键、成员和查询模式。
+/// 参数说明:
+/// - `command`: 已解析的完整查询命令，必填参数不参与写入选项匹配。
+/// - `first_option`: 当前命令可选参数的起始位置，按 RESP 参数索引计数。
+///
+/// 返回: 可选参数中出现 STORE 或 STOREDIST 时返回 `true`；其他参数交由后端验证。
+fn read_query_has_write_destination(command: &ClientCommand, first_option: usize) -> bool {
+    let mut index = first_option;
+    while let Some(option) = command.arg(index) {
+        // 写入目标必须在路由之前拒绝，不能依赖不同后端对只读命令后缀的处理方式。
+        if matches_ignore_ascii_case(option, &[b"STORE", b"STOREDIST"]) {
+            return true;
+        }
+        // 查询模式和数量是选项值，不能把这些位置上的普通字节误判为写操作。
+        index += if matches_ignore_ascii_case(option, &[b"BY", b"GET", b"COUNT"]) {
+            2
+        } else if option.eq_ignore_ascii_case(b"LIMIT") {
+            3
+        } else {
+            1
+        };
     }
     false
 }
@@ -2080,11 +2590,13 @@ fn json_command_is_read_only(name: &[u8]) -> bool {
             b"JSON.MGET",
             b"JSON.TYPE",
             b"JSON.ARRLEN",
+            b"JSON.ARRINDEX",
             b"JSON.OBJKEYS",
             b"JSON.OBJLEN",
             b"JSON.STRLEN",
             b"JSON.RESP",
             b"JSON.DEBUG",
+            b"JSON.INFO",
         ],
     )
 }
@@ -2108,18 +2620,30 @@ fn search_command_is_read_only(name: &[u8], command: &ClientCommand) -> bool {
             b"FT.TAGVALS",
             b"FT.SYNDUMP",
             b"FT._LIST",
+            b"FT.ALIASLIST",
+            b"FT.DICTDUMP",
+            b"FT.GET",
+            b"FT.MGET",
+            b"FT.SUGGET",
+            b"FT.SUGLEN",
+            b"FT.HYBRID",
+            b"FT.SEARCHSQL",
+            b"FT.EXPLAINSQL",
         ],
     ) {
         return true;
     }
-    if name.eq_ignore_ascii_case(b"FT.CONFIG") {
+    if name.eq_ignore_ascii_case(b"FT.CONFIG") || name.eq_ignore_ascii_case(b"_FT.CONFIG") {
         return command_subcommand_matches(command, &[b"GET", b"HELP"]);
     }
     if name.eq_ignore_ascii_case(b"FT.CURSOR") {
         return command_subcommand_matches(command, &[b"READ"]);
     }
     if name.eq_ignore_ascii_case(b"FT.PROFILE") {
-        return command_subcommand_matches(command, &[b"SEARCH", b"AGGREGATE"]);
+        // FT.PROFILE 的第二个参数是索引名，查询类型位于其后；索引名不能充当放行依据。
+        return command
+            .arg(2)
+            .is_some_and(|kind| matches_ignore_ascii_case(kind, &[b"SEARCH", b"AGGREGATE"]));
     }
     false
 }
@@ -2149,7 +2673,7 @@ fn response_frames_bytes<C: AsRef<[u8]>>(responses: &[C]) -> usize {
 
 /// 业务作用: 把专用隧道满载或排队超时转换为稳定 RESP 错误，并记录对应拒绝指标。
 /// 参数说明:
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `command_count`: Redis 命令或外部命令参数，调用方按 RESP 或系统命令语义传入。
@@ -2184,7 +2708,7 @@ async fn write_dedicated_tunnel_limit_error(
 
 /// 业务作用: 把隧道后端建连或执行错误脱敏后写回前端，避免内部连接细节泄漏。
 /// 参数说明:
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `command_count`: Redis 命令或外部命令参数，调用方按 RESP 或系统命令语义传入。
 /// - `elapsed_micros`: 本次操作耗时的微秒值，用于延迟累计、最大值和直方指标。
@@ -2215,7 +2739,7 @@ async fn write_tunnel_backend_error(
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 /// - `generation`: 当前配置运行代次，用于隔离并回收热更新前的旧数据面。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `registry`: 进程内代理注册表，用于汇总状态并按名称定位运行时。
 /// - `coordinator`: 集群部署时用于关闭陈旧配置数据面的进程级协调器。
 /// - `publication_guard`: 多代理事务发布期间统一暂停新连接的进程级门禁。
@@ -2241,9 +2765,11 @@ async fn serve_cluster_node_proxy_listeners(
 ) -> anyhow::Result<()> {
     let metrics = ProxyMetrics::default();
     let generation_activity = ProxyGenerationActivity::default();
+    let data_tasks = TaskScope::default();
     let runtime = Arc::new(ClusterNodeProxyRuntime::from_proxy_item(
         &item,
         metrics.clone(),
+        data_tasks.spawner(),
     )?);
     let nodes = item.cluster_node_proxies()?.to_vec();
     let mut bound = Vec::with_capacity(nodes.len());
@@ -2263,6 +2789,7 @@ async fn serve_cluster_node_proxy_listeners(
         drop(bound_listeners);
         drop(bound);
         let _ = listener_closed.send(());
+        data_tasks.cancel_and_wait().await?;
         return Ok(());
     }
     drop(bound_listeners);
@@ -2318,23 +2845,39 @@ async fn serve_cluster_node_proxy_listeners(
         });
     }
     let _ = activated.send(());
-
+    let mut failure = None;
+    let mut resource_health = tokio::time::interval(Duration::from_millis(100));
+    resource_health.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = resource_health.tick() => {
+                if let Err(error) = data_tasks.check() {
+                    listeners.abort_all();
+                    failure = Some(error);
+                    break;
+                }
+            }
             _ = shutdown.changed() => {
                 info!(proxy = %item.name, "cluster-node-proxy listeners stopping");
                 break;
             }
             joined = listeners.join_next(), if !listeners.is_empty() => {
                 match joined {
-                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Ok(()))) if *shutdown.borrow() => {}
+                    Some(Ok(Ok(()))) => {
+                        listeners.abort_all();
+                        failure = Some(anyhow::anyhow!("cluster-node-proxy listener exited before shutdown"));
+                        break;
+                    }
                     Some(Ok(Err(err))) => {
                         listeners.abort_all();
-                        return Err(err);
+                        failure = Some(err);
+                        break;
                     }
-                    Some(Err(err)) => {
+                    Some(Err(_)) => {
                         listeners.abort_all();
-                        return Err(anyhow::anyhow!("cluster-node-proxy listener task failed: {err}"));
+                        failure = Some(anyhow::anyhow!("cluster-node-proxy listener task exited abnormally"));
+                        break;
                     }
                     None => break,
                 }
@@ -2356,15 +2899,23 @@ async fn serve_cluster_node_proxy_listeners(
         match joined {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                warn!(proxy = %item.name, error = %err, "cluster-node-proxy listener stopped with error")
+                failure.get_or_insert(err);
             }
             Err(err) if err.is_cancelled() => {}
-            Err(err) => {
-                warn!(proxy = %item.name, error = %err, "cluster-node-proxy listener join error")
+            Err(_) => {
+                failure.get_or_insert_with(|| {
+                    anyhow::anyhow!("cluster-node-proxy listener task exited abnormally")
+                });
             }
         }
     }
-    Ok(())
+    if let Err(error) = data_tasks.cancel_and_wait().await {
+        failure.get_or_insert(error);
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// 业务作用: 接受单个 Redis Cluster 源节点对应的前端连接，并把连接固定转发到该源节点。
@@ -2373,7 +2924,7 @@ async fn serve_cluster_node_proxy_listeners(
 /// - `node`: 当前 listener 对应的 cluster-node-proxy 节点映射配置。
 /// - `listener`: 已由父任务绑定完成、等待本节点接受连接的 listener。
 /// - `runtime`: 当前代理或 HA 运行时句柄，用于读取状态并执行受控操作。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `limiter`: 共享容量限制器，用于原子申请和释放当前操作占用的许可。
 /// - `tunnel_limiter`: 专用隧道容量控制器，用于限制连接绑定命令占用的后端连接。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
@@ -2471,7 +3022,7 @@ async fn accept_cluster_node_proxy_listener(
                     generation_activity.connection_finished();
                     metrics.connection_finished(has_error);
                     if let Err(err) = result {
-                        debug!(client = %peer, error = %err, "cluster-node-proxy connection closed with error");
+                        error!(client = %peer, error = %err, "cluster-node-proxy connection closed with error");
                     }
                 });
             }
@@ -2528,14 +3079,19 @@ async fn drain_connections(item: &ProxyItem, mut connections: JoinSet<()>) {
     );
 }
 
-/// 业务作用: 统一记录前端连接任务结束、取消或异常，避免后台错误静默丢失。
+/// 业务作用: 记录前端连接任务的异常退出，正常结束与受管取消保持静默。
 /// 参数说明:
 /// - `proxy_name`: 目标代理项名称，用于在同进程多代理中选择唯一运行时。
-/// - `joined`: 已等待完成的后台任务数量，用于确认所有监听器都已退出。
+/// - `joined`: 连接任务的等待结果；为空表示任务集合已经排空。
 ///
+/// 返回: 无返回值；非取消的任务异常写入 ERROR，正常完成和预期取消不输出日志。
 fn log_connection_join(proxy_name: &str, joined: Option<Result<(), tokio::task::JoinError>>) {
     if let Some(Err(err)) = joined {
-        debug!(
+        // 关闭预算到期后主动取消连接是受管收尾，不能为每条连接重复报告异常。
+        if err.is_cancelled() {
+            return;
+        }
+        error!(
             proxy = %proxy_name,
             error = %err,
             "connection task join error"
@@ -2654,7 +3210,7 @@ fn auth_mode_name(mode: AuthMode) -> &'static str {
 /// - `proxy_name`: 目标代理项名称，用于在同进程多代理中选择唯一运行时。
 /// - `runtime`: 当前代理或 HA 运行时句柄，用于读取状态并执行受控操作。
 /// - `refresh_interval`: Cluster 拓扑定时刷新间隔。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 ///
 // 定时刷新失败保留最后一次完整槽位表，不能发布半成品拓扑让请求随机落错节点。
 async fn watch_cluster_topology(
@@ -2678,13 +3234,10 @@ async fn watch_cluster_topology(
                                 error = %err,
                                 "periodic cluster topology refresh failed"
                             );
-                        } else {
-                            debug!(proxy = %proxy_name, "periodic cluster topology refresh completed");
                         }
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
-                            debug!(proxy = %proxy_name, "cluster topology watcher stopped");
                             return;
                         }
                     }
@@ -2692,7 +3245,6 @@ async fn watch_cluster_topology(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    debug!(proxy = %proxy_name, "cluster topology watcher stopped");
                     return;
                 }
             }
@@ -2704,8 +3256,8 @@ async fn watch_cluster_topology(
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 /// - `runtimes`: 同进程内注册的运行时集合，用于批量启动、关闭或聚合状态。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 ///
 /// 返回: 连接或批次完整结束并完成资源回收时返回成功；认证、路由、后端或 I/O 失败时返回错误。
@@ -2851,7 +3403,7 @@ async fn handle_connection(
             auth_result,
             shutdown,
             backend_addr,
-            Some(DynamicRoutingReceiver::ReplicationHa(routing_rx)),
+            Some(DynamicRoutingReceiver::replication_ha(routing_rx)),
             metrics,
         )
         .await;
@@ -2875,9 +3427,9 @@ async fn handle_connection(
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 /// - `connection_runtime`: 当前路由代次的数据面、可选 Sentinel 会话和独占隧道限制器。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 /// - `auth_result`: 前端认证解析结果，决定写回握手响应、拒绝连接或继续读取命令。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 ///
 /// 返回: 连接或批次完整结束并完成资源回收时返回成功；认证、路由、后端或 I/O 失败时返回错误。
@@ -2951,7 +3503,6 @@ async fn handle_standalone_connection(
                         bail!("client idle timeout");
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, "closing standalone connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -2965,7 +3516,6 @@ async fn handle_standalone_connection(
                         buf.extend_from_slice(&tmp[..n]);
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, "closing standalone connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -3032,7 +3582,7 @@ async fn handle_standalone_connection(
             write_response_frames(&mut client, &responses).await?;
             continue;
         }
-        let plan = classify_node_proxy_batch(commands);
+        let plan = classify_node_proxy_batch::<false>(commands);
 
         if let Some(tunnel_idx) = plan.tunnel_idx {
             if tunnel_idx > 0 {
@@ -3171,7 +3721,10 @@ async fn handle_standalone_connection(
                     BlockingRouteContext {
                         backend_addr: &runtime.backend,
                         backend_change: sentinel.as_ref().map(|context| {
-                            DynamicRoutingReceiver::Sentinel(context.control.routing_rx())
+                            DynamicRoutingReceiver::Sentinel {
+                                receiver: context.control.routing_rx(),
+                                generation: context.generation,
+                            }
                         }),
                     },
                 )
@@ -3233,18 +3786,20 @@ async fn handle_standalone_connection(
             let pending_client_to_backend = std::mem::take(&mut buf);
             // Sentinel 的事务、订阅和无限阻塞命令不能迁移。为透明隧道额外订阅
             // 路由 watch；新主发布或进入保护态时同时关闭前后端，由 SDK 重建状态。
-            let (relay_shutdown, route_stop_task) = if let Some(context) = sentinel.as_ref() {
-                let (receiver, task) = spawn_dynamic_relay_stop(
-                    item.name.clone(),
+            let (relay_shutdown, route_stop, authority) = if let Some(context) = sentinel.as_ref() {
+                let (receiver, task, authority) = dynamic_relay_stop(
                     runtime.backend.clone(),
-                    DynamicRoutingReceiver::Sentinel(context.routing_rx.clone()),
+                    DynamicRoutingReceiver::Sentinel {
+                        receiver: context.routing_rx.clone(),
+                        generation: context.generation,
+                    },
                     shutdown.clone(),
                 );
-                (receiver, Some(task))
+                (receiver, Some(task), Some(authority))
             } else {
-                (shutdown, None)
+                (shutdown, None, None)
             };
-            let (client_to_backend, backend_to_client) = copy_bidirectional_bounded_with_preface(
+            let (client_to_backend, backend_to_client) = copy_bidirectional_bounded_with_stop(
                 client,
                 relay_parts.stream,
                 pending_client_to_backend,
@@ -3252,19 +3807,17 @@ async fn handle_standalone_connection(
                 relay_shutdown,
                 metrics.clone(),
                 client_idle_timeout,
+                (relay_parts.legacy_garnet_etag || relay_parts.garnet_single_key_migrate)
+                    .then_some(GarnetRelayCompatibility {
+                        frame_limit: item.frame_max_bytes,
+                        legacy_etag: relay_parts.legacy_garnet_etag,
+                        single_key_migrate: relay_parts.garnet_single_key_migrate,
+                    }),
+                route_stop,
+                authority,
             )
             .await?;
-            if let Some(task) = route_stop_task {
-                task.abort();
-            }
             metrics.record_relay_bytes(client_to_backend, backend_to_client);
-            debug!(
-                proxy = %item.name,
-                backend = %runtime.backend,
-                client_to_backend,
-                backend_to_client,
-                "standalone switched to dedicated tunnel"
-            );
             return Ok(());
         }
 
@@ -3391,11 +3944,11 @@ fn synchronize_sentinel_session_route(
 /// 业务作用: 在 replication-ha 只读模式逐批校验命令，并在路由保护或切主时丢弃旧主在途响应并关闭会话。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 /// - `auth_result`: 前端认证解析结果，决定写回握手响应、拒绝连接或继续读取命令。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `backend_addr`: 目标网络地址，通常为 `host:port`，用于连接、监听或状态查询。
-/// - `backend_change`: 后端路由是否已经变化的标记，用于决定旧连接是否必须关闭。
+/// - `backend_change`: 保留连接准入时已见位置的 HA 路由接收器，任何后续发布都使旧会话失效。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 ///
 /// 返回: 连接或批次完整结束并完成资源回收时返回成功；认证、路由、后端或 I/O 失败时返回错误。
@@ -3422,13 +3975,8 @@ async fn handle_replication_ha_readonly_connection(
     .await?;
 
     loop {
-        if let Some(reason) = ha_relay_close_reason(&backend_change.borrow(), &backend_addr) {
-            info!(
-                proxy = %item.name,
-                old_backend = %backend_addr,
-                reason = %reason,
-                "closing replication-ha readonly session because route changed"
-            );
+        // 路由通知可能合并保护与同地址恢复；准入后的任何发布都要求旧会话重新连接。
+        if ha_relay_close_reason(&backend_change, &backend_addr).is_some() {
             return Ok(());
         }
 
@@ -3475,13 +4023,11 @@ async fn handle_replication_ha_readonly_connection(
                     _ = tokio::time::sleep(timeout) => {
                         bail!("client idle timeout");
                     }
-                    changed = backend_change.changed() => {
-                        if changed.is_err() || ha_relay_close_reason(&backend_change.borrow(), &backend_addr).is_some() {
-                            return Ok(());
-                        }
+                    _ = backend_change.changed() => {
+                        // changed 已消费通知，直接关闭，不能只检查合并后的可服务地址。
+                        return Ok(());
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, "closing replication-ha readonly connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -3494,13 +4040,11 @@ async fn handle_replication_ha_readonly_connection(
                         }
                         buf.extend_from_slice(&tmp[..n]);
                     }
-                    changed = backend_change.changed() => {
-                        if changed.is_err() || ha_relay_close_reason(&backend_change.borrow(), &backend_addr).is_some() {
-                            return Ok(());
-                        }
+                    _ = backend_change.changed() => {
+                        // 同地址恢复不恢复旧会话的路由资格。
+                        return Ok(());
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, "closing replication-ha readonly connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -3550,7 +4094,7 @@ async fn handle_replication_ha_readonly_connection(
             continue;
         }
 
-        let plan = classify_node_proxy_batch(commands);
+        let plan = classify_node_proxy_batch::<false>(commands);
         if let Some(tunnel_idx) = plan.tunnel_idx {
             let tunnel_command_count = commands.len() - tunnel_idx;
             let responses = vec![read_only_error(&item.name); tunnel_command_count];
@@ -3591,19 +4135,7 @@ async fn handle_replication_ha_readonly_connection(
         // 重连到新 master。数据正确性优先于切换窗口内的一次请求可用性。
         let execution = tokio::select! {
             biased;
-            changed = backend_change.changed() => {
-                let reason = if changed.is_err() {
-                    "routing state channel closed".to_string()
-                } else {
-                    ha_relay_close_reason(&backend_change.borrow(), &backend_addr)
-                        .unwrap_or_else(|| "routing state changed".to_string())
-                };
-                info!(
-                    proxy = %item.name,
-                    old_backend = %backend_addr,
-                    reason = %reason,
-                    "closing replication-ha readonly session during backend request"
-                );
+            _ = backend_change.changed() => {
                 return Ok(());
             }
             execution = backend.send_raw_pipeline_joined(exec_raw, exec_commands.len()) => {
@@ -3614,13 +4146,7 @@ async fn handle_replication_ha_readonly_connection(
         // 先返回，也必须在写客户端前再次读取最新状态，封住最后一个旧响应
         // 外泄窗口。此处只丢弃响应，不重放命令，避免未来新增带副作用命令时
         // 因自动重试产生重复执行。
-        if let Some(reason) = ha_relay_close_reason(&backend_change.borrow(), &backend_addr) {
-            info!(
-                proxy = %item.name,
-                old_backend = %backend_addr,
-                reason = %reason,
-                "discarding replication-ha readonly response because route changed"
-            );
+        if ha_relay_close_reason(&backend_change, &backend_addr).is_some() {
             return Ok(());
         }
         let elapsed_micros = duration_micros_u64(started.elapsed());
@@ -3667,17 +4193,17 @@ async fn handle_replication_ha_readonly_connection(
     }
 }
 
-/// 业务作用: 建立指定后端的认证连接并执行有界双向透明转发，动态路由变化时主动终止旧后端隧道。
+/// 业务作用: 建立认证连接，把握手遗留字节交给受保护的有界转发，并在失去路由或关闭时终止隧道。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
-/// - `auth_result`: 前端认证解析结果，决定写回握手响应、拒绝连接或继续读取命令。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
+/// - `auth_result`: 已完成认证后的预读字节与 RESP 协商状态，用于接续后端握手及受保护转发。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `backend_addr`: 目标网络地址，通常为 `host:port`，用于连接、监听或状态查询。
-/// - `backend_change`: 后端路由是否已经变化的标记，用于决定旧连接是否必须关闭。
+/// - `backend_change`: 可选的动态路由快照与通知，后端连接建立后复验，失效时禁止继续转发。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 ///
-/// 返回: 连接或批次完整结束并完成资源回收时返回成功；认证、路由、后端或 I/O 失败时返回错误。
+/// 返回: 对端结束或路由、关闭门禁终止转发时返回成功；建连、认证、协议协商、idle 或 I/O 失败时返回错误。
 // 后端地址变化与 shutdown 同时参与 relay 取消，旧主连接不能在新路由发布后继续传递响应。
 async fn handle_tcp_relay(
     item: Arc<ProxyItem>,
@@ -3715,33 +4241,33 @@ async fn handle_tcp_relay(
     }
     let relay_parts = backend.into_relay_parts();
     let _backend_connection = relay_parts.backend_connection_guard;
-    let mut backend = relay_parts.stream;
+    let backend = relay_parts.stream;
 
-    if !leftover.is_empty() {
-        backend.write_all(&leftover).await?;
-    }
+    // 建连和认证期间可能已经撤回路由或关闭运行代；预读请求必须等关闭观察先复验后再发送。
+    // 后端握手多读的响应也交给同一作用域，保持它们先于后续 socket 字节写回客户端。
 
     let (client_to_backend, backend_to_client) = if let Some(backend_change) = backend_change {
-        let (relay_stop_rx, stop_task) = spawn_dynamic_relay_stop(
-            item.name.clone(),
-            backend_addr.clone(),
-            backend_change,
-            shutdown.clone(),
-        );
-        let result = copy_bidirectional_bounded(
+        let (relay_stop_rx, stop, authority) =
+            dynamic_relay_stop(backend_addr.clone(), backend_change, shutdown.clone());
+        copy_bidirectional_bounded_with_stop(
             client,
             backend,
+            leftover,
+            relay_parts.pending_response,
             relay_stop_rx,
             metrics.clone(),
             optional_duration_ms(item.client_idle_timeout_ms),
+            None,
+            Some(stop),
+            Some(authority),
         )
-        .await;
-        stop_task.abort();
-        result?
+        .await?
     } else {
         copy_bidirectional_bounded(
             client,
             backend,
+            leftover,
+            relay_parts.pending_response,
             shutdown,
             metrics.clone(),
             optional_duration_ms(item.client_idle_timeout_ms),
@@ -3749,48 +4275,43 @@ async fn handle_tcp_relay(
         .await?
     };
     metrics.record_relay_bytes(client_to_backend, backend_to_client);
-    debug!(
-        proxy = %item.name,
-        client_to_backend,
-        backend_to_client,
-        "relay finished"
-    );
 
     Ok(())
 }
 
-/// 业务作用: 启动动态路由隧道的停止观察器。
+/// 业务作用: 创建随前端连接共同执行和释放的动态路由停止观察器。
 ///
 /// 参数说明：
-/// - `proxy_name`：当前代理名称，用于切路由关闭日志。
 /// - `old_backend`：当前透明隧道实际连接的旧后端地址。
 /// - `backend_change`：replication HA 或 Sentinel 路由 watch 的统一接收器。
 /// - `shutdown`：进程级关闭信号，保证退出时观察器和 relay 同步收敛。
 ///
-/// 返回：返回 relay 停止接收器和观察任务句柄；调用方在 relay 结束后取消任务。
+/// 返回：relay 停止接收器、观察 future 与原始控制来源；调用方必须在连接作用域内驱动观察，独立方向恢复 I/O 前复验控制来源。
 ///
-/// 观察器同时接收进程关闭与后端路由 watch；一旦旧地址不再可服务，就发布本地
-/// stop 信号。调用方持有任务句柄并在 relay 正常结束后主动取消，避免后台任务泄漏。
-fn spawn_dynamic_relay_stop(
-    proxy_name: String,
+/// 观察器进入时复验准入状态，随后由进程关闭或后端路由 watch 唤醒；路由失效或
+/// 通知来源消失时发布本地 stop。父连接在成功、错误和强取消时一并释放其路由引用。
+fn dynamic_relay_stop(
     old_backend: String,
     mut backend_change: DynamicRoutingReceiver,
     mut shutdown: watch::Receiver<bool>,
-) -> (watch::Receiver<bool>, tokio::task::JoinHandle<()>) {
+) -> (
+    watch::Receiver<bool>,
+    impl std::future::Future<Output = ()>,
+    RelayAuthority,
+) {
+    // 在本地关闭通道之外保留原始权威，父观察尚未获得调度时也不能继续失权 I/O。
+    let authority = RelayAuthority::dynamic(&shutdown, &old_backend, &backend_change);
     let (relay_stop_tx, relay_stop_rx) = watch::channel(false);
-    let task = tokio::spawn(async move {
-        let mut poll = tokio::time::interval(Duration::from_millis(50));
-        poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let observe = async move {
         loop {
-            if let Some(reason) = backend_change.close_reason(&old_backend) {
-                info!(
-                    proxy = %proxy_name,
-                    old_backend = %old_backend,
-                    reason = %reason,
-                    "closing relay because dynamic backend route changed"
-                );
+            if *shutdown.borrow() {
                 break;
             }
+            if backend_change.close_reason(&old_backend).is_some() {
+                break;
+            }
+            // 状态发布与发送端消失都会唤醒 watch；持续保留两个等待即可覆盖空闲连接，
+            // 无需按连接周期唤醒。循环入口的复验同时覆盖首次登记通知之前的路由变化。
             tokio::select! {
                 _ = shutdown.changed() => break,
                 changed = backend_change.changed() => {
@@ -3798,21 +4319,30 @@ fn spawn_dynamic_relay_stop(
                         break;
                     }
                 },
-                _ = poll.tick() => {}
             }
         }
+        // 原路由失效后先关闭本地转发门禁，作用域退出再同步回收两侧资源。
         let _ = relay_stop_tx.send(true);
-    });
-    (relay_stop_rx, task)
+    };
+    (relay_stop_rx, observe, authority)
 }
 
-/// 业务作用: 判断 replication-ha 路由变化后指向旧主的透明连接是否必须关闭。
+/// 业务作用: 判断 replication-ha 连接准入后是否经历路由变化，防止旧会话跨越保护窗口。
 /// 参数说明:
-/// - `state`: 共享运行时状态快照或状态容器，用于跨任务读取和更新业务状态。
+/// - `receiver`: 保留连接准入时已见位置的路由接收器；调用方不能消费变化后继续使用旧连接。
 /// - `old_backend`: 切换前的后端地址，用于识别并关闭仍指向旧 master 的连接。
 ///
-fn ha_relay_close_reason(state: &HaRoutingState, old_backend: &str) -> Option<String> {
-    match state {
+/// 返回: 路由发布、控制来源消失、保护或地址变化时返回关闭原因；准入路由仍有效时返回 None。
+fn ha_relay_close_reason(
+    receiver: &watch::Receiver<HaRoutingState>,
+    old_backend: &str,
+) -> Option<String> {
+    let state = receiver.borrow();
+    // 持有当前状态的读借用期间核对通知位置，避免保护与恢复被合并后仅按最终地址继续转发。
+    if receiver.has_changed().unwrap_or(true) {
+        return Some("replication HA route changed or watcher closed".to_string());
+    }
+    match &*state {
         HaRoutingState::Serving { master } if master != old_backend => {
             Some(format!("backend master changed to {master}"))
         }
@@ -3826,13 +4356,21 @@ fn ha_relay_close_reason(state: &HaRoutingState, old_backend: &str) -> Option<St
 /// 参数说明：
 /// - `state`：最新 Sentinel 路由状态快照。
 /// - `old_backend`：现有 relay 实际连接的旧数据节点地址。
+/// - `old_generation`：建立当前连接资源时绑定的 Sentinel 路由代次。
 ///
-/// 返回：旧地址已不可服务时返回关闭原因；仍是当前已验证主节点时返回 `None`。
-fn sentinel_relay_close_reason(state: &SentinelRoutingState, old_backend: &str) -> Option<String> {
+/// 返回：地址或代次已失效时返回关闭原因；仍属于当前已验证路由时返回 `None`。
+fn sentinel_relay_close_reason(
+    state: &SentinelRoutingState,
+    old_backend: &str,
+    old_generation: u64,
+) -> Option<String> {
     match state {
-        SentinelRoutingState::Serving { master, .. } if master != old_backend => {
-            Some(format!("backend master changed to {master}"))
-        }
+        // watch 可以合并保护和恢复通知；即使主地址相同，旧代连接也不能跨过保护窗口继续转发。
+        SentinelRoutingState::Serving {
+            master, generation, ..
+        } if master != old_backend || *generation != old_generation => Some(format!(
+            "backend route changed to {master} at generation {generation}"
+        )),
         SentinelRoutingState::Serving { .. } => None,
         SentinelRoutingState::Resolving { reason } => Some(format!("resolving: {reason}")),
         SentinelRoutingState::Protected { reason } => Some(format!("protected: {reason}")),
@@ -3858,9 +4396,11 @@ struct NodeProxyBatch {
 
 /// 业务作用: 在关闭、路由切换和双向 idle 门禁下复制前后端字节流。
 /// 参数说明:
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 /// - `backend`: 当前操作对应的后端目标或连接句柄，用于转发命令并归属资源统计。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `client_to_backend_preface`: 认证阶段已读到的客户端字节，受路由和关闭门禁保护后按序发送。
+/// - `backend_to_client_preface`: 后端握手多读的响应，保持先于后续响应写回。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `client_idle_timeout`: 前端连接在 relay 阶段允许保持空闲的最长时间。
 ///
@@ -3868,6 +4408,8 @@ struct NodeProxyBatch {
 async fn copy_bidirectional_bounded(
     client: TcpStream,
     backend: BackendStream,
+    client_to_backend_preface: Vec<u8>,
+    backend_to_client_preface: Vec<u8>,
     shutdown: watch::Receiver<bool>,
     metrics: ProxyMetrics,
     client_idle_timeout: Option<Duration>,
@@ -3875,28 +4417,84 @@ async fn copy_bidirectional_bounded(
     copy_bidirectional_bounded_with_preface(
         client,
         backend,
-        Vec::new(),
-        Vec::new(),
+        client_to_backend_preface,
+        backend_to_client_preface,
         shutdown,
         metrics,
         client_idle_timeout,
+        None,
     )
     .await
 }
 
+/// 业务作用: 为 Garnet 专用连接携带已确认的命令形态兼容及单帧内存上限。
+#[derive(Clone, Copy)]
+struct GarnetRelayCompatibility {
+    frame_limit: usize,
+    legacy_etag: bool,
+    single_key_migrate: bool,
+}
+
 /// 业务作用: 执行带预置字节的双向转发，用于把已解析连接切换到透明隧道且不丢失缓冲区数据。
 /// 参数说明:
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
-/// - `backend`: 当前操作对应的后端目标或连接句柄，用于转发命令并归属资源统计。
+/// - `client`: 已完成前端准入的客户端连接。
+/// - `backend`: 与当前路由目标绑定的后端连接。
 /// - `client_to_backend_preface`: 进入透明转发前已从客户端读取的前置字节，必须先转发到后端。
 /// - `backend_to_client_preface`: 建立透明转发前已从后端读取的前置字节，必须先按原顺序写回客户端。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 进程退出或动态路由保护时触发的连接关闭信号。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `client_idle_timeout`: 前端连接在 relay 阶段允许保持空闲的最长时间。
+/// - `garnet_compatibility`: 同连接确认的 Garnet 命令兼容及帧上限；None 保留透明字节转发。
 ///
 /// 返回: 双向转发结束时返回两个方向的字节数；关闭、idle 或 I/O 异常按对应结果返回。
-// 执行带预置字节的双向转发，用于把已解析连接切换到透明隧道且不丢失缓冲区数据。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "双向流及各自前置字节独立移交，关闭信号、计数和兼容策略沿用同一连接边界"
+)]
 async fn copy_bidirectional_bounded_with_preface(
+    client: TcpStream,
+    backend: BackendStream,
+    client_to_backend_preface: Vec<u8>,
+    backend_to_client_preface: Vec<u8>,
+    shutdown: watch::Receiver<bool>,
+    metrics: ProxyMetrics,
+    client_idle_timeout: Option<Duration>,
+    garnet_compatibility: Option<GarnetRelayCompatibility>,
+) -> io::Result<(u64, u64)> {
+    copy_bidirectional_bounded_with_stop(
+        client,
+        backend,
+        client_to_backend_preface,
+        backend_to_client_preface,
+        shutdown,
+        metrics,
+        client_idle_timeout,
+        garnet_compatibility,
+        None::<std::future::Pending<()>>,
+        None,
+    )
+    .await
+}
+
+/// 业务作用: 在同一连接作用域内观察关闭与路由保护并驱动双向转发，保留已成功发送的部分字节计数。
+/// 参数说明:
+/// - `client`: 已完成前端准入的客户端连接。
+/// - `backend`: 与当前路由绑定的后端连接，停止时与客户端同时释放。
+/// - `client_to_backend_preface`: 握手期间预读的请求，关闭及路由复验通过后才按序转发。
+/// - `backend_to_client_preface`: 握手期间预读的响应，必须先于后续响应写回。
+/// - `shutdown`: 每次读取和写入前复验的关闭门禁；动态路由观察在停止前向此门禁发布关闭。
+/// - `metrics`: 当前代理的流量及背压观测对象。
+/// - `client_idle_timeout`: 可选的双向静默超时，任一方向接收字节都续活。
+/// - `garnet_compatibility`: 同一连接确认的 Garnet 兼容范围及帧上限。
+/// - `route_stop`: 同时观察进程关闭及动态路由的过程；缺省时直接等待 shutdown，避免重复等待同一停止事件。
+/// - `authority`: 独立转发任务在恢复 I/O 前复验的原始控制来源；固定路由从 shutdown 构造。
+///
+/// 返回: 关闭或正常结束时返回已发送字节数；传播 idle 和 I/O 错误，父任务取消时同步释放观察与两侧套接字。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "双向流、预读字节、门禁与路由观察共同绑定当前连接，协议兼容及计数沿用该边界"
+)]
+async fn copy_bidirectional_bounded_with_stop<S>(
     mut client: TcpStream,
     mut backend: BackendStream,
     client_to_backend_preface: Vec<u8>,
@@ -3904,63 +4502,129 @@ async fn copy_bidirectional_bounded_with_preface(
     shutdown: watch::Receiver<bool>,
     metrics: ProxyMetrics,
     client_idle_timeout: Option<Duration>,
-) -> io::Result<(u64, u64)> {
+    garnet_compatibility: Option<GarnetRelayCompatibility>,
+    route_stop: Option<S>,
+    authority: Option<RelayAuthority>,
+) -> io::Result<(u64, u64)>
+where
+    S: std::future::Future<Output = ()>,
+{
     let counters = Arc::new(RelayCounters::default());
-    if !backend_to_client_preface.is_empty() {
-        client.write_all(&backend_to_client_preface).await?;
-        counters
-            .backend_to_client
-            .fetch_add(backend_to_client_preface.len() as u64, Ordering::Relaxed);
+    let shutdown_gate = RelayShutdown::new(&shutdown);
+    // 已关闭的连接不能发送握手遗留字节；关闭观察覆盖前置数据及两个转发方向。
+    if shutdown_gate.is_closed() {
+        return Ok((0, 0));
     }
-    if !client_to_backend_preface.is_empty() {
-        backend.write_all(&client_to_backend_preface).await?;
-        counters
-            .client_to_backend
-            .fetch_add(client_to_backend_preface.len() as u64, Ordering::Relaxed);
-    }
-    let (client_read, client_write) = client.into_split();
-    let (backend_read, backend_write) = tokio::io::split(backend);
+    let authority = authority.unwrap_or_else(|| RelayAuthority::fixed(&shutdown));
+    let mut shutdown_observer = shutdown.clone();
+    let transfer = async {
+        if !backend_to_client_preface.is_empty() {
+            write_all_with_backpressure(
+                &mut AuthorityCheckedIo::new(&mut client, authority.clone()),
+                &backend_to_client_preface,
+                &shutdown_gate,
+                &metrics,
+                false,
+                &counters.backend_to_client,
+            )
+            .await?;
+        }
+        if garnet_compatibility.is_none() && !client_to_backend_preface.is_empty() {
+            write_all_with_backpressure(
+                &mut AuthorityCheckedIo::new(&mut backend, authority.clone()),
+                &client_to_backend_preface,
+                &shutdown_gate,
+                &metrics,
+                true,
+                &counters.client_to_backend,
+            )
+            .await?;
+        }
+        if client_idle_timeout.is_none() && garnet_compatibility.is_none() {
+            return copy_owned_relay_pair(
+                client,
+                backend,
+                shutdown.clone(),
+                metrics.clone(),
+                counters.clone(),
+                Some(authority),
+            )
+            .await;
+        }
+        let (client_read, client_write) = client.into_split();
+        let (backend_read, backend_write) = tokio::io::split(backend);
+        // idle 和命令兼容路径也在每次 I/O 前复验，不能只依赖父观察下一次获得调度。
+        let client_read = AuthorityCheckedIo::new(client_read, authority.clone());
+        let backend_write = AuthorityCheckedIo::new(backend_write, authority.clone());
+        let backend_read = AuthorityCheckedIo::new(backend_read, authority.clone());
+        let client_write = AuthorityCheckedIo::new(client_write, authority);
 
-    // idle 判定基于「双向」活动共享的最近活动时间戳：任一方向有字节流动即刷新，
-    // 使持续收 pub/sub 推送或阻塞等待结果的连接(SUBSCRIBE/BLPOP/XREAD BLOCK/WAIT)不被误杀，
-    // 同时真正双向静默的连接仍在 idle_timeout 后被精确回收。tunnel 之外的普通 pipeline 不走此路径。
-    let last_activity = Arc::new(AtomicU64::new(0));
-    let idle_base = Instant::now();
+        // 未启用 idle 时不分配活动状态，也不在每次转发时读取时钟或写入共享时间戳。
+        // 启用后两个方向共同续活，持续接收后端推送的连接不会因客户端静默而超时。
+        let activity = client_idle_timeout.map(|timeout| {
+            Arc::new(RelayActivity {
+                timeout,
+                last_activity: AtomicU64::new(0),
+                base: Instant::now(),
+            })
+        });
 
-    let mut client_to_backend_task = tokio::spawn(copy_relay_direction(
-        client_read,
-        backend_write,
-        shutdown.clone(),
-        metrics.clone(),
-        counters.clone(),
-        true,
-        RelayIdle {
-            timeout: client_idle_timeout,
-            last_activity: last_activity.clone(),
-            base: idle_base,
-        },
-    ));
-    let mut backend_to_client_task = tokio::spawn(copy_relay_direction(
-        backend_read,
-        client_write,
-        shutdown,
-        metrics,
-        counters.clone(),
-        false,
-        RelayIdle {
-            timeout: None,
-            last_activity,
-            base: idle_base,
-        },
-    ));
-
-    let result = tokio::select! {
-        result = &mut client_to_backend_task => join_relay_result(result),
-        result = &mut backend_to_client_task => join_relay_result(result),
+        let idle = RelayIdle {
+            enforce_timeout: true,
+            activity: activity.clone(),
+        };
+        // 两个方向属于同一前端连接的作用域；连接取消或任一方向结束时直接释放另一方向，
+        // 防止套接字和凭据引用被独立任务继续持有，也不增加每次转发的任务调度。
+        let client_to_backend = async {
+            if let Some(compatibility) = garnet_compatibility {
+                copy_garnet_command_direction(
+                    client_read,
+                    backend_write,
+                    client_to_backend_preface,
+                    compatibility,
+                    &shutdown_gate,
+                    metrics.clone(),
+                    counters.clone(),
+                    idle,
+                )
+                .await
+            } else {
+                copy_relay_direction(
+                    client_read,
+                    backend_write,
+                    &shutdown_gate,
+                    metrics.clone(),
+                    counters.clone(),
+                    true,
+                    idle,
+                )
+                .await
+            }
+        };
+        let backend_to_client = copy_relay_direction(
+            backend_read,
+            client_write,
+            &shutdown_gate,
+            metrics.clone(),
+            counters.clone(),
+            false,
+            RelayIdle {
+                enforce_timeout: false,
+                activity,
+            },
+        );
+        drive_relay_directions(client_to_backend, backend_to_client).await
     };
-
-    client_to_backend_task.abort();
-    backend_to_client_task.abort();
+    // 动态观察先复验路由并覆盖进程关闭，完成后直接结束转发，无需再等待它发布的本地 stop。
+    // 两类连接共用一个优先观察过程；方向内部仍复验门禁，父取消同步释放观察及转发。
+    let result = drive_relay_until_stop(transfer, async {
+        if let Some(stop) = route_stop {
+            stop.await;
+        } else {
+            let _ = shutdown_observer.changed().await;
+        }
+    })
+    .await;
     result?;
 
     Ok((
@@ -3969,30 +4633,789 @@ async fn copy_bidirectional_bounded_with_preface(
     ))
 }
 
-/// 业务作用: 保存双向 relay 共享活动时钟和 idle 超时，使任一方向有流量即可续活。
-// tunnel/relay 的 idle 计时上下文：timeout 只在 client->backend 方向生效；
-// last_activity/base 由两个方向共享，任一方向有字节流动即刷新，实现「双向活动」的精确 idle 判定。
-struct RelayIdle {
-    timeout: Option<Duration>,
-    last_activity: Arc<AtomicU64>,
+/// 业务作用: 在连接作用域内优先响应关闭，只在关闭观察收到通知时驱动它，避免数据唤醒重复检查空闲通知。
+/// 参数说明:
+/// - `transfer`: 持有双向套接字和转发门禁的过程，关闭或父任务取消时同步释放。
+/// - `stop`: 关闭通知或通知来源消失的等待过程，不独立发布业务路由。
+///
+/// 返回: 关闭时成功并释放转发；转发先完成则保留其结果，父任务取消时同时释放两个过程。
+async fn drive_relay_until_stop<F, S>(transfer: F, stop: S) -> io::Result<()>
+where
+    F: std::future::Future<Output = io::Result<()>>,
+    S: std::future::Future<Output = ()>,
+{
+    use futures_util::{stream::FuturesUnordered, StreamExt};
+    let mut stops = FuturesUnordered::new();
+    stops.push(stop);
+    tokio::select! {
+        // 关闭与数据同时就绪时先结束转发，禁止把已失效连接的缓冲继续送入对端。
+        biased;
+        _ = stops.next() => Ok(()),
+        result = transfer => result,
+    }
+}
+
+/// 业务作用: 合并同一转发方向的重复唤醒，只在该方向从未就绪转为就绪时通知所属连接。
+struct RelayDirectionWake {
+    ready: std::sync::atomic::AtomicBool,
+    parent: std::task::Waker,
+}
+
+impl std::task::Wake for RelayDirectionWake {
+    /// 业务作用: 接收持有所有权的方向通知，并交给同一就绪门禁合并重复唤醒。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 标记方向就绪，必要时唤醒父连接；不创建后台任务。
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    /// 业务作用: 发布方向就绪状态，确保正在轮询或即将挂起的连接不会遗漏通知。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 首次未消费通知唤醒父连接，已就绪时保留该状态并合并重复通知。
+    fn wake_by_ref(self: &Arc<Self>) {
+        if !self.ready.swap(true, Ordering::AcqRel) {
+            self.parent.wake_by_ref();
+        }
+    }
+}
+
+/// 业务作用: 在连接作用域内保存一个转发方向的就绪状态及供 I/O 登记的唤醒句柄。
+struct RelayDirection {
+    state: Arc<RelayDirectionWake>,
+    waker: std::task::Waker,
+}
+
+impl RelayDirection {
+    /// 业务作用: 绑定父连接并允许首次轮询，使两个方向先登记各自的 I/O 通知。
+    /// 参数说明:
+    /// - `parent`: 当前执行器提供的连接唤醒句柄。
+    ///
+    /// 返回: 初始就绪的方向状态，不持有套接字或创建任务。
+    fn new(parent: &std::task::Waker) -> Self {
+        let state = Arc::new(RelayDirectionWake {
+            ready: std::sync::atomic::AtomicBool::new(true),
+            parent: parent.clone(),
+        });
+        Self {
+            waker: std::task::Waker::from(state.clone()),
+            state,
+        }
+    }
+
+    /// 业务作用: 只驱动首次登记或已收到通知的方向，避免对向数据唤醒重复轮询闲置 I/O。
+    /// 参数说明:
+    /// - `future`: 仍由父连接持有的单向转发过程。
+    ///
+    /// 返回: 方向未就绪时保持挂起；否则返回本次轮询结果，轮询期间的新通知留给下一次驱动。
+    fn poll<F: std::future::Future>(&self, future: Pin<&mut F>) -> std::task::Poll<F::Output> {
+        self.poll_with(|cx| future.poll(cx))
+    }
+
+    /// 业务作用: 消费方向通知后在当前上下文轮询借用的 I/O，不把流借用移交给其它任务。
+    /// 参数说明:
+    /// - `poll`: 只在方向就绪时执行的同步轮询过程。
+    ///
+    /// 返回: 未就绪时挂起；已就绪时保留轮询结果以及轮询期间新产生的通知。
+    fn poll_with<T>(
+        &self,
+        poll: impl FnOnce(&mut std::task::Context<'_>) -> std::task::Poll<T>,
+    ) -> std::task::Poll<T> {
+        // 在进入方向过程前消费当前通知；并发或自唤醒会重新置位，不能在轮询后清除它。
+        if self.state.ready.load(Ordering::Acquire)
+            && self.state.ready.swap(false, Ordering::AcqRel)
+        {
+            poll(&mut std::task::Context::from_waker(&self.waker))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// 业务作用: 在连接任务内交替驱动已就绪的转发方向，任一方向结束后同步释放另一方向。
+/// 参数说明:
+/// - `client_to_backend`: 持有客户端读取端和后端写入端的转发过程。
+/// - `backend_to_client`: 持有后端读取端和客户端写入端的转发过程。
+///
+/// 返回: 返回最先结束方向的结果；父连接取消时一并释放两侧状态，不保留后台转发。
+async fn drive_relay_directions<C, B>(client_to_backend: C, backend_to_client: B) -> io::Result<()>
+where
+    C: std::future::Future<Output = io::Result<()>>,
+    B: std::future::Future<Output = io::Result<()>>,
+{
+    tokio::pin!(client_to_backend, backend_to_client);
+    let mut directions: Option<(RelayDirection, RelayDirection)> = None;
+    let mut client_first = true;
+    std::future::poll_fn(|cx| {
+        if directions
+            .as_ref()
+            .is_none_or(|(client, _)| !client.state.parent.will_wake(cx.waker()))
+        {
+            // 父执行上下文变化后，旧通知不能负责新上下文的驱动；重新轮询两侧以登记新句柄。
+            directions = Some((
+                RelayDirection::new(cx.waker()),
+                RelayDirection::new(cx.waker()),
+            ));
+        }
+        let (client, backend) = directions.as_ref().expect("relay directions initialized");
+        // 两侧同时就绪时交换优先方向；只有收到通知的一侧才进入 I/O，仍由父连接同步持有和释放。
+        let poll_client_first = client_first;
+        client_first = !client_first;
+        if poll_client_first {
+            if let std::task::Poll::Ready(result) = client.poll(client_to_backend.as_mut()) {
+                return std::task::Poll::Ready(result);
+            }
+            backend.poll(backend_to_client.as_mut())
+        } else {
+            if let std::task::Poll::Ready(result) = backend.poll(backend_to_client.as_mut()) {
+                return std::task::Poll::Ready(result);
+            }
+            client.poll(client_to_backend.as_mut())
+        }
+    })
+    .await
+}
+
+/// 业务作用: 为转发方向保留原始关闭与路由资格，父连接尚未调度时也能拒绝失权 I/O。
+#[derive(Clone)]
+struct RelayAuthority {
+    shutdown: watch::Receiver<bool>,
+    closed: bool,
+    routing: Option<RelayRoutingAuthority>,
+}
+
+/// 业务作用: 区分 HA 撤权通知与 Sentinel 同代确认，避免把合法确认误当作路由切换。
+#[derive(Clone)]
+enum RelayRoutingAuthority {
+    ReplicationHa(watch::Receiver<HaRoutingState>),
+    Sentinel {
+        receiver: watch::Receiver<SentinelRoutingState>,
+        backend: Arc<str>,
+        generation: u64,
+    },
+}
+
+impl RelayAuthority {
+    /// 业务作用: 从固定路由的关闭通道建立不可重新开放的连接资格。
+    /// 参数说明:
+    /// - `shutdown`: 连接创建时持有的关闭通道及已见通知位置。
+    ///
+    /// 返回: 初始关闭、未消费通知或发送端消失时立即标记失权。
+    fn fixed(shutdown: &watch::Receiver<bool>) -> Self {
+        Self {
+            shutdown: shutdown.clone(),
+            closed: *shutdown.borrow() || shutdown.has_changed().unwrap_or(true),
+            routing: None,
+        }
+    }
+
+    /// 业务作用: 绑定当前连接的原始动态路由，避免仅依赖父任务转发关闭通知。
+    /// 参数说明:
+    /// - `shutdown`: 进程或运行代关闭通道。
+    /// - `backend`: 当前连接实际绑定的后端地址。
+    /// - `routing`: 建连时确认的路由接收者及 Sentinel 代次。
+    ///
+    /// 返回: 保留独立的路由观察位置；已失效路由从创建时即拒绝转发。
+    fn dynamic(
+        shutdown: &watch::Receiver<bool>,
+        backend: &str,
+        routing: &DynamicRoutingReceiver,
+    ) -> Self {
+        let mut authority = Self::fixed(shutdown);
+        authority.closed |= routing.close_reason(backend).is_some();
+        authority.routing = Some(match routing {
+            DynamicRoutingReceiver::ReplicationHa { receiver, .. } => {
+                RelayRoutingAuthority::ReplicationHa(receiver.clone())
+            }
+            DynamicRoutingReceiver::Sentinel {
+                receiver,
+                generation,
+            } => RelayRoutingAuthority::Sentinel {
+                receiver: receiver.clone(),
+                backend: Arc::from(backend),
+                generation: *generation,
+            },
+        });
+        authority
+    }
+
+    /// 业务作用: 在方向任务恢复 I/O 前复验控制来源，并记住已经发生的撤权。
+    /// 参数说明: 无。
+    /// 返回: 关闭、通道失联或路由资格失效时返回 true，后续确认不能重新开放该连接。
+    fn is_closed(&mut self) -> bool {
+        // 父连接尚未获得执行机会时，独立方向也必须在恢复挂起的 I/O 前自行复验控制来源。
+        // 关闭通知不消费；即使值被再次写回 false，也不能让旧连接恢复资格。
+        self.closed |= self.shutdown.has_changed().unwrap_or(true);
+        if self.closed {
+            return true;
+        }
+        self.closed = match &mut self.routing {
+            None => false,
+            Some(RelayRoutingAuthority::ReplicationHa(receiver)) => {
+                // HA 的每次发布都撤销旧连接，保护与同址恢复被合并也不能绕过门禁。
+                receiver.has_changed().unwrap_or(true)
+            }
+            Some(RelayRoutingAuthority::Sentinel {
+                receiver,
+                backend,
+                generation,
+            }) => match receiver.has_changed() {
+                Ok(false) => false,
+                Err(_) => true,
+                Ok(true) => {
+                    // 同代重新确认可以继续；只有在持有当前值时更新已见位置，避免吞掉并发发布。
+                    let state = receiver.borrow_and_update();
+                    !matches!(
+                        &*state,
+                        SentinelRoutingState::Serving {
+                            master,
+                            generation: current,
+                            ..
+                        } if master == backend.as_ref() && current == generation
+                    )
+                }
+            },
+        };
+        self.closed
+    }
+}
+
+/// 业务作用: 在转发每次实际 I/O 前复验原始权威，覆盖一次轮询内部发生的撤权。
+struct AuthorityCheckedIo<T> {
+    io: T,
+    authority: RelayAuthority,
+}
+
+impl<T> AuthorityCheckedIo<T> {
+    /// 业务作用: 将一个 I/O 端点绑定到当前连接的路由资格。
+    /// 参数说明:
+    /// - `io`: 当前方向独占的读取或写入端点。
+    /// - `authority`: 从连接准入时保留的原始权威，必须与外层方向任务一致。
+    ///
+    /// 返回: 不创建任务或增加数据面锁的端点包装。
+    fn new(io: T, authority: RelayAuthority) -> Self {
+        Self {
+            io,
+            // 端点保留独立通知位置，父观察消费变更不能重新授予旧端点转发资格。
+            authority,
+        }
+    }
+
+    /// 业务作用: 拒绝已经失去权威的 I/O，并让所属方向任务执行现有同步回收。
+    /// 参数说明:
+    /// - `cx`: 受原始权威关闭观察保护的转发上下文。
+    ///
+    /// 返回: 权威有效时允许 I/O；失权时唤醒外层并保持挂起，不把撤权伪装成写入零字节。
+    fn permitted(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        // 读取与写入可以在同一次任务轮询内连续完成；父观察尚未调度也不能继续使用旧路由。
+        if self.authority.is_closed() {
+            // 外层方向任务或父连接持有相同原始权威，下次轮询会关闭并同步释放 I/O。
+            cx.waker().wake_by_ref();
+            return false;
+        }
+        true
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for AuthorityCheckedIo<T> {
+    /// 业务作用: 只在原始权威仍有效时读取连接字节，失权后交由外层回收端点。
+    /// 参数说明:
+    /// - `cx`: 当前方向的执行器上下文。
+    /// - `buffer`: 调用方限定的读取缓冲。
+    ///
+    /// 返回: 有效权威下保留底层读取结果；失权时挂起并唤醒外层关闭。
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if !self.permitted(cx) {
+            return std::task::Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_read(cx, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for AuthorityCheckedIo<T> {
+    /// 业务作用: 在每次完整或部分写入前复验路由，阻止撤权后的请求及响应继续外发。
+    /// 参数说明:
+    /// - `cx`: 当前方向的执行器上下文。
+    /// - `bytes`: 尚未写出的有序字节片段。
+    ///
+    /// 返回: 有效时保留底层已写数量或错误；失权时不触碰底层端点。
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if !self.permitted(cx) {
+            return std::task::Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_write(cx, bytes)
+    }
+
+    /// 业务作用: 将缓冲刷出也纳入路由门禁，失权后不能通过 flush 发送保留的业务字节。
+    /// 参数说明:
+    /// - `cx`: 当前方向的执行器上下文。
+    ///
+    /// 返回: 有效时保留底层刷出结果；失权时等待外层回收。
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if !self.permitted(cx) {
+            return std::task::Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    /// 业务作用: 防止协议关闭过程在撤权后隐式刷出尚未发送的业务数据。
+    /// 参数说明:
+    /// - `cx`: 当前方向的执行器上下文。
+    ///
+    /// 返回: 有效时委托协议关闭；失权时由外层直接释放端点。
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if !self.permitted(cx) {
+            return std::task::Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// 业务作用: 允许父连接同步收回方向任务的 I/O 与路由引用。
+trait RetireRelayFuture: Send + Sync {
+    /// 业务作用: 等待正在执行的轮询结束，并在返回前释放方向资源。
+    /// 参数说明: 无。
+    /// 返回: 资源已经释放；重复调用不产生额外副作用。
+    fn retire(&self);
+}
+
+/// 业务作用: 将控制来源与对应 I/O 绑定为同一个同步回收单元。
+struct RelayFutureState<F> {
+    future: Pin<Box<F>>,
+    authority: Option<RelayAuthority>,
+}
+
+/// 业务作用: 用每方向独占区间串行化轮询与父连接回收，两个转发方向不共用此锁。
+struct RelayFutureCell<F> {
+    future: std::sync::Mutex<Option<RelayFutureState<F>>>,
+}
+
+impl<F: Send> RetireRelayFuture for RelayFutureCell<F> {
+    /// 业务作用: 取走并同步析构方向状态，保证父连接退出后没有残留套接字或路由引用。
+    /// 参数说明: 无。
+    /// 返回: 状态已清空；等待已开始的轮询及其析构完成。
+    fn retire(&self) {
+        let mut slot = self
+            .future
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retired = slot.take();
+        // 路由引用与 I/O 资源同属连接，不依赖执行器再次调度已取消的任务来释放。
+        drop(retired);
+    }
+}
+
+/// 业务作用: 在独立任务每次轮询前复验撤权，并为同步回收保留互斥边界。
+struct OwnedRelayPoll<F> {
+    cell: Arc<RelayFutureCell<F>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<F: std::future::Future<Output = io::Result<()>>> std::future::Future for OwnedRelayPoll<F> {
+    type Output = io::Result<()>;
+
+    /// 业务作用: 获得当前方向独占权后复验资格，再推进一次 I/O。
+    /// 参数说明:
+    /// - `cx`: 执行器提供的当前任务唤醒上下文。
+    ///
+    /// 返回: 失权或完成时在锁内释放全部资源；挂起时保留方向状态和唤醒注册。
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut slot = self
+            .cell
+            .future
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(active) = slot.as_mut() else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        // 控制来源与父取消均在取得方向独占权后复验；挂起写入不得依赖父任务先获调度。
+        if self.cancelled.load(Ordering::Acquire)
+            || active
+                .authority
+                .as_mut()
+                .is_some_and(RelayAuthority::is_closed)
+        {
+            let retired = slot.take();
+            drop(retired);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let result = active.future.as_mut().poll(cx);
+        if result.is_ready() {
+            let completed = slot.take();
+            // 完成方向的析构仍属于其独占区间，关闭者不能越过尚未释放的资源。
+            drop(completed);
+        }
+        result
+    }
+}
+
+/// 业务作用: 将两个独立转发任务的生命周期绑定到父连接。
+struct OwnedRelayTasks {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    tasks: tokio::task::JoinSet<io::Result<()>>,
+    resources: Vec<Arc<dyn RetireRelayFuture>>,
+}
+
+impl OwnedRelayTasks {
+    /// 业务作用: 建立连接私有的取消标记及方向任务资源集合。
+    /// 参数说明: 无。
+    /// 返回: 尚未启动任务且未撤权的所有者。
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tasks: tokio::task::JoinSet::new(),
+            resources: Vec::with_capacity(2),
+        }
+    }
+
+    /// 业务作用: 注册同步回收入口后启动一个受控转发方向。
+    /// 参数说明:
+    /// - `authority`: 当前方向恢复 I/O 时必须复验的控制来源。
+    /// - `future`: 持有该方向套接字、缓冲及流量计数的转发过程。
+    ///
+    /// 返回: 任务开始调度，父连接始终保有同步收回其资源的能力。
+    fn spawn_with_authority<F>(&mut self, authority: Option<RelayAuthority>, future: F)
+    where
+        F: std::future::Future<Output = io::Result<()>> + Send + 'static,
+    {
+        let cell = Arc::new(RelayFutureCell {
+            future: std::sync::Mutex::new(Some(RelayFutureState {
+                future: Box::pin(future),
+                authority,
+            })),
+        });
+        // 启动前先登记回收入口，父取消不能留下已启动但无法同步回收的方向。
+        self.resources.push(cell.clone());
+        self.tasks.spawn(OwnedRelayPoll {
+            cell,
+            cancelled: self.cancelled.clone(),
+        });
+    }
+
+    /// 业务作用: 先撤销转发资格，再同步收回全部方向资源。
+    /// 参数说明: 无。
+    /// 返回: 两侧资源均已释放；执行器可在之后回收已失去 I/O 能力的任务外壳。
+    fn stop(&mut self) {
+        // 两个方向各自持锁轮询，彼此没有共享该锁；关闭者等正在执行的轮询结束后取走资源。
+        // 先撤权再取走 future，使执行器尚未处理 abort 时也不再保留套接字和凭据。
+        self.cancelled.store(true, Ordering::Release);
+        self.tasks.abort_all();
+        for resource in self.resources.drain(..) {
+            resource.retire();
+        }
+    }
+
+    /// 业务作用: 等待任一方向结束，收回另一方向并汇总已经完成的 I/O 错误。
+    /// 参数说明: 无。
+    /// 返回: 两侧资源释放且任务排空后返回；传播 I/O 错误及非主动取消的任务异常。
+    async fn finish(mut self) -> io::Result<()> {
+        let first = self.tasks.join_next().await.expect("two relay directions");
+        self.stop();
+        let mut result = match first {
+            Ok(result) => result,
+            Err(error) => Err(io::Error::other(error)),
+        };
+        while let Some(joined) = self.tasks.join_next().await {
+            match joined {
+                Ok(Err(error)) if result.is_ok() => {
+                    result = Err(error);
+                }
+                Err(error) if !error.is_cancelled() && result.is_ok() => {
+                    result = Err(io::Error::other(error));
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+}
+
+impl Drop for OwnedRelayTasks {
+    /// 业务作用: 父连接被取消时同步撤权并回收方向资源。
+    /// 参数说明: 无。
+    /// 返回: 不依赖执行器继续调度，资源已经释放。
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 业务作用: 独立调度两个透明转发方向，同时将撤权和同步资源回收绑定到父连接。
+/// 参数说明:
+/// - `client_read`: 客户端请求读取端。
+/// - `backend_write`: 对应后端的请求写入端。
+/// - `backend_read`: 后端响应读取端。
+/// - `client_write`: 客户端响应写入端。
+/// - `shutdown`: 进程或运行代的关闭通道。
+/// - `metrics`: 当前代理的流量和背压观测对象。
+/// - `counters`: 当前连接已经成功转发的字节计数。
+/// - `authority`: 原始动态路由资格；固定路由从关闭通道构造。
+///
+/// 返回: 两侧任务完成且资源收回后返回，传播方向 I/O 或任务异常。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "两侧 I/O、控制来源与计数共同属于当前连接"
+)]
+async fn drive_owned_relay_io<R, W, B, C>(
+    client_read: R,
+    backend_write: W,
+    backend_read: B,
+    client_write: C,
+    shutdown: watch::Receiver<bool>,
+    metrics: ProxyMetrics,
+    counters: Arc<RelayCounters>,
+    authority: Option<RelayAuthority>,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    B: AsyncRead + Unpin + Send + 'static,
+    C: AsyncWrite + Unpin + Send + 'static,
+{
+    let authority = authority.unwrap_or_else(|| RelayAuthority::fixed(&shutdown));
+    let mut owner = OwnedRelayTasks::new();
+    let forward_cancelled = owner.cancelled.clone();
+    let forward_metrics = metrics.clone();
+    let forward_counters = counters.clone();
+    let mut forward_authority = authority.clone();
+    owner.spawn_with_authority(Some(authority.clone()), async move {
+        // 每次实际读写前统一复验父取消、进程关闭和原始路由，避免端点再重复检查同一关闭通道。
+        copy_ready_relay_direction(
+            client_read,
+            backend_write,
+            || forward_cancelled.load(Ordering::Acquire) || forward_authority.is_closed(),
+            &forward_metrics,
+            true,
+            &forward_counters.client_to_backend,
+        )
+        .await
+    });
+    let reverse_cancelled = owner.cancelled.clone();
+    let mut reverse_authority = authority.clone();
+    owner.spawn_with_authority(Some(authority), async move {
+        // 响应方向使用独立的已见路由位置，另一方向的确认不能吞掉本方向的撤权通知。
+        copy_ready_relay_direction(
+            backend_read,
+            client_write,
+            || reverse_cancelled.load(Ordering::Acquire) || reverse_authority.is_closed(),
+            &metrics,
+            false,
+            &counters.backend_to_client,
+        )
+        .await
+    });
+    owner.finish().await
+}
+
+/// 业务作用: 拆分透明连接的读取与写入所有权，交由父连接管理的独立方向转发。
+/// 参数说明:
+/// - `client`: 已通过准入与认证的客户端连接。
+/// - `backend`: 当前连接绑定的 TCP 或 TLS 后端流。
+/// - `shutdown`: 连接关闭通道。
+/// - `metrics`: 当前代理的流量与背压观测对象。
+/// - `counters`: 已转发字节计数，取消时保留已发送部分。
+/// - `authority`: 当前连接原始路由资格，恢复 I/O 前必须复验。
+///
+/// 返回: 转发完成、撤权或失败后，两侧资源同步释放；传播 I/O 与任务错误。
+async fn copy_owned_relay_pair(
+    client: TcpStream,
+    backend: BackendStream,
+    shutdown: watch::Receiver<bool>,
+    metrics: ProxyMetrics,
+    counters: Arc<RelayCounters>,
+    authority: Option<RelayAuthority>,
+) -> io::Result<()> {
+    let (client_read, client_write) = client.into_split();
+    let (backend_read, backend_write) = tokio::io::split(backend);
+    drive_owned_relay_io(
+        client_read,
+        backend_write,
+        backend_read,
+        client_write,
+        shutdown,
+        metrics,
+        counters,
+        authority,
+    )
+    .await
+}
+
+/// 业务作用: 保存启用 idle 时两个转发方向共享的活动时间，避免单向推送被当作空闲。
+struct RelayActivity {
+    timeout: Duration,
+    last_activity: AtomicU64,
     base: Instant,
+}
+
+/// 业务作用: 为每个转发方向指定 idle 执行职责，未配置超时的连接不维护活动状态。
+struct RelayIdle {
+    enforce_timeout: bool,
+    activity: Option<Arc<RelayActivity>>,
+}
+
+/// 业务作用: 保留连接初始关闭状态，并在关闭信号未变化时避免重复获取值读锁。
+struct RelayShutdown<'a> {
+    receiver: &'a watch::Receiver<bool>,
+    initially_closed: bool,
+}
+
+impl<'a> RelayShutdown<'a> {
+    /// 业务作用: 在进入转发作用域时读取一次初始门禁，防止未产生变更通知的关闭值被忽略。
+    /// 参数说明:
+    /// - `receiver`: 当前连接的关闭信号；本门禁只观察，不消费其变更状态。
+    ///
+    /// 返回: 保存初始关闭值及信号引用；不创建任务、不改变接收者已见版本。
+    fn new(receiver: &'a watch::Receiver<bool>) -> Self {
+        Self {
+            receiver,
+            initially_closed: *receiver.borrow(),
+        }
+    }
+
+    /// 业务作用: 在每次读取或写入前复验关闭状态，发送端全部消失时停止业务转发。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 初始关闭、当前关闭或信号发送端消失时返回 true；仅未关闭的连接允许继续 I/O。
+    fn is_closed(&self) -> bool {
+        // 初始关闭不能被后续值覆盖而重新开放；未变化的初始开放状态只需复验通道版本。
+        if self.initially_closed {
+            return true;
+        }
+        match self.receiver.has_changed() {
+            Ok(false) => false,
+            // 不消费更新，确保连接外层的优先关闭观察仍能立即收到通知。
+            Ok(true) => *self.receiver.borrow(),
+            // 没有发送端就不再有持续开放连接的控制来源，停止后续读取和写入。
+            Err(_) => true,
+        }
+    }
+}
+
+/// 业务作用: 在 Garnet 专用连接上保持事务和流水线顺序，并对完整请求执行单条等价命令转换。
+/// 参数说明:
+/// - `reader`: 已准入客户端的读取方向。
+/// - `writer`: 同一已认证后端连接的写入方向。
+/// - `buffer`: 握手或切换隧道时已读取的客户端前置字节，可能包含半包。
+/// - `compatibility`: 已确认的命令转换范围及单帧上限，限制长连接上的未完成请求内存。
+/// - `shutdown`: 路由保护或进程关闭时立即终止转发的信号。
+/// - `metrics`: 当前代理的背压与字节指标。
+/// - `counters`: 两个转发方向共享的连接流量计数。
+/// - `idle`: 本方向的空闲超时职责和双向活动状态。
+///
+/// 返回: 正常关闭返回成功；超限、非法请求或 I/O 失败时关闭连接，不重放任何写入。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "读取、写入、缓冲和双向活动状态分别拥有明确的连接职责"
+)]
+async fn copy_garnet_command_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    mut buffer: Vec<u8>,
+    compatibility: GarnetRelayCompatibility,
+    shutdown: &RelayShutdown<'_>,
+    metrics: ProxyMetrics,
+    counters: Arc<RelayCounters>,
+    idle: RelayIdle,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use crate::cluster::command_compat::{request_len, rewrite_garnet_relay_pipeline};
+    let limit = compatibility.frame_limit;
+    let mut scratch = vec![0u8; RELAY_BUFFER_SIZE.min(limit.max(1))];
+    loop {
+        // 路由撤回后不能因为已有完整缓冲而继续发送事务或写请求。
+        if shutdown.is_closed() {
+            return Ok(());
+        }
+        let mut complete = 0;
+        while let Some(length) = request_len(&buffer[complete..]).map_err(io::Error::other)? {
+            if length == 0 || length > limit {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "compatibility request exceeds frame limit",
+                ));
+            }
+            complete += length;
+        }
+        if complete > 0 {
+            // 在发送之前确定整批别名，MULTI/EXEC 与其间命令仍按客户端顺序由同一后端处理。
+            let translated = rewrite_garnet_relay_pipeline(
+                &buffer[..complete],
+                compatibility.legacy_etag,
+                compatibility.single_key_migrate,
+            )
+            .map_err(io::Error::other)?;
+            let bytes = translated.as_deref().unwrap_or(&buffer[..complete]);
+            let written = write_all_with_backpressure(
+                &mut writer,
+                bytes,
+                shutdown,
+                &metrics,
+                true,
+                &counters.client_to_backend,
+            )
+            .await?;
+            if written < bytes.len() {
+                return Ok(());
+            }
+            buffer.drain(..complete);
+        }
+        if buffer.len() >= limit {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "incomplete compatibility request exceeds frame limit",
+            ));
+        }
+        let available = scratch.len().min(limit - buffer.len());
+        let mut window = tokio::io::ReadBuf::new(&mut scratch[..available]);
+        let read = read_relay_chunk(&mut reader, &mut window, shutdown, &idle).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        if let Some(activity) = &idle.activity {
+            activity.last_activity.store(
+                duration_millis_saturating(activity.base.elapsed()),
+                Ordering::Relaxed,
+            );
+        }
+        buffer.extend_from_slice(&scratch[..read]);
+    }
 }
 
 /// 业务作用: 复制透明隧道的单向字节流，并更新活动时间与方向流量计数。
 /// 参数说明:
-/// - `reader`: 协议读取端，函数从中增量读取并处理半帧、断连和大小限制。
-/// - `writer`: 协议写入端，负责按顺序完整写出响应并传播背压。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `reader`: 当前方向的字节流读取端，不对 RESP 帧进行解析。
+/// - `writer`: 当前方向的写入端，按字节顺序转发并传播背压。
+/// - `shutdown`: 进程退出或动态路由保护时触发的连接关闭信号。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `counters`: 运行时原子计数器集合，用于记录连接、请求、错误和资源占用。
-/// - `client_to_backend`: 客户端到后端方向累计传输的字节数，用于流量指标统计。
-/// - `idle`: 连接进入空闲状态的时间点或时长，用于判断是否应回收。
+/// - `client_to_backend`: 当前方向是否为客户端到后端，用于选择流量与背压指标。
+/// - `idle`: 可选的双向活动状态与当前方向的超时执行职责。
 ///
-/// 返回: 任务正常完成或被有序取消时返回成功；panic 或底层 I/O 失败时返回错误。
+/// 返回: 对端关闭或收到关闭信号时成功；空闲超时、读取或写入失败时返回错误。
 async fn copy_relay_direction<R, W>(
     mut reader: R,
     mut writer: W,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: &RelayShutdown<'_>,
     metrics: ProxyMetrics,
     counters: Arc<RelayCounters>,
     client_to_backend: bool,
@@ -4002,109 +5425,218 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; RELAY_BUFFER_SIZE];
+    let counter = if client_to_backend {
+        &counters.client_to_backend
+    } else {
+        &counters.backend_to_client
+    };
+    if idle.activity.is_none() {
+        return copy_ready_relay_direction(
+            reader,
+            writer,
+            || shutdown.is_closed(),
+            &metrics,
+            client_to_backend,
+            counter,
+        )
+        .await;
+    }
+    // 固定窗口只初始化实际收到的字节；保留初始化边界，让后续读取复用同一块内存。
+    let mut storage = Box::<[u8]>::new_uninit_slice(RELAY_BUFFER_SIZE);
+    let mut buf = tokio::io::ReadBuf::uninit(&mut storage);
     loop {
-        let read = read_relay_chunk(&mut reader, &mut buf, &mut shutdown, &idle).await?;
+        // 前一段完整发送后才清空有效长度；初始化边界和固定容量保留，背压期间不覆盖待发字节。
+        buf.clear();
+        let read = read_relay_chunk(&mut reader, &mut buf, shutdown, &idle).await?;
         if read == 0 {
             return Ok(());
         }
-        // 本方向有字节到达即刷新共享活动时间戳，用于重置对向(client->backend)的 idle 计时。
-        idle.last_activity.store(
-            idle.base.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-            Ordering::Relaxed,
-        );
+        // 后端方向虽不执行超时，也必须续活，否则订阅推送会被客户端方向的计时器关闭。
+        if let Some(activity) = &idle.activity {
+            activity.last_activity.store(
+                duration_millis_saturating(activity.base.elapsed()),
+                Ordering::Relaxed,
+            );
+        }
         let written = write_all_with_backpressure(
             &mut writer,
-            &buf[..read],
-            &mut shutdown,
+            buf.filled(),
+            shutdown,
             &metrics,
             client_to_backend,
+            counter,
         )
         .await?;
-        let counter = if client_to_backend {
-            &counters.client_to_backend
-        } else {
-            &counters.backend_to_client
-        };
-        counter.fetch_add(written as u64, Ordering::Relaxed);
         if written < read {
             return Ok(());
         }
     }
 }
 
-/// 业务作用: 在关闭与双向 idle 门禁下读取一段 relay 字节，并刷新共享活动时间。
+/// 业务作用: 在无需 idle 计时的透明方向中直接推进读写状态，避免每段数据重建嵌套等待状态。
 /// 参数说明:
-/// - `reader`: 协议读取端，函数从中增量读取并处理半帧、断连和大小限制。
-/// - `buf`: 协议帧或字节缓冲区，用于 RESP 解析、写回或大小限制校验。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
-/// - `idle`: 连接进入空闲状态的时间点或时长，用于判断是否应回收。
+/// - `reader`: 当前方向的读取端，门禁通过后才允许接收业务字节。
+/// - `writer`: 当前方向的写入端，保留协议顺序与背压。
+/// - `is_closed`: 每次实际读写前执行的完整门禁；独立方向包含父取消、关闭及原始路由资格。
+/// - `metrics`: 当前代理的背压观测对象。
+/// - `client_to_backend`: 当前方向，用于选择背压指标。
+/// - `counter`: 当前方向已成功发送的字节数，部分写入也必须立即记账。
 ///
-/// 返回: 输入可安全转换且未越界时返回数量；缺失、格式非法或溢出时返回错误。
+/// 返回: 对端关闭或连接取消时成功；传播读取、写入及零字节写入错误，挂起时保留未发送后缀。
+async fn copy_ready_relay_direction<R, W, G>(
+    mut reader: R,
+    mut writer: W,
+    mut is_closed: G,
+    metrics: &ProxyMetrics,
+    client_to_backend: bool,
+    counter: &AtomicU64,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    G: FnMut() -> bool,
+{
+    let mut storage = Box::<[u8]>::new_uninit_slice(RELAY_BUFFER_SIZE);
+    let mut buf = tokio::io::ReadBuf::uninit(&mut storage);
+    let mut writing = false;
+    let mut offset = 0;
+    let mut backpressure_recorded = false;
+    std::future::poll_fn(|cx| {
+        loop {
+            if !writing {
+                // 每次恢复读取前复验当前方向的完整门禁，不能依赖父任务先获得调度。
+                if is_closed() {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                match Pin::new(&mut reader).poll_read(cx, &mut buf) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(Err(error)) => {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                    std::task::Poll::Ready(Ok(())) => {}
+                }
+                if buf.filled().is_empty() {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                writing = true;
+            }
+            while offset < buf.filled().len() {
+                // 读取和部分写入之间都可能撤权，不能仅在本次方向轮询入口检查一次。
+                if is_closed() {
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                match Pin::new(&mut writer).poll_write(cx, &buf.filled()[offset..]) {
+                    std::task::Poll::Pending => {
+                        if !backpressure_recorded {
+                            metrics.record_relay_backpressure(client_to_backend);
+                            backpressure_recorded = true;
+                        }
+                        return std::task::Poll::Pending;
+                    }
+                    std::task::Poll::Ready(Err(error)) => {
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                    std::task::Poll::Ready(Ok(0)) => {
+                        return std::task::Poll::Ready(Err(io::Error::new(
+                            ErrorKind::WriteZero,
+                            "relay write returned zero bytes",
+                        )));
+                    }
+                    std::task::Poll::Ready(Ok(written)) => {
+                        // 在下一次 I/O 或让出执行前累计已发送部分，父取消不能丢失流量计数。
+                        counter.fetch_add(written as u64, Ordering::Relaxed);
+                        offset += written;
+                        backpressure_recorded = false;
+                    }
+                }
+            }
+            // 只有全部发送后才复用窗口；背压挂起时保留字节、偏移和读取初始化边界。
+            buf.clear();
+            offset = 0;
+            writing = false;
+        }
+    })
+    .await
+}
+
+/// 业务作用: 复验关闭状态并在可选双向 idle 门禁下读取 relay 字节，挂起期间由连接作用域取消。
+/// 参数说明:
+/// - `reader`: 当前方向的字节流读取端，不对 RESP 帧进行解析。
+/// - `buf`: 当前读取窗口及其初始化边界，只将本轮追加的有效字节纳入返回数量。
+/// - `shutdown`: 进程退出或动态路由保护时触发的连接关闭信号。
+/// - `idle`: 可选的双向活动状态与当前方向的超时执行职责。
+///
+/// 返回: 成功时返回读取的字节数，对端关闭或收到关闭信号时返回零；空闲超时或读取失败时返回错误。
 async fn read_relay_chunk<R>(
     reader: &mut R,
-    buf: &mut [u8],
-    shutdown: &mut watch::Receiver<bool>,
+    buf: &mut tokio::io::ReadBuf<'_>,
+    shutdown: &RelayShutdown<'_>,
     idle: &RelayIdle,
 ) -> io::Result<usize>
 where
     R: AsyncRead + Unpin,
 {
-    if *shutdown.borrow() {
+    if shutdown.is_closed() {
         return Ok(0);
     }
-    let Some(timeout) = idle.timeout else {
-        return tokio::select! {
-            read = reader.read(buf) => read,
-            _ = shutdown.changed() => Ok(0),
-        };
+    let filled = buf.filled().len();
+    let read = async {
+        std::future::poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, buf)).await?;
+        Ok(buf.filled().len() - filled)
     };
-    // 精确 idle：以共享 last_activity(任一方向最近一次字节流动) 为基准，仅当距最近活动已满 timeout 才回收。
-    // 这样持续收 pub/sub 推送或阻塞等待结果的连接(SUBSCRIBE/BLPOP/XREAD BLOCK/WAIT)不会被误杀，
-    // 与 Redis 对阻塞/订阅连接豁免 idle timeout 的语义一致；真正双向静默的连接仍在 timeout 后被精确回收。
-    // tunnel 之外的普通 pipeline 不走此路径，热路径零影响。
+    tokio::pin!(read);
+    let Some(activity) = idle.activity.as_deref().filter(|_| idle.enforce_timeout) else {
+        return read.await;
+    };
+    // 只有客户端方向执行超时，最近活动时间由两个方向共同更新；双向静默才回收连接。
+    // 阻塞或订阅本身不豁免超时，只有实际收到字节才续活。
+    let timeout = activity.timeout;
     loop {
-        if *shutdown.borrow() {
+        if shutdown.is_closed() {
             return Ok(0);
         }
-        let idle_for = idle.base.elapsed().saturating_sub(Duration::from_millis(
-            idle.last_activity.load(Ordering::Relaxed),
-        ));
+        let idle_for = activity
+            .base
+            .elapsed()
+            .saturating_sub(Duration::from_millis(
+                activity.last_activity.load(Ordering::Relaxed),
+            ));
         if idle_for >= timeout {
             return Err(io::Error::new(ErrorKind::TimedOut, "tunnel idle timeout"));
         }
         let remaining = timeout - idle_for; // > 0
         tokio::select! {
-            read = reader.read(buf) => return read,
-            _ = shutdown.changed() => return Ok(0),
+            read = &mut read => return read,
             // 醒来后回到循环顶部重算 idle_for：对向在此期间有活动(last_activity 前移)则继续等待，否则精确回收。
             _ = tokio::time::sleep(remaining) => {}
         }
     }
 }
 
-/// 业务作用: 完整写出 relay 缓冲并累计实际等待可写的背压时间。
+/// 业务作用: 按序写出 relay 缓冲并记录发生背压的写入，挂起期间由连接作用域取消。
 /// 参数说明:
 /// - `writer`: 协议写入端，负责按顺序完整写出响应并传播背压。
 /// - `bytes`: 协议帧或字节缓冲区，用于 RESP 解析、写回或大小限制校验。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 当前连接的关闭门禁，保留初始关闭状态并复验运行中的信号变化。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
-/// - `client_to_backend`: 客户端到后端方向累计传输的字节数，用于流量指标统计。
+/// - `client_to_backend`: 是否向后端写入，用于选择对应方向的背压指标。
+/// - `counter`: 当前方向的连接字节计数，写入成功后立即累计，取消不丢失已发送部分。
 ///
-/// 返回: 输入可安全转换且未越界时返回数量；缺失、格式非法或溢出时返回错误。
+/// 返回: 完整写出或检测到关闭时返回已写字节数；零字节写入或 I/O 失败时返回错误。
 async fn write_all_with_backpressure<W>(
     writer: &mut W,
     mut bytes: &[u8],
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &RelayShutdown<'_>,
     metrics: &ProxyMetrics,
     client_to_backend: bool,
+    counter: &AtomicU64,
 ) -> io::Result<usize>
 where
     W: AsyncWrite + Unpin,
 {
     let mut total_written = 0usize;
     while !bytes.is_empty() {
-        if *shutdown.borrow() {
+        if shutdown.is_closed() {
             return Ok(total_written);
         }
         let mut backpressure_recorded = false;
@@ -4116,10 +5648,7 @@ where
             }
             result
         });
-        match tokio::select! {
-            written = write => written,
-            _ = shutdown.changed() => return Ok(total_written),
-        } {
+        match write.await {
             Ok(0) => {
                 return Err(io::Error::new(
                     ErrorKind::WriteZero,
@@ -4127,6 +5656,8 @@ where
                 ));
             }
             Ok(written) => {
+                // 下一次等待可能被连接关闭取消，已发送字节必须在让出执行前完成记账。
+                counter.fetch_add(written as u64, Ordering::Relaxed);
                 total_written = total_written.saturating_add(written);
                 bytes = &bytes[written..];
             }
@@ -4136,26 +5667,14 @@ where
     Ok(total_written)
 }
 
-/// 业务作用: 归一化 relay 任务完成、取消和 I/O 错误，确保另一方向及时停止。
-/// 参数说明:
-/// - `result`: 异步任务或后端操作结果，用于传播错误并更新成功失败指标。
-///
-/// 返回: 任务正常完成或被有序取消时返回成功；panic 或底层 I/O 失败时返回错误。
-fn join_relay_result(result: Result<io::Result<()>, tokio::task::JoinError>) -> io::Result<()> {
-    match result {
-        Ok(result) => result,
-        Err(err) => Err(io::Error::other(format!("relay task failed: {err}"))),
-    }
-}
-
 /// 业务作用: 驱动 Cluster 单入口会话的命令规划、跨节点执行、响应聚合和连接绑定隧道，同时保持 pipeline 原始顺序。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 /// - `cluster`: 集群运行时或拓扑句柄，用于槽位路由、刷新和节点选择。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 /// - `auth_result`: 前端认证阶段留下的未消费字节和已协商 RESP 版本；
 ///   前者必须继续参与本会话解析，后者用于 Cluster 节点 tunnel pool 的协议隔离。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `tunnel_limiter`: 当前 proxy 私有的专用隧道并发与等待队列限制器。
 ///
@@ -4224,7 +5743,6 @@ async fn handle_cluster_connection(
                         bail!("client idle timeout");
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, "closing cluster connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -4238,7 +5756,6 @@ async fn handle_cluster_connection(
                         buf.extend_from_slice(&tmp[..n]);
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, "closing cluster connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -4502,18 +6019,18 @@ async fn handle_cluster_connection(
     }
 }
 
-/// 业务作用: 驱动单节点 Cluster 代理会话，在固定源节点上执行普通批次或独占隧道，并改写所有对外拓扑地址。
+/// 业务作用: 驱动单节点 Cluster 代理会话，在固定源节点上执行逐帧批次或独占隧道，在逐帧阶段改写对外拓扑地址。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 /// - `node`: 当前连接固定使用的 cluster-node-proxy 节点映射配置。
 /// - `runtime`: 当前代理或 HA 运行时句柄，用于读取状态并执行受控操作。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `tunnel_limiter`: 专用隧道容量控制器，用于限制连接绑定命令占用的后端连接。
 ///
 /// 返回: 连接或批次完整结束并完成资源回收时返回成功；认证、路由、后端或 I/O 失败时返回错误。
-// 会话固定绑定一个真实节点；所有拓扑帧仍需改写为代理公布地址，不能泄漏后端网络地址。
+// 会话固定绑定一个真实节点；逐帧响应使用代理公布地址，转为透明数据流时保留原连接及其会话状态。
 async fn handle_cluster_node_proxy_connection(
     item: Arc<ProxyItem>,
     node: ClusterNodeProxyItem,
@@ -4547,6 +6064,7 @@ async fn handle_cluster_node_proxy_connection(
     // 可选诊断模式让普通批次走 session 专属连接，用于比较连接池借还与连接亲和模型的成本。
     let dedicated_session_mode = node_proxy_dedicated_session_enabled();
     let mut dedicated_backend: Option<BackendConnection> = None;
+    let mut bound_session_permit: Option<DedicatedTunnelPermit> = None;
     loop {
         let read_parse_started = stage_profile_enabled.then(Instant::now);
         let batch = loop {
@@ -4593,7 +6111,6 @@ async fn handle_cluster_node_proxy_connection(
                         bail!("client idle timeout");
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, backend = %node.backend, "closing cluster-node-proxy connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -4607,7 +6124,6 @@ async fn handle_cluster_node_proxy_connection(
                         buf.extend_from_slice(&tmp[..n]);
                     }
                     _ = shutdown.changed() => {
-                        debug!(proxy = %item.name, backend = %node.backend, "closing cluster-node-proxy connection on shutdown");
                         return Ok(());
                     }
                 }
@@ -4623,15 +6139,20 @@ async fn handle_cluster_node_proxy_connection(
         }
 
         let previous_protocol_version = protocol_version;
-        let local_prefix = consume_local_handshake_prefix(
-            &item,
-            &mut client,
-            &batch.commands,
-            "cluster",
-            &mut protocol_version,
-            &metrics,
-        )
-        .await?;
+        // 绑定后不能本地吞掉后续握手命令，否则 ASKING 的单次权限可能跨过本应消耗它的请求。
+        let local_prefix = if bound_session_permit.is_some() {
+            0
+        } else {
+            consume_local_handshake_prefix(
+                &item,
+                &mut client,
+                &batch.commands,
+                "cluster",
+                &mut protocol_version,
+                &metrics,
+            )
+            .await?
+        };
         // 当前 listener 的 backend 固定，只有 HELLO 改变 RESP 版本时才需要切换节点池队列。
         if protocol_version != previous_protocol_version {
             pool_handle = runtime.pipeline_pool.node_handle(
@@ -4666,9 +6187,27 @@ async fn handle_cluster_node_proxy_connection(
         }
 
         let classify_started = stage_profile_enabled.then(Instant::now);
-        let plan = classify_node_proxy_batch(commands);
+        let plan = classify_node_proxy_batch::<true>(commands);
         if let Some(started) = classify_started {
             stage_profile.classify_micros = duration_micros_u64(started.elapsed());
+        }
+
+        if plan.requires_bound_session && bound_session_permit.is_none() {
+            // 先取得会话容量再执行状态命令；同一连接保持节点权限，退出时直接关闭而不归还共享池。
+            bound_session_permit = match tunnel_limiter.acquire(&metrics).await {
+                Ok(permit) => Some(permit),
+                Err(err) => {
+                    write_dedicated_tunnel_limit_error(
+                        &mut client,
+                        &item,
+                        &metrics,
+                        commands.len(),
+                        err,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
         }
 
         if let Some(tunnel_idx) = plan.tunnel_idx {
@@ -4679,12 +6218,26 @@ async fn handle_cluster_node_proxy_connection(
                     .slice(raw_start..batch.command_spans[absolute_tunnel_idx].start);
                 let _pending_pipeline = metrics.start_pending_pipeline(tunnel_idx);
                 let started = Instant::now();
-                let execution = execute_session_request_response(
-                    &pool_handle,
-                    &commands[..tunnel_idx],
-                    prefix_raw,
-                )
-                .await;
+                let execution = if bound_session_permit.is_some() || dedicated_session_mode {
+                    execute_dedicated_session_request_response(
+                        &item,
+                        &node,
+                        &metrics,
+                        item.backend_profile
+                            .backend_protocol_version(protocol_version),
+                        &mut dedicated_backend,
+                        &commands[..tunnel_idx],
+                        prefix_raw,
+                    )
+                    .await
+                } else {
+                    execute_session_request_response(
+                        &pool_handle,
+                        &commands[..tunnel_idx],
+                        prefix_raw,
+                    )
+                    .await
+                };
                 let elapsed_micros = duration_micros_u64(started.elapsed());
                 let execution_error = execution.is_err();
                 metrics.record_backend_forward_result(tunnel_idx, elapsed_micros, execution_error);
@@ -4741,7 +6294,13 @@ async fn handle_cluster_node_proxy_connection(
             let tunnel_start = batch.command_spans[absolute_tunnel_idx].start;
             let tunnel_raw = batch.raw.slice(tunnel_start..);
             let tunnel_command_count = commands.len() - tunnel_idx;
-            let _tunnel_permit = match tunnel_limiter.acquire(&metrics).await {
+            let was_bound_session = bound_session_permit.is_some();
+            // 转入推送或阻塞数据流时转移已有许可，避免同一会话二次占用容量而等待自身释放。
+            let permit = match bound_session_permit.take() {
+                Some(permit) => Ok(permit),
+                None => tunnel_limiter.acquire(&metrics).await,
+            };
+            let _tunnel_permit = match permit {
                 Ok(permit) => permit,
                 Err(err) => {
                     write_dedicated_tunnel_limit_error(
@@ -4765,6 +6324,7 @@ async fn handle_cluster_node_proxy_connection(
                 item.backend_profile
                     .backend_protocol_version(protocol_version),
                 &tunnel_raw,
+                dedicated_backend.take(),
             )
             .await
             {
@@ -4793,9 +6353,10 @@ async fn handle_cluster_node_proxy_connection(
             // 后端会话状态，因此即便首条是 XREAD/BLPOP 也必须走 tainted relay。
             let reusable_blocking = tunnel_idx == 0
                 && commands.len() == 1
+                && !was_bound_session
                 && command_is_reusable_blocking(&commands[0]);
             if reusable_blocking {
-                let response = match wait_reusable_blocking_response(
+                let mut response = match wait_reusable_blocking_response(
                     &item,
                     &mut client,
                     &mut buf,
@@ -4830,6 +6391,7 @@ async fn handle_cluster_node_proxy_connection(
                         return Ok(());
                     }
                 };
+                runtime.rewrite_response(NodeProxyRewriteKind::None, &mut response.bytes);
                 let elapsed_micros = duration_micros_u64(started.elapsed());
                 let response_bytes = response.bytes.len();
                 metrics.record_pipeline_result(
@@ -4868,16 +6430,15 @@ async fn handle_cluster_node_proxy_connection(
                 shutdown,
                 metrics.clone(),
                 client_idle_timeout,
+                (relay_parts.legacy_garnet_etag || relay_parts.garnet_single_key_migrate)
+                    .then_some(GarnetRelayCompatibility {
+                        frame_limit: item.frame_max_bytes,
+                        legacy_etag: relay_parts.legacy_garnet_etag,
+                        single_key_migrate: relay_parts.garnet_single_key_migrate,
+                    }),
             )
             .await?;
             metrics.record_relay_bytes(client_to_backend, backend_to_client);
-            debug!(
-                proxy = %item.name,
-                backend = %node.backend,
-                client_to_backend,
-                backend_to_client,
-                "cluster-node-proxy switched to transparent tunnel"
-            );
             return Ok(());
         }
 
@@ -4898,7 +6459,7 @@ async fn handle_cluster_node_proxy_connection(
 
         let _pending_pipeline = metrics.start_pending_pipeline(exec_commands.len());
         let started = Instant::now();
-        let execution = if dedicated_session_mode {
+        let execution = if dedicated_session_mode || bound_session_permit.is_some() {
             execute_dedicated_session_request_response(
                 &item,
                 &node,
@@ -5010,19 +6571,17 @@ async fn handle_cluster_node_proxy_connection(
     }
 }
 
-/// 业务作用: NARIX_V1_NODE_PROXY_DEDICATED=1 时，普通批次改用 session 专属后端连接， 用于受控比较「连接池借还」与「连接亲和」的吞吐差异；默认生产路径仍使用有界连接池。
+/// 业务作用: 在节点代理的独占连接上执行一问一答批次，保持 READONLY、READWRITE 和 ASKING 的连接状态，同时保留逐帧地址改写。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 /// - `node`: 当前专用连接固定使用的 cluster-node-proxy 节点映射配置。
 /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
 /// - `protocol_version`: 当前前端会话使用的 RESP 版本，决定后端连接隔离和响应编码形态。
-/// - `dedicated`: 专用隧道资源控制器，用于限制连接绑定命令占用的后端连接。
+/// - `dedicated`: 当前前端会话独占的后端连接；首次调用建立，后续批次复用，失败后丢弃。
 /// - `commands`: Redis 命令或外部命令参数，调用方按 RESP 或系统命令语义传入。
 /// - `raw_pipeline`: 包含多个连续 RESP 命令的原始 pipeline 字节，发送时不得逐命令重排。
 ///
-/// 返回: 返回与请求顺序一致的后端响应批次；连接池、I/O 或协议失败时返回错误。
-// NARIX_V1_NODE_PROXY_DEDICATED=1 时，普通批次改用 session 专属后端连接，
-// 用于受控比较「连接池借还」与「连接亲和」的吞吐差异；默认生产路径仍使用有界连接池。
+/// 返回: 成功返回与请求顺序一致的完整响应批次；建连、I/O 或协议失败时关闭独占连接并返回错误，不能重试可能已执行的写入。
 async fn execute_dedicated_session_request_response(
     item: &ProxyItem,
     node: &ClusterNodeProxyItem,
@@ -5103,7 +6662,7 @@ async fn execute_session_request_response_profiled(
 /// - `runtime`: 当前 standalone proxy 私有运行时；其中的池绝不与其他 proxy 共享。
 /// - `metrics`: 当前 proxy 的指标句柄，用于记录新建连接和池命中情况。
 /// - `protocol_version`: 前端已协商的 RESP 版本；不同版本的连接严格分队列复用。
-/// - `raw_pipeline`: 从前端批次切出的 tunnel 原始字节；直接写出，不重新编码或复制。
+/// - `raw_pipeline`: 从前端批次切出的 tunnel 原始字节；仅命中已确认的后端兼容规则时重新编码。
 ///
 /// 返回:
 /// - 成功时返回已经写入初始命令的独占 lease。
@@ -5150,14 +6709,15 @@ async fn acquire_standalone_tunnel_lease(
 /// - `tunnel_pool`: 会话启动时按 `node.backend` 解析出的节点私有池。
 /// - `metrics`: 当前 proxy 的指标句柄，用于记录新建连接和池命中情况。
 /// - `protocol_version`: 前端已协商的 RESP 版本；不同版本的连接严格分队列复用。
-/// - `raw_pipeline`: 从前端批次切出的 tunnel 原始字节；直接写出，不重新编码或复制。
+/// - `raw_pipeline`: 从前端批次切出的 tunnel 原始字节；仅命中已确认的后端兼容规则时重新编码。
+/// - `bound_backend`: 已绑定当前会话的连接；存在时必须沿用，不能切换连接丢失副本读取或导入槽权限。
 ///
 /// 返回:
 /// - 成功时返回已经写入初始命令的独占 lease。
 /// - 建连、认证、协议同步或写入失败时返回包含 proxy 与节点地址的错误。
 ///
 /// 关键步骤:
-/// 1. 调用方传入的 pool 已绑定当前 `node.backend`，运行时不再执行全局池查找。
+/// 1. 优先沿用当前会话的绑定连接；未绑定时才访问当前 `node.backend` 的节点私有池。
 /// 2. 该节点池耗尽时只为同一节点新建连接，绝不借用其他 1:1 节点的 idle socket。
 /// 3. 命令写入后 lease 默认 tainted，只有上层明确证明 clean 才可归还本节点池。
 async fn acquire_cluster_node_tunnel_lease(
@@ -5167,13 +6727,20 @@ async fn acquire_cluster_node_tunnel_lease(
     metrics: &ProxyMetrics,
     protocol_version: Option<u8>,
     raw_pipeline: &[u8],
+    bound_backend: Option<BackendConnection>,
 ) -> anyhow::Result<TunnelLease> {
-    let mut lease = match tunnel_pool.acquire_idle(protocol_version) {
-        Some(lease) => lease,
-        None => {
-            let backend =
-                connect_cluster_node_proxy_backend(item, node, metrics, protocol_version).await?;
-            tunnel_pool.lease_new(protocol_version, backend)
+    // 状态型会话转为数据流时保持原连接；只有尚未绑定的会话才可借用无状态池连接。
+    let mut lease = if let Some(backend) = bound_backend {
+        tunnel_pool.lease_new(protocol_version, backend)
+    } else {
+        match tunnel_pool.acquire_idle(protocol_version) {
+            Some(lease) => lease,
+            None => {
+                let backend =
+                    connect_cluster_node_proxy_backend(item, node, metrics, protocol_version)
+                        .await?;
+                tunnel_pool.lease_new(protocol_version, backend)
+            }
         }
     };
     lease
@@ -5279,13 +6846,7 @@ async fn wait_reusable_blocking_response(
                 _ = shutdown.changed() => {
                     return Ok(None);
                 }
-                reason = wait_dynamic_backend_change(&mut route.backend_change, route.backend_addr) => {
-                    info!(
-                        proxy = %item.name,
-                        backend = %route.backend_addr,
-                        reason = %reason,
-                        "closing reusable blocking command because dynamic backend route changed"
-                    );
+                _ = wait_dynamic_backend_change(&mut route.backend_change, route.backend_addr) => {
                     return Ok(None);
                 }
             }
@@ -5311,13 +6872,7 @@ async fn wait_reusable_blocking_response(
                 _ = shutdown.changed() => {
                     return Ok(None);
                 }
-                reason = wait_dynamic_backend_change(&mut route.backend_change, route.backend_addr) => {
-                    info!(
-                        proxy = %item.name,
-                        backend = %route.backend_addr,
-                        reason = %reason,
-                        "closing reusable blocking command because dynamic backend route changed"
-                    );
+                _ = wait_dynamic_backend_change(&mut route.backend_change, route.backend_addr) => {
                     return Ok(None);
                 }
             }
@@ -5384,6 +6939,9 @@ async fn connect_standalone_backend(
             item.name
         )
     })?;
+    backend
+        .prepare_command_compatibility(item.backend_profile)
+        .await?;
     if let Some(protocol_version) = item
         .backend_profile
         .backend_protocol_version(protocol_version)
@@ -5436,6 +6994,9 @@ async fn connect_cluster_node_proxy_backend(
             item.name, node.backend
         )
     })?;
+    backend
+        .prepare_command_compatibility(item.backend_profile)
+        .await?;
     if let Some(protocol_version) = item
         .backend_profile
         .backend_protocol_version(protocol_version)
@@ -5617,16 +7178,9 @@ where
     }
 }
 
-/// 业务作用: 把数据面阶段耗时饱和转换为 u64 微秒指标。
-/// 参数说明:
-/// - `duration`: 时间跨度，用于统计窗口、等待上限或吞吐计算。
-///
-fn duration_micros_u64(duration: Duration) -> u64 {
-    duration.as_micros().min(u128::from(u64::MAX)) as u64
-}
-
 /// 业务作用: 判断是否启用节点代理热路径的分阶段耗时采样；该诊断默认关闭，避免生产请求承担计时和输出开销。
 /// 参数说明: 无。
+///
 /// 返回: 专用环境变量取明确真值时返回 `true`；结果在进程内只读取一次并缓存，防止每批命令重复访问环境变量。
 fn node_proxy_stage_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -5914,20 +7468,20 @@ fn parse_client_batch(buf: &mut Vec<u8>, item: &ProxyItem) -> anyhow::Result<Vec
     let mut pos = 0;
 
     while parsed_commands.len() < item.pipeline_max_commands {
-        let Some(parsed) = resp::parse_command_ranges(&buf[pos..])? else {
+        let Some((arg_ranges, consumed)) = resp::parse_compact_command_ranges(&buf[pos..])? else {
             break;
         };
         let start = pos;
-        let end = pos + parsed.consumed;
-        validate_command_limits(&parsed.arg_ranges, parsed.consumed, item)?;
+        let end = pos + consumed;
+        validate_command_limits(&arg_ranges, consumed, item)?;
         if end > item.pipeline_max_bytes {
             bail!(
                 "client pipeline batch exceeds limit: {end} > {}",
                 item.pipeline_max_bytes
             );
         }
-        if !parsed.arg_ranges.is_empty() {
-            parsed_commands.push((start, end, parsed.arg_ranges));
+        if !arg_ranges.is_empty() {
+            parsed_commands.push((start, end, arg_ranges));
         }
         pos = end;
         if pos == buf.len() {
@@ -5939,7 +7493,10 @@ fn parse_client_batch(buf: &mut Vec<u8>, item: &ProxyItem) -> anyhow::Result<Vec
     if pos > 0 {
         let batch = parsed_batch_bytes(buf, pos);
         for (start, end, arg_ranges) in parsed_commands {
-            commands.push(ClientCommand::new(batch.slice(start..end), arg_ranges));
+            commands.push(ClientCommand::from_compact_ranges(
+                batch.slice(start..end),
+                arg_ranges,
+            ));
         }
     }
     Ok(commands)
@@ -5957,20 +7514,20 @@ fn parse_node_proxy_batch(buf: &mut Vec<u8>, item: &ProxyItem) -> anyhow::Result
     let mut pos = 0;
 
     while parsed_commands.len() < item.pipeline_max_commands {
-        let Some(parsed) = resp::parse_command_ranges(&buf[pos..])? else {
+        let Some((arg_ranges, consumed)) = resp::parse_compact_command_ranges(&buf[pos..])? else {
             break;
         };
         let start = pos;
-        let end = pos + parsed.consumed;
-        validate_command_limits(&parsed.arg_ranges, parsed.consumed, item)?;
+        let end = pos + consumed;
+        validate_command_limits(&arg_ranges, consumed, item)?;
         if end > item.pipeline_max_bytes {
             bail!(
                 "client pipeline batch exceeds limit: {end} > {}",
                 item.pipeline_max_bytes
             );
         }
-        if !parsed.arg_ranges.is_empty() {
-            parsed_commands.push((start, end, parsed.arg_ranges));
+        if !arg_ranges.is_empty() {
+            parsed_commands.push((start, end, arg_ranges));
         }
         pos = end;
         if pos == buf.len() {
@@ -5984,7 +7541,10 @@ fn parse_node_proxy_batch(buf: &mut Vec<u8>, item: &ProxyItem) -> anyhow::Result
         let batch = parsed_batch_bytes(buf, pos);
         for (start, end, arg_ranges) in parsed_commands {
             command_spans.push(start..end);
-            commands.push(ClientCommand::new(batch.slice(start..end), arg_ranges));
+            commands.push(ClientCommand::from_compact_ranges(
+                batch.slice(start..end),
+                arg_ranges,
+            ));
         }
         batch
     } else {
@@ -6018,6 +7578,8 @@ fn parsed_batch_bytes(buf: &mut Vec<u8>, len: usize) -> Bytes {
 #[derive(Debug, Clone, Copy, Default)]
 // 表示一批前端命令的执行计划，用于单遍扫描同时得出隧道切换点、QUIT 截断点和拓扑改写需求。
 struct NodeProxyBatchPlan {
+    // 一问一答的节点状态命令需要独占连接，同时继续解析响应并改写重定向。
+    requires_bound_session: bool,
     // 第一个必须切透明隧道的命令下标;其后的原始字节随隧道转发。
     tunnel_idx: Option<usize>,
     // 第一个 QUIT 的下标;QUIT 由 proxy 本地回 +OK 并关闭连接,其后的命令按 Redis 语义丢弃。
@@ -6026,19 +7588,41 @@ struct NodeProxyBatchPlan {
     needs_topology_rewrite: bool,
 }
 
-/// 业务作用: 单遍扫描一批命令，用于把原先的 QUIT 扫描、隧道扫描和改写门控扫描合并成一次命令名匹配。
+/// 业务作用: 单遍确定批次的 QUIT、隧道和拓扑改写边界，常见无会话状态命令直接沿用已有计划。
+/// 仅已实现独占逐帧会话的节点代理启用 `ALLOW_BOUND_SESSION`；其他调用方必须将连接状态命令交给透明隧道。
 /// 参数说明:
 /// - `commands`: Redis 命令或外部命令参数，调用方按 RESP 或系统命令语义传入。
 ///
-// 单遍扫描一批命令，用于把原先的 QUIT 扫描、隧道扫描和改写门控扫描合并成一次命令名匹配。
-fn classify_node_proxy_batch(commands: &[ClientCommand]) -> NodeProxyBatchPlan {
+/// 返回: 同时给出独占连接需求、透明流切换点、QUIT 截断点及拓扑改写需求；只有响应数量明确的节点状态命令保留逐帧处理。
+fn classify_node_proxy_batch<const ALLOW_BOUND_SESSION: bool>(
+    commands: &[ClientCommand],
+) -> NodeProxyBatchPlan {
     let mut plan = NodeProxyBatchPlan::default();
     for (idx, command) in commands.iter().enumerate() {
+        // 这些普通命令不改变连接状态，也不返回拓扑；直接保留现有计划，避免逐条扫描状态命令表。
+        // 参数合法性和读写权限仍由各自门禁校验，不能把此处的转发分类用作权限依据。
+        if command.arg(0).is_some_and(|name| {
+            matches_ignore_ascii_case(
+                name,
+                &[b"GET", b"SET", b"MGET", b"MSET", b"HGET", b"HSET", b"PING"],
+            )
+        }) {
+            continue;
+        }
         if command_name_eq(command, b"QUIT") {
             plan.quit_idx = Some(idx);
             return plan;
         }
         if node_proxy_command_requires_tunnel(command) {
+            // 只有持有独占逐帧会话的调用方才能保留地址改写；其余模式必须切隧道，避免状态泄漏到共享池。
+            if ALLOW_BOUND_SESSION
+                && command.arg(0).is_some_and(|name| {
+                    matches_ignore_ascii_case(name, &[b"READONLY", b"READWRITE", b"ASKING"])
+                })
+            {
+                plan.requires_bound_session = true;
+                continue;
+            }
             plan.tunnel_idx = Some(idx);
             return plan;
         }
@@ -6062,7 +7646,7 @@ struct LocalHandshakeResponse {
 /// 业务作用: 消费代理能够本地完成的连续握手前缀，并把这些命令计入总 OPS。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 /// - `commands`: Redis 命令或外部命令参数，调用方按 RESP 或系统命令语义传入。
 /// - `hello_mode`: HELLO 响应中的服务模式，决定客户端采用单节点还是集群语义。
 /// - `protocol_version`: 当前前端会话使用的 RESP 版本，决定后端连接隔离和响应编码形态。
@@ -6327,8 +7911,7 @@ fn backend_inject_hello_response(
 /// 参数说明:
 /// - `command`: Redis 命令或外部命令参数，调用方按 RESP 或系统命令语义传入。
 ///
-// 判断命令是否需要透明隧道，用于避免 request/response 计数模型卡住后端主动推送或长阻塞响应。
-// QUIT 不在名单里:它由 classify_node_proxy_batch 识别并本地应答,不为断连新建后端连接。
+/// 返回: 会话绑定、主动推送、可能阻塞或未登记的请求返回 `true`；可逐帧处理的普通请求返回 `false`。
 fn node_proxy_command_requires_tunnel(command: &ClientCommand) -> bool {
     let Some(name) = command.arg(0) else {
         return false;
@@ -6373,7 +7956,13 @@ fn node_proxy_command_requires_tunnel(command: &ClientCommand) -> bool {
     if xread_has_block_option(command) {
         return true;
     }
-    !is_known_stateless_request_response(name)
+    if is_known_stateless_request_response(name) {
+        // Kvrocks 的导入权限绑定连接，放回共享池会使其他客户端继承权限；该入口必须保持独占直到断连。
+        return name.eq_ignore_ascii_case(b"CLUSTER")
+            && command_subcommand_matches(command, &[b"IMPORT"]);
+    }
+    !(name.eq_ignore_ascii_case(b"TS.READ") && timeseries_read_is_nonblocking(command)
+        || name.eq_ignore_ascii_case(b"CLUSTERX") && clusterx_is_read_only_query(command))
 }
 
 /// 业务作用: 判断一条 tunnel 命令在读取唯一响应后是否一定恢复为无状态连接。
@@ -6608,13 +8197,11 @@ fn matches_ignore_ascii_case(value: &[u8], names: &[&[u8]]) -> bool {
     names.iter().any(|name| value.eq_ignore_ascii_case(name))
 }
 
-/// 业务作用: 判断命令是否是明确的一请求一响应且不修改连接状态的普通命令。 名单按生产命令频率排序(热命令前置),降低每批 1000 条命令的线性匹配成本; FT./JSON. 前缀族放在精确名单之后,让 GET/SET 这类高频命令少走两次前缀比较。
+/// 业务作用: 判断命令是否是一请求一响应且不修改连接状态的普通命令，让已知查询保持逐帧门禁与池化转发；按生产频率优先匹配热命令，再识别模块与低频查询。
 /// 参数说明:
-/// - `name`: 当前代理、模式或运行任务名称，用于唯一标识配置、日志和指标。
+/// - `name`: 客户端命令名称，按 ASCII 大小写无关规则识别。
 ///
-// 判断命令是否是明确的一请求一响应且不修改连接状态的普通命令。
-// 名单按生产命令频率排序(热命令前置),降低每批 1000 条命令的线性匹配成本;
-// FT./JSON. 前缀族放在精确名单之后,让 GET/SET 这类高频命令少走两次前缀比较。
+/// 返回: 已知无会话状态的命令返回 true，保留普通流水线及节点代理地址改写；其余命令交由专用连接处理。
 fn is_known_stateless_request_response(name: &[u8]) -> bool {
     if matches_ignore_ascii_case(
         name,
@@ -6781,32 +8368,98 @@ fn is_known_stateless_request_response(name: &[u8]) -> bool {
             b"CLUSTER",
             b"OBJECT",
             b"MEMORY",
+            // ETag 命令不绑定会话，必须保留普通响应路径以改写 MOVED/ASK 中的后端地址。
+            b"GETWITHETAG",
+            b"GETIFNOTMATCH",
+            b"SETWITHETAG",
+            b"SETIFMATCH",
+            b"SETIFGREATER",
+            b"DELIFGREATER",
         ],
     ) {
         return true;
     }
-    starts_with_ignore_ascii_case(name, b"FT.") || starts_with_ignore_ascii_case(name, b"JSON.")
+    if starts_with_ignore_ascii_case(name, b"FT.") || starts_with_ignore_ascii_case(name, b"JSON.")
+    {
+        return true;
+    }
+    // 已知查询不能因走透明隧道而失去后续请求的只读检查；补充表放在原有热命令与模块判断之后。
+    matches_ignore_ascii_case(
+        name,
+        &[
+            b"SUBSTR",
+            b"DIGEST",
+            b"EXPIRETIME",
+            b"PEXPIRETIME",
+            b"HTTL",
+            b"HPEXPIRETIME",
+            b"FIELDTTL",
+            b"SINTERCARD",
+            b"ZINTERCARD",
+            b"ZRANGEBYLEX",
+            b"ZRANGEBYSCORE",
+            b"ZREVRANGE",
+            b"ZREVRANGEBYLEX",
+            b"ZREVRANGEBYSCORE",
+            b"GEORADIUS_RO",
+            b"GEORADIUSBYMEMBER_RO",
+            b"SORT_RO",
+            b"XPENDING",
+            b"BF.EXISTS",
+            b"BF.MEXISTS",
+            b"BF.INFO",
+            b"CF.EXISTS",
+            b"CF.MEXISTS",
+            b"CF.COUNT",
+            b"CF.INFO",
+            b"CMS.QUERY",
+            b"CMS.INFO",
+            b"TOPK.QUERY",
+            b"TOPK.COUNT",
+            b"TOPK.LIST",
+            b"TOPK.INFO",
+            b"STRALGO",
+            b"_FT.CONFIG",
+            b"SLOWLOG",
+            b"COMMANDLOG",
+            b"CACHE",
+            b"DISK",
+            b"NAMESPACE",
+            b"PERFLOG",
+            b"KPROFILE",
+            b"SHOW",
+            b"LATENCY",
+            b"HOTKEYS",
+            b"BACKUP",
+            b"MODULE",
+            b"ACL",
+            b"SEARCH.CLUSTERINFO",
+            b"SYNCVERSION",
+            b"PFDEBUG",
+            b"SLOTSEMPTY",
+        ],
+    ) || is_additional_stateless_query(name)
 }
 
 /// 业务作用: 以 ASCII 大小写无关方式判断命令名是否属于指定模块前缀。
 /// 参数说明:
 /// - `value`: 待写入、解析或比较的业务值。
-/// - `prefix`: 测试 key、协议字段或配置路径前缀，用于限定匹配和资源命名空间。
+/// - `prefix`: 命令模块前缀，用于限定命令名称的匹配范围。
 ///
 // 先检查长度再切片，避免短命令在前缀比较时越界。
 fn starts_with_ignore_ascii_case(value: &[u8], prefix: &[u8]) -> bool {
     value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
-/// 业务作用: 在命令进入路由前校验参数数量、frame 和 bulk 大小，超限即拒绝当前连接输入。
+/// 业务作用: 在命令进入路由前校验 frame 和 bulk 大小，超限即拒绝当前连接输入。
 /// 参数说明:
 /// - `arg_ranges`: 命令参数在原始帧中的边界集合，用于无复制地定位和改写指定参数。
 /// - `frame_len`: 已经确认的完整 RESP 帧长度，用于切分缓冲区且不吞掉后续帧。
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 ///
-/// 返回: 命令参数数、frame 大小和每个 bulk 长度均未超限时返回成功；任一限制违反时返回错误。
+/// 返回: frame 大小和每个 bulk 长度均未超限时返回成功；任一限制违反时返回错误。
 fn validate_command_limits(
-    arg_ranges: &[std::ops::Range<usize>],
+    arg_ranges: &resp::CommandArgRanges,
     frame_len: usize,
     item: &ProxyItem,
 ) -> anyhow::Result<()> {
@@ -6868,7 +8521,7 @@ fn should_defer_valkey_protocol_error(
 /// 业务作用: 按 terminate、backend-inject 或 pass-through 策略处理前端认证前缀并保留首包剩余字节。
 /// 参数说明:
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
-/// - `client`: 当前前端客户端连接或测试客户端，用于发送命令并读取对应响应。
+/// - `client`: 当前前端连接，承载命令输入和对应响应。
 ///
 /// 返回: 认证成功或允许匿名时返回协议版本和首包剩余字节；超时、拒绝或协议非法时返回错误。
 async fn frontend_auth(

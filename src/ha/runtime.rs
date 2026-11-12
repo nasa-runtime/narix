@@ -1,3 +1,6 @@
+use crate::infrastructure::time::{
+    display_millis as now_ms, elapsed_micros, now_millis as now_unix_millis, unix_millis,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -5,15 +8,16 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
+use crate::infrastructure::identity::instance_nonce;
+use crate::infrastructure::lifecycle::{DomainTask, TaskScope, TaskSpawner};
 use anyhow::{bail, Context};
 use futures_util::future::join_all;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::cluster::backend::{BackendConnectOptions, BackendConnection};
@@ -73,6 +77,7 @@ pub struct ReplicationHaRuntime {
     cluster_config_revision: AtomicU64,
     persistence: RuntimePersistenceConfig,
     failover_lock: AsyncMutex<()>,
+    cleanup_tasks: TaskScope,
     current_master: RwLock<HaNode>,
     routing_tx: watch::Sender<HaRoutingState>,
     last_error: RwLock<Option<String>>,
@@ -89,15 +94,15 @@ pub struct ReplicationHaRuntime {
     reconcile_warning_not_before_ms: AtomicU64,
     /// fencing 失败后下一次允许执行自动隔离命令的 Unix 毫秒时间，防止每轮探测重复调用基础设施。
     automatic_retry_not_before_ms: AtomicU64,
-    /// 副本上游修复失败后下一次允许执行拓扑修复命令的 Unix 毫秒时间，防止坏副本按探测周期反复触发控制命令。
+    /// 副本上游收敛失败后下一次允许执行拓扑收敛命令的 Unix 毫秒时间，防止坏副本按探测周期反复触发控制命令。
     repair_retry_not_before_ms: AtomicU64,
     /// 运行代有效性令牌；退休后运行时步骤和适配器内部的每条控制命令都会拒绝继续执行。
     generation_guard: HaGenerationGuard,
-    /// 成功完成副本上游修复的累计次数。
+    /// 成功完成副本上游收敛的累计次数。
     repair_count: AtomicU64,
-    /// 副本上游修复失败（含权威获取失败）的累计次数。
+    /// 副本上游收敛失败（含权威获取失败）的累计次数。
     repair_failure_count: AtomicU64,
-    /// 最近一次成功副本上游修复的耗时，单位为微秒。
+    /// 最近一次成功副本上游收敛的耗时，单位为微秒。
     last_repair_elapsed_micros: AtomicU64,
     /// 各节点下一次允许输出探测失败日志的 Unix 毫秒时间，避免故障期日志随探测频率放大。
     probe_failure_log_not_before_ms: RwLock<HashMap<String, u64>>,
@@ -183,6 +188,7 @@ struct RuntimeClusterCoordinatorConfig {
 
 impl RuntimeCoordinatorConfig {
     /// 业务作用: 根据本地租约文件派生 failover outcome 文件路径，让等待租约的 proxy 能观察到已完成的新 master。
+    ///
     /// 返回: local-file coordinator 返回 outcome 文件路径；其它 coordinator 返回 `None`。
     fn local_outcome_path(&self) -> Option<PathBuf> {
         self.lease_path
@@ -198,7 +204,7 @@ impl RuntimeCoordinatorConfig {
 struct RedisCoordinatorConfig {
     addr: String,
     username: Option<String>,
-    password: Option<String>,
+    password: Option<crate::infrastructure::credentials::SecretText>,
     key: String,
     outcome_key: String,
     connect_timeout_ms: u64,
@@ -242,6 +248,7 @@ enum PersistenceTopologyKind {
 
 impl PersistenceTopologyKind {
     /// 业务作用: 将拓扑枚举转换成管理面稳定字符串，避免状态接口暴露 Rust 枚举格式。
+    ///
     /// 返回: 可用于 JSON 状态和指标标签的拓扑名称。
     fn as_str(&self) -> &'static str {
         match self {
@@ -418,6 +425,7 @@ impl HaActionAuthority for RuntimePersistenceAuthority<'_> {
 
 impl ClusterActionGuard {
     /// 业务作用: 在 fencing、提主等每个外部副作用前复验本节点仍是领导者且令牌仍处于活动状态。
+    ///
     /// 返回: 协调权威和活动令牌均有效时返回成功。
     async fn ensure_active(&self) -> anyhow::Result<()> {
         self.coordinator
@@ -467,30 +475,24 @@ impl ClusterActionGuard {
 
 impl Drop for ClusterActionGuard {
     /// 业务作用: 对尚未完成的动作异步提交失败结果，正常错误路径不应把 HA 组永久留在活动动作状态。
-    /// 返回: 无显式返回值；仅在当前异步运行时仍存在时启动尽力清理任务。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 补偿由协调器持有并等待；协调器已关闭时仅记录拒绝，不启动脱管任务。
     fn drop(&mut self) {
         if self.completed {
             return;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let coordinator = self.coordinator.clone();
-        let token = self.token.clone();
-        let target_master = self.target_master.clone();
-        runtime.spawn(async move {
-            if let Err(error) = coordinator
-                .handle
-                .complete_action(&coordinator.group_id, token, false, target_master)
-                .await
-            {
-                warn!(
-                    group_id = %coordinator.group_id,
-                    error = %error,
-                    "清理未完成的 replication HA 集群协调动作失败"
-                );
-            }
-        });
+        if let Err(error) = self.coordinator.handle.schedule_action_cleanup(
+            self.coordinator.group_id.clone(),
+            self.token.clone(),
+            self.target_master.clone(),
+        ) {
+            warn!(
+                group_id = %self.coordinator.group_id,
+                error = %error,
+                "协调器已关闭，未接纳 HA 动作失败报告"
+            );
+        }
     }
 }
 
@@ -527,11 +529,11 @@ pub struct ReplicationHaStatus {
     pub fence_failure_count: u64,
     /// 最近一次隔离动作的耗时，单位为微秒。
     pub last_fence_elapsed_micros: u64,
-    /// 成功完成副本上游修复的累计次数。
+    /// 成功完成副本上游收敛的累计次数。
     pub replica_repair_count: u64,
-    /// 副本上游修复失败（含权威获取失败）的累计次数。
+    /// 副本上游收敛失败（含权威获取失败）的累计次数。
     pub replica_repair_failure_count: u64,
-    /// 最近一次成功副本上游修复的耗时，单位为微秒。
+    /// 最近一次成功副本上游收敛的耗时，单位为微秒。
     pub last_replica_repair_elapsed_micros: u64,
     /// 当前使用的多代理协调模式。
     pub coordinator_mode: String,

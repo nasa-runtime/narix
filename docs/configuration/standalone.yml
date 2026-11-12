@@ -1,5 +1,5 @@
 # standalone 模式全量示例。
-# 接入其他已验证 KV 时修改 backend_profile、host、port 和后端凭据。
+# 接入其他受支持 KV 时修改 backend_profile、host、port 和后端凭据。
 
 reload: # 配置文件、证书依赖和显式请求的热更新策略。
   enabled: true # 是否允许文件检查、SIGHUP 和管理接口触发热更新。
@@ -41,7 +41,7 @@ admin: # 管理端 HTTP 服务配置。
 
 proxies: # 业务代理项列表；一个元素对应一个独立 listener 和一套资源配额。
   - name: redis-primary # 代理项唯一名称，也是日志、指标和多层配置合并的身份。
-    backend_profile: redis # 后端能力档案；可改为 README 中已验证的其他 standalone KV。
+    backend_profile: redis # 后端能力档案；可改为 README 中支持的其他 standalone KV。
     mode: standalone # 固定单后端透明代理模式。
 
     listen_host: 0.0.0.0 # 业务 listener 绑定主机；0.0.0.0 表示全部 IPv4 网卡。

@@ -3,7 +3,7 @@ use serde::Deserialize;
 /// 一个代理项选择的后端兼容档案。
 ///
 /// 档案不是展示标签：配置校验、前端 HELLO 身份、RESP3 准入和拓扑模式都会读取它。
-/// 精确版本的命令差异仍由后续版本化能力账本补充，不能仅凭产品名推断完整兼容。
+/// 命令、参数和模块能力仍受后端实际版本约束，不能仅凭产品名推断完整兼容。
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendProfile {

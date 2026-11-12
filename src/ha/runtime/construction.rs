@@ -1,5 +1,24 @@
 impl ReplicationHaRuntime {
-/// 业务作用: 从 proxy 配置构造 replication HA runtime，先以保护态启动，发现唯一在线 master 后发布路由。
+    /// 业务作用: 在配置候选发布前验证独立 Redis 租约凭据和读取权限，避免数据后端可用掩盖协调身份不可用。
+    /// 参数说明:
+    /// - `item`: 尚未发布的 replication HA 代理配置。
+    ///
+    /// 返回: 非 Redis 租约模式直接通过；连接、认证或租约记录读取失败时拒绝候选，不申请、续期或释放租约。
+    pub(crate) async fn preflight_redis_coordinator(item: &ProxyItem) -> anyhow::Result<()> {
+        let Some(config) = RedisCoordinatorConfig::from_proxy_item(item)? else {
+            return Ok(());
+        };
+        // 预检只读取当前权威和结果记录；候选尚未提交，不能以校验为由取得控制权或改变旧代租约。
+        read_redis_lease_owner(&config)
+            .await
+            .context("preflight Redis coordinator lease credentials")?;
+        read_redis_failover_outcome(&config)
+            .await
+            .context("preflight Redis coordinator outcome access")?;
+        Ok(())
+    }
+
+    /// 业务作用: 从 proxy 配置构造 replication HA runtime，先以保护态启动，发现唯一在线 master 后发布路由。
     /// 构造期只做拓扑发现，绝不执行 fence/promote；无主时以保护态返回并把恢复交给激活后的 reconcile 循环。
     /// 参数说明:
     /// - `item`: replication-ha listener 配置，包含节点列表、认证、探活、fencing、coordinator 和产品持久化参数。
@@ -69,12 +88,11 @@ impl ReplicationHaRuntime {
         let (routing_tx, _) = watch::channel(HaRoutingState::Protected {
             reason: "replication-ha runtime is initializing".to_string(),
         });
-        let coordinator_owner_id = item
-            .replication_ha_config()?
-            .coordinator
-            .owner_id
-            .clone()
-            .unwrap_or_else(|| default_coordinator_owner_id(&item.name));
+        // 显式 owner 保持配置身份；自动身份必须与旧运行代隔离，材料不足时在任何控制动作前拒绝构造。
+        let coordinator_owner_id = match &replication_ha.coordinator.owner_id {
+            Some(owner_id) => owner_id.clone(),
+            None => default_coordinator_owner_id(&item.name)?,
+        };
         let generation_guard = HaGenerationGuard::default();
         let backend = HaBackendDriver::from_proxy_item_with_guard(
             item,
@@ -115,39 +133,7 @@ impl ReplicationHaRuntime {
                     .lease_path
                     .as_ref()
                     .map(PathBuf::from),
-                redis: if coordinator_mode == HaCoordinatorMode::Redis {
-                    let key = replication_ha
-                        .coordinator
-                        .redis_key
-                        .clone()
-                        .with_context(|| {
-                            format!(
-                                "proxy `{}` ha.coordinator.mode=redis requires redis_key",
-                                item.name
-                            )
-                        })?;
-                    Some(RedisCoordinatorConfig {
-                        addr: replication_ha
-                            .coordinator
-                            .redis_addr
-                            .clone()
-                            .with_context(|| {
-                                format!(
-                                    "proxy `{}` ha.coordinator.mode=redis requires redis_addr",
-                                    item.name
-                                )
-                            })?,
-                        username: replication_ha.coordinator.redis_username.clone(),
-                        password: replication_ha.coordinator.redis_password.clone(),
-                        outcome_key: format!("{key}:outcome"),
-                        key,
-                        connect_timeout_ms: replication_ha.coordinator.redis_connect_timeout_ms,
-                        request_timeout_ms: replication_ha.coordinator.redis_request_timeout_ms,
-                        tcp_keepalive_ms: item.tcp_keepalive_ms,
-                    })
-                } else {
-                    None
-                },
+                redis: RedisCoordinatorConfig::from_proxy_item(item)?,
                 lease_ttl_ms: replication_ha.coordinator.lease_ttl_ms,
                 lease_renew_interval_ms: replication_ha.coordinator.lease_renew_interval_ms,
                 lease_acquire_timeout_ms: replication_ha.coordinator.lease_acquire_timeout_ms,
@@ -192,6 +178,7 @@ impl ReplicationHaRuntime {
                 fail_closed: replication_ha.persistence.fail_closed,
             },
             failover_lock: AsyncMutex::new(()),
+            cleanup_tasks: TaskScope::default(),
             observed_takeover: RwLock::new(ObservedTakeover::default()),
             unconfirmed_extra_masters: RwLock::new(HashSet::new()),
             current_master: RwLock::new(HaNode {
@@ -294,7 +281,9 @@ impl ReplicationHaRuntime {
                 // 会绕过跨代互斥形成双主。以保护态启动并把旧主设为当前目标,激活后的
                 // reconcile 循环按连败宽限、候选门禁与协调令牌完成恢复或等旧主归队。
                 *runtime.current_master.write().await = old_master.clone();
-                runtime.protect_until_initial_persistence_is_verified().await;
+                runtime
+                    .protect_until_initial_persistence_is_verified()
+                    .await;
                 runtime
                     .enter_protection(format!(
                         "no replication HA master observed at startup; routing stays closed while automatic recovery confirms `{}` is down",
@@ -330,7 +319,9 @@ impl ReplicationHaRuntime {
                 .ensure_cluster_initial_master_committed(&master)
                 .await?;
             *runtime.current_master.write().await = master.clone();
-            runtime.protect_until_initial_persistence_is_verified().await;
+            runtime
+                .protect_until_initial_persistence_is_verified()
+                .await;
             if !cluster.handle.route_authoritative().await {
                 runtime
                     .enter_protection(
@@ -346,7 +337,9 @@ impl ReplicationHaRuntime {
             runtime
                 .ensure_cluster_initial_master_committed(&master)
                 .await?;
-            runtime.protect_until_initial_persistence_is_verified().await;
+            runtime
+                .protect_until_initial_persistence_is_verified()
+                .await;
             runtime.set_current_master(master).await;
         }
         Ok(runtime)
@@ -414,7 +407,8 @@ impl ReplicationHaRuntime {
         ))
     }
 
-    /// 业务作用: 读取当前已发布的 master 地址，供管理接口、测试流程和切主前后对比使用。
+    /// 业务作用: 读取当前已发布的 master 地址，供管理接口和切主前后对比使用。
+    ///
     /// 返回: 当前 master 的客户端连接地址。
     // 返回克隆值而不是暴露锁守卫，调用方不会在后续网络 await 期间占用主节点读锁。
     pub async fn current_master_addr(&self) -> String {
@@ -429,12 +423,14 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 订阅 HA 路由状态变化，让数据面 relay 能在切主或保护态时主动断开旧连接。
+    ///
     /// 返回: watch receiver，初始值为当前 Serving 或 Protected 状态。
     pub fn routing_rx(&self) -> watch::Receiver<HaRoutingState> {
         self.routing_tx.subscribe()
     }
 
     /// 业务作用: 读取轻量路由状态摘要，管理面的 ready/status 不需要重新探活即可判断是否可服务。
+    ///
     /// 返回: 状态名称和保护原因；Serving 时原因为空。
     // 管理面只读 watch 快照，不在健康请求路径触发新的后端探测或控制动作。
     pub fn routing_status(&self) -> (&'static str, Option<String>) {
@@ -445,14 +441,16 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 构造 replication HA 管理面完整状态快照，包含当前路由、探活结果、切主计数、租约和自适应持久化状态。
+    /// 参数说明: 无。
+    ///
     /// 返回: 可序列化的状态对象；节点探活失败会标记为 unknown，不会让状态接口整体失败。
     pub async fn status(&self) -> ReplicationHaStatus {
         let current_master = self.current_master_addr().await;
         let last_error = self.last_error.read().await.clone();
         let (routing_state, protection_reason) = self.routing_status();
-        let probes = self.ha.nodes().iter().cloned().map(|node| async move {
+        let probes = self.ha.nodes().iter().map(|node| async move {
             let started = Instant::now();
-            let (role, replica_lag_seconds) = match self.ha.backend().inspect_node(&node).await {
+            let (role, replica_lag_seconds) = match self.ha.backend().inspect_node(node).await {
                 Ok(observation) => (observation.role, observation.replica_lag_seconds),
                 Err(_) => (HaRole::Unknown, None),
             };
@@ -502,7 +500,8 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 生成自适应 persistence 状态快照，展示热备、副本快照 owner、最近 handoff 和失败保护原因。
-    /// 返回: 可序列化的持久化状态对象，供管理接口和稳定性测试读取。
+    ///
+    /// 返回: 可序列化的持久化状态对象，供管理接口读取。
     async fn persistence_status(&self) -> ReplicationHaPersistenceStatus {
         let topology = self.persistence_topology.read().await.clone();
         let primary_owner = topology.snapshot_owners.first().cloned();
@@ -561,5 +560,42 @@ impl ReplicationHaRuntime {
                 .persistence_last_verify_duration_micros
                 .load(Ordering::Relaxed),
         }
+    }
+}
+
+impl RedisCoordinatorConfig {
+    /// 业务作用: 从同一配置代装配 Redis 租约连接材料，使候选预检和运行时使用一致的身份、键名及超时。
+    /// 参数说明:
+    /// - `item`: 包含外部协调器设置的 replication HA 代理配置。
+    ///
+    /// 返回: Redis 模式返回完整连接配置，其他模式返回空；必需地址或键名缺失时拒绝装配。
+    fn from_proxy_item(item: &ProxyItem) -> anyhow::Result<Option<Self>> {
+        let ha = item.replication_ha_config()?;
+        let coordinator = &ha.coordinator;
+        if coordinator.effective_mode(false) != HaCoordinatorMode::Redis {
+            return Ok(None);
+        }
+        let key = coordinator.redis_key.clone().with_context(|| {
+            format!(
+                "proxy `{}` ha.coordinator.mode=redis requires redis_key",
+                item.name
+            )
+        })?;
+        let addr = coordinator.redis_addr.clone().with_context(|| {
+            format!(
+                "proxy `{}` ha.coordinator.mode=redis requires redis_addr",
+                item.name
+            )
+        })?;
+        Ok(Some(Self {
+            addr,
+            username: coordinator.redis_username.clone(),
+            password: coordinator.redis_password.clone(),
+            outcome_key: format!("{key}:outcome"),
+            key,
+            connect_timeout_ms: coordinator.redis_connect_timeout_ms,
+            request_timeout_ms: coordinator.redis_request_timeout_ms,
+            tcp_keepalive_ms: item.tcp_keepalive_ms,
+        }))
     }
 }

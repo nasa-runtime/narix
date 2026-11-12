@@ -1,7 +1,8 @@
+use crate::infrastructure::time::display_millis as now_unix_ms;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use serde::Serialize;
@@ -24,7 +25,7 @@ pub enum SentinelRoutingState {
     Serving {
         /// 已通过 Sentinel 发现和数据节点角色验证的当前主节点。
         master: String,
-        /// 主节点变化时单调递增的路由代次。
+        /// 主节点变化或从保护态恢复时递增的路由代次。
         generation: u64,
         /// 最近一次成功确认当前路由的 Sentinel 地址。
         sentinel: String,
@@ -60,7 +61,7 @@ pub struct SentinelStatus {
     pub routing_state: String,
     /// 已验证且当前可服务的主节点地址。
     pub current_master: Option<String>,
-    /// 当前路由代次；尚未进入 Serving 时为零。
+    /// 当前可服务路由代次；非 Serving 状态为零。
     pub generation: u64,
     /// 最近一次成功响应发现请求的 Sentinel 地址。
     pub last_successful_sentinel: Option<String>,
@@ -74,7 +75,7 @@ pub struct SentinelStatus {
     pub refresh_success_total: u64,
     /// 所有 Sentinel 或候选角色验证失败累计次数。
     pub refresh_failure_total: u64,
-    /// 已有 Serving 路由之后发生的主节点切换累计次数。
+    /// 最近两次已验证主节点地址不同的累计次数，包含保护态期间的切换。
     pub master_change_total: u64,
 }
 
@@ -90,13 +91,13 @@ pub struct SentinelRuntime {
     /// Sentinel ACL 用户名，与数据节点 ACL 相互独立。
     sentinel_username: Option<String>,
     /// Sentinel 认证密码，与数据节点密码相互独立。
-    sentinel_password: Option<String>,
+    sentinel_password: Option<crate::infrastructure::credentials::SecretText>,
     /// Sentinel 控制连接专用 RESP TLS 配置。
     sentinel_tls: Option<BackendTlsConfig>,
     /// 业务数据节点 ACL 用户名。
     backend_username: Option<String>,
     /// 业务数据节点认证密码。
-    backend_password: Option<String>,
+    backend_password: Option<crate::infrastructure::credentials::SecretText>,
     /// 业务数据节点专用 RESP TLS 配置。
     backend_tls: Option<BackendTlsConfig>,
     /// TCP 或 TLS 建连允许等待的最长毫秒数。
@@ -115,6 +116,8 @@ pub struct SentinelRuntime {
     master_connections: Mutex<HashMap<String, BackendConnection>>,
     /// 向数据面广播 Resolving、Serving 或 Protected 路由状态。
     routing_tx: watch::Sender<SentinelRoutingState>,
+    /// 保留保护前的已验证地址与代次，并串行化发现和发布，避免并发刷新覆盖新路由。
+    verified_route: Mutex<Option<(String, u64)>>,
     /// 数据面故障触发的即时刷新通知。
     refresh_notify: Notify,
     /// 最近一次完整刷新失败原因。
@@ -127,7 +130,7 @@ pub struct SentinelRuntime {
     refresh_success_total: AtomicU64,
     /// 完整刷新失败累计次数。
     refresh_failure_total: AtomicU64,
-    /// Serving 路由之间发生主节点变化的累计次数。
+    /// 已验证主节点地址变化的累计次数，不因保护态清空历史。
     master_change_total: AtomicU64,
     /// 数据面最近是否报告当前路由连接失败；发现也失败时据此进入保护态。
     backend_failure_reported: AtomicBool,
@@ -173,6 +176,7 @@ impl SentinelRuntime {
             sentinel_connections,
             master_connections: Mutex::new(HashMap::new()),
             routing_tx,
+            verified_route: Mutex::new(None),
             refresh_notify: Notify::new(),
             last_error: RwLock::new(None),
             last_successful_sentinel: RwLock::new(None),
@@ -249,29 +253,39 @@ impl SentinelRuntime {
     /// 参数说明：
     /// - `shutdown`：进程关闭 watch；变化后停止新的发现请求。
     ///
-    /// 返回：无显式返回值；路由更新通过内部 watch channel 发布。
-    pub async fn watch(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
-        let _ = self.refresh().await;
-        let subscription_tasks = self
-            .sentinel_nodes
-            .iter()
-            .cloned()
-            .map(|sentinel| {
-                let runtime = Arc::clone(&self);
-                let shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    runtime.watch_switch_master_node(sentinel, shutdown).await;
-                })
-            })
-            .collect::<Vec<_>>();
+    /// 返回：正常关闭并等待订阅回收后成功；必需订阅提前结束或 panic 返回错误，由运行代监督关闭进程。
+    pub async fn watch(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = self.refresh() => {}
+            _ = shutdown.changed() => return Ok(()),
+        }
+        let mut subscription_tasks = tokio::task::JoinSet::new();
+        for sentinel in self.sentinel_nodes.iter().cloned() {
+            let runtime = Arc::clone(&self);
+            let shutdown = shutdown.clone();
+            subscription_tasks.spawn(async move {
+                runtime.watch_switch_master_node(sentinel, shutdown).await;
+            });
+        }
         let mut interval = tokio::time::interval(Duration::from_millis(self.refresh_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // `interval` 的首个 tick 立即完成；首次刷新已经显式执行，先消费该 tick。
         interval.tick().await;
+        let mut failed = false;
         loop {
             // 刷新在途时也要响应关闭信号:切代屏障会等待本任务退出,单次刷新的剩余时长
             // 不应叠加进发布窗口;取消等价于该轮刷新未发生,由下一轮或事件触发重试。
             tokio::select! {
+                ended = subscription_tasks.join_next(), if !subscription_tasks.is_empty() => {
+                    // 每个订阅都应自行重连；提前结束意味着发现监听不再完整，交由运行代监督收口。
+                    if ended.is_some() {
+                        failed = !*shutdown.borrow() || ended.is_some_and(|result| result.is_err());
+                        break;
+                    }
+                }
                 _ = interval.tick() => {
                     tokio::select! {
                         _ = self.refresh() => {}
@@ -299,10 +313,14 @@ impl SentinelRuntime {
                 }
             }
         }
-        for task in subscription_tasks {
-            task.abort();
-            let _ = task.await;
+        subscription_tasks.abort_all();
+        while let Some(result) = subscription_tasks.join_next().await {
+            if let Err(error) = result {
+                failed |= !error.is_cancelled();
+            }
         }
+        anyhow::ensure!(!failed, "Sentinel subscription task exited abnormally");
+        Ok(())
     }
 
     /// 业务作用: 持续订阅一个 Sentinel 的 `+switch-master` 频道，断线后按固定退避重连。
@@ -395,12 +413,6 @@ impl SentinelRuntime {
                 }
             };
             if switch_master_event_matches(&response.bytes, &self.master_name)? {
-                info!(
-                    proxy = %self.name,
-                    master_name = %self.master_name,
-                    sentinel = %sentinel,
-                    "sentinel switch-master event requested route refresh"
-                );
                 self.request_refresh();
             }
         }
@@ -408,10 +420,41 @@ impl SentinelRuntime {
 
     /// 业务作用: 执行一轮完整发现、候选角色验证和安全路由提交。
     ///
+    /// 参数说明: 无。
+    ///
     /// 返回：发现并验证成功时返回成功；全部候选失败时记录错误并返回失败。
     pub async fn refresh(&self) -> anyhow::Result<()> {
+        // 发现与发布使用同一串行边界；保护态只撤销可服务性，不能丢弃旧代身份。
+        let mut verified_route = self.verified_route.lock().await;
         match self.discover_master().await {
             Ok((master, sentinel_index, sentinel)) => {
+                let previous = self.routing_tx.borrow().clone();
+                let changed = previous
+                    .serving_route()
+                    .is_none_or(|(current, _)| current != master);
+                let generation = if changed {
+                    let previous_generation =
+                        verified_route.as_ref().map_or(0, |(_, value)| *value);
+                    match previous_generation.checked_add(1) {
+                        Some(value) => value,
+                        None => {
+                            // 代号耗尽时不能复用连接资源身份，保持保护并拒绝发布新路由。
+                            let reason = "sentinel route generation exhausted".to_string();
+                            self.routing_tx
+                                .send_replace(SentinelRoutingState::Protected {
+                                    reason: reason.clone(),
+                                });
+                            *self.last_error.write().await = Some(reason.clone());
+                            self.refresh_failure_total.fetch_add(1, Ordering::Relaxed);
+                            bail!(reason);
+                        }
+                    }
+                } else {
+                    previous
+                        .serving_route()
+                        .expect("serving route checked above")
+                        .1
+                };
                 self.preferred_sentinel
                     .store(sentinel_index, Ordering::Relaxed);
                 self.refresh_success_total.fetch_add(1, Ordering::Relaxed);
@@ -422,16 +465,15 @@ impl SentinelRuntime {
                 *self.last_successful_sentinel.write().await = Some(sentinel.clone());
                 *self.last_error.write().await = None;
 
-                let previous = self.routing_tx.borrow().clone();
-                let (generation, changed) = match previous.serving_route() {
-                    Some((current, generation)) if current == master => (generation, false),
-                    Some((_, generation)) => (generation.saturating_add(1), true),
-                    None => (1, true),
-                };
                 if changed {
-                    if previous.serving_route().is_some() {
+                    if verified_route
+                        .as_ref()
+                        .is_some_and(|(previous, _)| previous != &master)
+                    {
                         self.master_change_total.fetch_add(1, Ordering::Relaxed);
                     }
+                    // 即使恢复到同一地址，也发布新代；watch 合并中间保护通知时旧资源仍能识别失效。
+                    *verified_route = Some((master.clone(), generation));
                     self.routing_tx.send_replace(SentinelRoutingState::Serving {
                         master: master.clone(),
                         generation,
@@ -455,6 +497,7 @@ impl SentinelRuntime {
                 if self.routing_tx.borrow().serving_route().is_none()
                     || self.backend_failure_reported.load(Ordering::Acquire)
                 {
+                    // 没有已验证路由，或业务连接与重新发现同时失败时，禁止继续使用旧资源。
                     self.routing_tx
                         .send_replace(SentinelRoutingState::Protected {
                             reason: error.clone(),
@@ -717,18 +760,4 @@ fn switch_master_event_matches(frame: &[u8], master_name: &str) -> anyhow::Resul
             .as_deref()
             .and_then(|value| value.split_whitespace().next())
             == Some(master_name))
-}
-
-/// 业务作用: 获取用于管理状态展示的当前 Unix 毫秒时间。
-///
-/// 参数说明：无。
-///
-/// 返回：返回系统时间距 Unix epoch 的毫秒数；系统时间异常时返回零。
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }

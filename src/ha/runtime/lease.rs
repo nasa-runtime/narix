@@ -1,26 +1,29 @@
-/// 业务作用: 持有 HA 动作租约、续租任务和失权标记，析构时停止续租并尽力释放当前 owner。
+/// 业务作用: 持有 HA 动作租约和续租任务，析构时把停止续期及 owner 释放交还领域关闭屏障。
 #[derive(Debug)]
-// 表示 LeaseGuard 的数据结构，用于持有并释放本地 failover 租约。
 struct LeaseGuard {
     backend: LeaseBackend,
     owner_id: String,
     lost: Arc<AtomicBool>,
-    renew_task: JoinHandle<()>,
+    renew_task: Option<DomainTask<()>>,
+    cleanup_tasks: TaskSpawner,
 }
 
 impl LeaseGuard {
     /// 业务作用: 把已取得的本地或 Redis 租约组装成带续租任务和失权状态的生命周期守卫。
     /// 参数说明:
     /// - `backend`: 当前操作对应的后端目标或连接句柄，用于转发命令并归属资源统计。
-    /// - `owner_id`: 当前代理持有协调器租约时使用的唯一 owner 标识，用于防止其他实例误续约或误释放。
+    /// - `owner_id`: 本次动作已经取得租约时使用的完整随机令牌，用于隔离迟到续期和释放。
     /// - `ttl_ms`: coordinator 租约的有效期毫秒数。
     /// - `renew_interval_ms`: 持锁期间刷新 coordinator 租约的间隔毫秒数。
+    /// - `cleanup_tasks`: 租约所属运行代的收尾入口；续期停止和释放由其统一等待。
     ///
+    /// 返回: 持有续期任务的守卫；守卫取消后仍由运行代等待续期任务析构。
     fn from_acquired(
         backend: LeaseBackend,
         owner_id: String,
         ttl_ms: u64,
         renew_interval_ms: u64,
+        cleanup_tasks: TaskSpawner,
     ) -> Self {
         let renew_backend = backend.clone();
         let renew_owner = owner_id.clone();
@@ -74,17 +77,19 @@ impl LeaseGuard {
             backend,
             owner_id,
             lost,
-            renew_task,
+            renew_task: Some(renew_task.into()),
+            cleanup_tasks,
         }
     }
 
     /// 业务作用: 按配置后端竞争 HA 动作租约，并在成功后启动周期续租。
     /// 参数说明:
     /// - `backend`: 当前操作对应的后端目标或连接句柄，用于转发命令并归属资源统计。
-    /// - `owner_id`: 当前代理持有协调器租约时使用的唯一 owner 标识，用于防止其他实例误续约或误释放。
+    /// - `owner_id`: 稳定实例身份；本函数附加本次动作的独立随机令牌后才开始竞争。
     /// - `ttl_ms`: coordinator 租约的有效期毫秒数。
     /// - `renew_interval_ms`: 持锁期间刷新 coordinator 租约的间隔毫秒数。
     /// - `acquire_timeout_ms`: 等待获得 coordinator 租约的最长毫秒数。
+    /// - `cleanup_tasks`: 租约所属运行代的收尾入口，必须晚于所有动作守卫关闭。
     ///
     /// 返回: 在超时内取得租约时返回带续租任务的守卫；忙碌、后端或续租初始化失败时返回错误。
     async fn acquire(
@@ -93,7 +98,10 @@ impl LeaseGuard {
         ttl_ms: u64,
         renew_interval_ms: u64,
         acquire_timeout_ms: u64,
+        cleanup_tasks: TaskSpawner,
     ) -> anyhow::Result<Self> {
+        // Redis 超时不能证明已发送命令没有执行；每次动作使用独立身份，迟到释放只能命中原租约。
+        let owner_id = new_lease_owner_id(&owner_id)?;
         let started = Instant::now();
         let label = backend.label();
         let timeout = Duration::from_millis(acquire_timeout_ms);
@@ -106,6 +114,7 @@ impl LeaseGuard {
                         owner_id,
                         ttl_ms,
                         renew_interval_ms,
+                        cleanup_tasks,
                     ));
                 }
                 Ok(false) => {}
@@ -126,9 +135,14 @@ impl LeaseGuard {
     }
 
     /// 业务作用: 复验租约守卫未失权且后端 owner 仍匹配，阻止过期动作继续执行副作用。
+    /// 参数说明: 无。
+    ///
     /// 返回: 本地失权标记未置位且权威后端仍确认当前 owner 时返回成功；否则返回失权错误。
     async fn ensure_active(&self) -> anyhow::Result<()> {
-        if self.lost.load(Ordering::Relaxed) {
+        // 续期任务异常结束同样意味着未来有效期无法保证，不能仅依赖尚未到期的存储值继续动作。
+        if self.lost.load(Ordering::Relaxed)
+            || self.renew_task.as_ref().is_none_or(DomainTask::is_finished)
+        {
             bail!(
                 "replication HA lease `{}` renewal failed for `{}`",
                 self.backend.label(),
@@ -139,35 +153,53 @@ impl LeaseGuard {
     }
 }
 
+/// 业务作用: 为每次租约竞争生成独立控制身份，隔离同一代理前后两次动作的迟到续期和释放。
+/// 参数说明:
+/// - `instance_owner`: 配置或自动生成的稳定实例身份，用于关联日志与运行状态。
+///
+/// 返回: 稳定实例前缀加独立随机令牌；随机源不可用时拒绝竞争，不降级复用旧令牌。
+fn new_lease_owner_id(instance_owner: &str) -> anyhow::Result<String> {
+    Ok(format!("{instance_owner}:{}", instance_nonce()?))
+}
+
 impl Drop for LeaseGuard {
-    /// 业务作用: 释放 replication HA 主从探活、受控切换、租约互斥和持久化编排 的作用域资源，确保错误路径和正常路径都能回收计数或文件锁。
+    /// 业务作用: 先撤销续期，再将等待及 owner 比较释放登记到运行代，避免续期与释放乱序。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 运行代负责等待收尾；后端不可达时保留告警并依赖租约 TTL，不释放其他 owner 的租约。
     fn drop(&mut self) {
-        self.renew_task.abort();
-        match &self.backend {
-            LeaseBackend::LocalFile { path } => {
-                if let Err(err) = release_local_lease(path, &self.owner_id) {
-                    warn!(
-                        owner = %self.owner_id,
-                        path = %path.display(),
-                        error = %err,
-                        "failed to release replication HA failover lease"
-                    );
-                }
+        let Some(renew_task) = self.renew_task.take() else {
+            return;
+        };
+        renew_task.abort();
+        let backend = self.backend.clone();
+        let owner_id = self.owner_id.clone();
+        if let Err(error) = self.cleanup_tasks.spawn_cleanup(async move {
+            // 必须确认续期 future 已析构，随后才可删除 owner；异步取消请求本身不构成释放屏障。
+            let renewal = match renew_task.await {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_cancelled() => Ok(()),
+                Err(_) => Err(anyhow::anyhow!("HA lease renewal task exited abnormally")),
+            };
+            let released = match &backend {
+                LeaseBackend::LocalFile { path } => release_local_lease(path, &owner_id),
+                LeaseBackend::Redis { config } => release_redis_lease(config, &owner_id).await,
+            };
+            if let Err(error) = released {
+                warn!(
+                    owner = %owner_id,
+                    coordinator = %backend.label(),
+                    error = %error,
+                    "failed to release replication HA failover lease"
+                );
             }
-            LeaseBackend::Redis { config } => {
-                let config = config.clone();
-                let owner_id = self.owner_id.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = release_redis_lease(&config, &owner_id).await {
-                        warn!(
-                            owner = %owner_id,
-                            key = %config.key,
-                            error = %err,
-                            "failed to release replication HA failover lease"
-                        );
-                    }
-                });
-            }
+            renewal
+        }) {
+            warn!(
+                owner = %self.owner_id,
+                error = %error,
+                "HA runtime closed before lease cleanup was accepted"
+            );
         }
     }
 }
@@ -185,12 +217,8 @@ async fn try_acquire_coordinator_lease(
     ttl_ms: u64,
 ) -> anyhow::Result<bool> {
     match backend {
-        LeaseBackend::LocalFile { path } => {
-            try_acquire_local_lease(path, owner_id, ttl_ms)
-        }
-        LeaseBackend::Redis { config } => {
-            try_acquire_redis_lease(config, owner_id, ttl_ms).await
-        }
+        LeaseBackend::LocalFile { path } => try_acquire_local_lease(path, owner_id, ttl_ms),
+        LeaseBackend::Redis { config } => try_acquire_redis_lease(config, owner_id, ttl_ms).await,
     }
 }
 
@@ -208,9 +236,7 @@ async fn refresh_coordinator_lease(
 ) -> anyhow::Result<()> {
     match backend {
         LeaseBackend::LocalFile { path } => refresh_local_lease(path, owner_id, ttl_ms),
-        LeaseBackend::Redis { config } => {
-            refresh_redis_lease(config, owner_id, ttl_ms).await
-        }
+        LeaseBackend::Redis { config } => refresh_redis_lease(config, owner_id, ttl_ms).await,
     }
 }
 
@@ -226,9 +252,7 @@ async fn ensure_coordinator_lease_active(
 ) -> anyhow::Result<()> {
     match backend {
         LeaseBackend::LocalFile { path } => ensure_local_lease_active(path, owner_id),
-        LeaseBackend::Redis { config } => {
-            ensure_redis_lease_active(config, owner_id).await
-        }
+        LeaseBackend::Redis { config } => ensure_redis_lease_active(config, owner_id).await,
     }
 }
 
@@ -275,8 +299,12 @@ struct LocalFailoverOutcome {
 /// 返回: 本次原子竞争成功返回真，被其它 owner 持有返回假；存储或协议失败时返回错误。
 fn try_acquire_local_lease(path: &Path, owner_id: &str, ttl_ms: u64) -> anyhow::Result<bool> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create replication HA lease directory `{}`", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create replication HA lease directory `{}`",
+                parent.display()
+            )
+        })?;
     }
     let _lock = lock_local_lease_sidecar(path)?;
     let now = now_unix_millis()?;
@@ -425,7 +453,8 @@ fn read_local_lease(path: &Path) -> anyhow::Result<Option<LocalLease>> {
         Ok(raw) => raw,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err).with_context(|| format!("read replication HA lease `{}`", path.display()));
+            return Err(err)
+                .with_context(|| format!("read replication HA lease `{}`", path.display()));
         }
     };
     let mut owner_id = None;
@@ -476,7 +505,12 @@ fn lock_local_lease_sidecar(path: &Path) -> anyhow::Result<LocalLeaseFileLock> {
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .with_context(|| format!("open replication HA lease sidecar `{}`", lock_path.display()))?;
+        .with_context(|| {
+            format!(
+                "open replication HA lease sidecar `{}`",
+                lock_path.display()
+            )
+        })?;
     loop {
         // 安全依据：`file` 在循环和返回守卫的生命周期内保持打开，描述符有效；系统调用只对
         // 该描述符施加排他锁。被信号中断时重试，其他错误原样返回，避免无锁进入租约临界区。
@@ -488,8 +522,12 @@ fn lock_local_lease_sidecar(path: &Path) -> anyhow::Result<LocalLeaseFileLock> {
         if err.kind() == ErrorKind::Interrupted {
             continue;
         }
-        return Err(err)
-            .with_context(|| format!("lock replication HA lease sidecar `{}`", lock_path.display()));
+        return Err(err).with_context(|| {
+            format!(
+                "lock replication HA lease sidecar `{}`",
+                lock_path.display()
+            )
+        });
     }
 }
 
@@ -512,8 +550,9 @@ fn invalid_local_lease_expired(path: &Path, ttl_ms: u64) -> anyhow::Result<bool>
         Ok(modified) => modified,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("read replication HA lease metadata `{}`", path.display()));
+            return Err(err).with_context(|| {
+                format!("read replication HA lease metadata `{}`", path.display())
+            });
         }
     };
     let modified_ms = unix_millis(modified)?;
@@ -537,8 +576,12 @@ fn is_local_lease_parse_error(err: &anyhow::Error) -> bool {
 /// 返回: 临时文件落盘并原子替换成功时返回成功；创建、刷盘或重命名失败时返回错误。
 fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create replication HA file directory `{}`", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "create replication HA file directory `{}`",
+                parent.display()
+            )
+        })?;
     }
     for attempt in 0..100u32 {
         let tmp = atomic_temp_path(path, attempt)?;
@@ -553,13 +596,15 @@ fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
         };
         if let Err(err) = file.write_all(contents.as_bytes()) {
             let _ = fs::remove_file(&tmp);
-            return Err(err)
-                .with_context(|| format!("write temporary replication HA file `{}`", tmp.display()));
+            return Err(err).with_context(|| {
+                format!("write temporary replication HA file `{}`", tmp.display())
+            });
         }
         if let Err(err) = file.sync_all() {
             let _ = fs::remove_file(&tmp);
-            return Err(err)
-                .with_context(|| format!("sync temporary replication HA file `{}`", tmp.display()));
+            return Err(err).with_context(|| {
+                format!("sync temporary replication HA file `{}`", tmp.display())
+            });
         }
         drop(file);
         if let Err(err) = fs::rename(&tmp, path) {
@@ -651,8 +696,9 @@ fn read_local_failover_outcome(path: &Path) -> anyhow::Result<Option<LocalFailov
         Ok(raw) => raw,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("read replication HA failover outcome `{}`", path.display()));
+            return Err(err).with_context(|| {
+                format!("read replication HA failover outcome `{}`", path.display())
+            });
         }
     };
     let mut master = None;
@@ -936,32 +982,4 @@ fn resp_integer(value: &RespValue) -> anyhow::Result<i64> {
         RespValue::Integer(value) => Ok(*value),
         other => bail!("expected Redis integer response, got {:?}", other),
     }
-}
-
-/// 业务作用: 生成 replication HA 主从探活、受控切换、租约互斥和持久化编排 使用的时间或当前状态值，用于租约、指标和测试数据去重。
-/// 参数说明: 无。
-/// 返回: 系统时间可表示为 Unix 毫秒时返回数值；早于纪元或换算失败时返回错误。
-fn now_unix_millis() -> anyhow::Result<u128> {
-    unix_millis(SystemTime::now())
-}
-
-/// 业务作用: 生成 replication HA 主从探活、受控切换、租约互斥和持久化编排 使用的时间或当前状态值，用于租约、指标和测试数据去重。
-/// 参数说明: 无。
-fn now_ms() -> u64 {
-    now_unix_millis()
-        .ok()
-        .and_then(|value| value.try_into().ok())
-        .unwrap_or(0)
-}
-
-/// 业务作用: 返回当前 Unix 毫秒时间，供租约过期判断与状态记录使用。
-/// 参数说明:
-/// - `time`: 需要格式化或比较的时间值，用于租约期限和状态展示。
-///
-/// 返回: 系统时间可表示为 Unix 毫秒时返回数值；早于纪元或换算失败时返回错误。
-fn unix_millis(time: SystemTime) -> anyhow::Result<u128> {
-    Ok(time
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_millis())
 }

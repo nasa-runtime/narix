@@ -1,5 +1,7 @@
 /// Redis Cluster 后端连接建立与认证。
 pub mod backend;
+/// 后端缺失命令的原子别名及请求边界处理。
+pub(crate) mod command_compat;
 /// 普通多路复用连接的请求响应匹配。
 pub mod ordinary_mux;
 /// Pipeline 专用后端连接池与借还策略。

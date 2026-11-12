@@ -51,7 +51,7 @@ impl HaGenerationGuard {
 #[derive(Debug, Clone)]
 pub(crate) struct HaControlClient {
     username: Option<String>,
-    password: Option<String>,
+    password: Option<crate::infrastructure::credentials::SecretText>,
     tls: Option<BackendTlsConfig>,
     connect_timeout_ms: u64,
     probe_connect_timeout_ms: u64,

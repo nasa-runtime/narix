@@ -1,5 +1,5 @@
 # 标准槽位 Cluster 单入口模式全量示例。
-# backend_profile 可换成 README 中 cluster 模式允许的已验证档案。
+# backend_profile 可换成 README 中 cluster 模式允许的后端档案。
 
 reload: # 配置文件、证书依赖和显式请求的热更新策略。
   enabled: true # 是否允许文件检查、SIGHUP 和管理接口触发热更新。

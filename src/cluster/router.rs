@@ -1,3 +1,5 @@
+use crate::infrastructure::lifecycle::{TaskScope, TaskSpawner};
+use crate::infrastructure::time::duration_micros as duration_micros_u64;
 use std::collections::{hash_map::RandomState, HashMap};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Range;
@@ -8,7 +10,7 @@ use anyhow::{bail, Context};
 use bytes::Bytes;
 use futures_util::future::join_all;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock, Semaphore};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::admin::{ClusterAggregateGuard, ProxyMetrics};
 use crate::backend::BackendProfile;
@@ -31,7 +33,7 @@ use crate::resp::{self, RespValue};
 pub struct ClientCommand {
     /// 客户端发送的完整原始 RESP 帧，转发时无需重新编码。
     pub raw: Bytes,
-    arg_ranges: Vec<Range<usize>>,
+    arg_ranges: resp::CommandArgRanges,
 }
 
 impl ClientCommand {
@@ -40,8 +42,23 @@ impl ClientCommand {
     /// - `raw`: 尚未结构化的 RESP 或后端字节数据，解析前必须保留原始顺序。
     /// - `arg_ranges`: 命令参数在原始帧中的边界集合，用于无复制地定位和改写指定参数。
     ///
+    /// 返回: 命令接管原始字节与参数区间；区间仍须由调用方保证位于原始帧内。
     pub fn new(raw: Bytes, arg_ranges: Vec<Range<usize>>) -> Self {
-        Self { raw, arg_ranges }
+        Self::from_compact_ranges(raw, resp::CommandArgRanges::Heap(arg_ranges))
+    }
+
+    /// 业务作用: 接管已解析的紧凑参数区间，使转发路径无需再次构造参数容器。
+    /// 参数说明:
+    /// - `raw`: 与参数区间对应的完整原始命令帧。
+    /// - `arg_ranges`: 已通过协议校验、相对原始命令起点的参数区间。
+    ///
+    /// 返回: 命令共享原始帧并接管参数元数据，不复制参数内容。
+    #[rustfmt::skip]
+    pub(crate) fn from_compact_ranges(raw: Bytes, arg_ranges: resp::CommandArgRanges) -> Self {
+        Self {
+            raw,
+            arg_ranges,
+        }
     }
 
     /// 业务作用: 查询指定参数切片，用于在 cluster 热路径上避免重新构造整条命令的参数 Vec。
@@ -50,9 +67,7 @@ impl ClientCommand {
     ///
     // 查询指定参数切片，用于在 cluster 热路径上避免重新构造整条命令的参数 Vec。
     pub fn arg(&self, idx: usize) -> Option<&[u8]> {
-        self.arg_ranges
-            .get(idx)
-            .map(|range| &self.raw[range.clone()])
+        self.arg_ranges.get(idx).map(|range| &self.raw[range])
     }
 
     /// 业务作用: 返回借用命令包含的参数数量。
@@ -66,7 +81,7 @@ impl ClientCommand {
     pub fn arg_slices(&self) -> Vec<&[u8]> {
         self.arg_ranges
             .iter()
-            .map(|range| &self.raw[range.clone()])
+            .map(|range| &self.raw[range])
             .collect()
     }
 }
@@ -338,6 +353,8 @@ fn cluster_response_slot_frame<'a>(
 #[derive(Debug)]
 // 表示 ClusterRuntime 的数据结构，用于执行 Redis Cluster slot 路由、聚合和重定向处理。
 pub struct ClusterRuntime {
+    tasks: TaskSpawner,
+    owned_tasks: Option<TaskScope>,
     /// 当前 `proxies` 配置项的唯一名称，用于错误上下文；不同名称对应不同运行时和池集合。
     name: String,
     /// 驱动本地握手身份和 Cluster 能力边界的后端兼容档案。
@@ -347,7 +364,7 @@ pub struct ClusterRuntime {
     /// 当前 proxy 访问全部 Redis Cluster 节点时使用的可选 ACL 用户名。
     username: Option<String>,
     /// 当前 proxy 访问全部 Redis Cluster 节点时使用的可选认证密码。
-    password: Option<String>,
+    password: Option<crate::infrastructure::credentials::SecretText>,
     /// 业务数据节点 RESP TLS 配置；seed、拓扑节点与重定向目标统一使用。
     backend_tls: Option<BackendTlsConfig>,
     /// 建立后端 TCP 连接允许等待的最长毫秒数。
@@ -516,6 +533,24 @@ impl ClusterRuntime {
     ///
     /// 返回: 初始化完成的 Cluster runtime；任何 seed 无法加载完整 slot map 时返回错误并阻止 listener 半启动。
     pub async fn from_proxy_item(item: &ProxyItem, metrics: ProxyMetrics) -> anyhow::Result<Self> {
+        let scope = TaskScope::default();
+        let mut runtime = Self::with_tasks(item, metrics, scope.spawner()).await?;
+        runtime.owned_tasks = Some(scope);
+        Ok(runtime)
+    }
+
+    /// 业务作用: 在代理运行代的任务责任范围内构造 Cluster 路由与各节点的连接资源。
+    /// 参数说明:
+    /// - `item`: Cluster 路由、认证、传输和容量配置。
+    /// - `metrics`: 当前代理共享计数单元。
+    /// - `tasks`: 运行代负责关闭和等待的弱任务入口。
+    ///
+    /// 返回: 初始拓扑加载完整时返回运行时；失败不开放监听或发布部分拓扑。
+    pub(crate) async fn with_tasks(
+        item: &ProxyItem,
+        metrics: ProxyMetrics,
+        tasks: TaskSpawner,
+    ) -> anyhow::Result<Self> {
         let seeds = item.cluster_nodes()?;
         let backend_tls = BackendTlsConfig::for_backend(item);
         let slot_map = load_first_slot_map(
@@ -529,7 +564,11 @@ impl ClusterRuntime {
         )
         .await?;
 
-        let pipeline_pool = Arc::new(PipelineBackendPool::new(item, metrics.clone()));
+        let pipeline_pool = Arc::new(PipelineBackendPool::with_tasks(
+            item,
+            metrics.clone(),
+            tasks.clone(),
+        ));
         let cluster_nodes = slot_map.all_nodes();
         pipeline_pool.warmup_nodes(&cluster_nodes);
         let tunnel_pools = cluster_nodes
@@ -537,16 +576,19 @@ impl ClusterRuntime {
             .map(|backend| {
                 (
                     backend.clone(),
-                    TunnelPool::new(
+                    TunnelPool::with_tasks(
                         item.dedicated_tunnel_pool_max_idle,
                         item.dedicated_tunnel_pool_idle_timeout_ms,
                         metrics.clone(),
+                        tasks.clone(),
                     ),
                 )
             })
             .collect();
 
         Ok(Self {
+            tasks,
+            owned_tasks: None,
             name: item.name.clone(),
             backend_profile: item.backend_profile,
             seeds,
@@ -570,6 +612,7 @@ impl ClusterRuntime {
     }
 
     /// 业务作用: 从配置的 seed 重新加载 `CLUSTER SLOTS` 并原子替换 slot map，用于周期刷新和 MOVED 后修正路由。
+    ///
     /// 返回: 刷新成功返回 `Ok`；所有 seed 都失败时保留旧拓扑并返回错误。
     pub async fn refresh_topology(&self) -> anyhow::Result<()> {
         let slot_map = load_first_slot_map(
@@ -712,6 +755,9 @@ impl ClusterRuntime {
                             self.name
                         )
                     })?;
+                backend_connection
+                    .prepare_command_compatibility(self.backend_profile)
+                    .await?;
                 if let Some(version) = protocol_version {
                     backend_connection
                         .set_protocol_version(version)
@@ -799,10 +845,11 @@ impl ClusterRuntime {
         Ok(pools
             .entry(backend.to_owned())
             .or_insert_with(|| {
-                TunnelPool::new(
+                TunnelPool::with_tasks(
                     self.tunnel_pool_max_idle,
                     self.tunnel_pool_idle_timeout_ms,
                     self.metrics.clone(),
+                    self.tasks.clone(),
                 )
             })
             .clone())
@@ -1311,6 +1358,7 @@ impl ClusterRuntime {
     }
 
     /// 业务作用: 申请 Cluster 聚合并发许可，限制 all-node、跨 slot 拆分和 SCAN 对后端请求量的放大。
+    ///
     /// 返回: 聚合容量可用时返回自动释放的许可；达到并发上限时返回背压错误。
     // 申请一个集群聚合许可，用于限制 all-node、跨 slot 拆分、SCAN 这类会放大后端请求量的命令。
     fn try_acquire_aggregate_permit(&self) -> anyhow::Result<AggregatePermit> {
@@ -1546,6 +1594,8 @@ impl ClusterRuntime {
         })
         .await?;
 
+        conn.prepare_command_compatibility(self.backend_profile)
+            .await?;
         let frames = match &redirect {
             Redirect::Moved { slot, .. } => {
                 let retry =
@@ -1608,14 +1658,6 @@ where
         result.is_err(),
     );
     result
-}
-
-/// 业务作用: 把路由阶段耗时饱和转换为 u64 微秒指标。
-/// 参数说明:
-/// - `duration`: 时间跨度，用于统计窗口、等待上限或吞吐计算。
-///
-fn duration_micros_u64(duration: Duration) -> u64 {
-    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 /// 业务作用: 收拢普通响应槽位，用于按原始 pipeline 顺序返回完整响应。
@@ -1760,7 +1802,7 @@ fn parse_proxy_scan_cursor(raw: &[u8]) -> anyhow::Result<u64> {
 /// 参数说明:
 /// - `seeds`: 可尝试的集群种子节点集合，用于在单节点不可用时继续发现拓扑。
 /// - `username`: 认证用户名，用于 Redis ACL 场景；未启用 ACL 时通常为空。
-/// - `password`: 认证密码，用于连接后端、协调器或测试代理，调用方负责从安全配置注入。
+/// - `password`: 后端认证密码，调用方负责从安全配置提供。
 /// - `connect_timeout_ms`: 建立后端或 coordinator TCP 连接的超时毫秒数。
 /// - `request_timeout_ms`: 发送命令后等待后端或 coordinator 响应的超时毫秒数。
 /// - `tcp_keepalive_ms`: 后端 TCP keepalive 配置毫秒数，用于清理异常断开的空闲连接。
@@ -1790,7 +1832,6 @@ async fn load_first_slot_map(
         .await
         {
             Ok(slot_map) => {
-                debug!(seed = %seed, "loaded cluster slots");
                 return Ok(slot_map);
             }
             Err(err) => {

@@ -1,15 +1,16 @@
+use crate::infrastructure::time::duration_millis as duration_millis_u64;
+use crate::infrastructure::time::unix_millis_u64 as now_unix_millis;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use futures_util::future::join_all;
 use openraft::{BasicNode, Config, SnapshotPolicy};
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Mutex, RwLock};
-use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -401,7 +402,7 @@ pub struct StartedCoordinator {
     /// 供同一进程所有托管复制 HA 代理项共享的协议无关句柄。
     pub handle: Arc<CoordinatorHandle>,
     /// 必须由主进程监管并在异常退出时触发整体关闭的后台任务。
-    pub tasks: Vec<JoinHandle<anyhow::Result<()>>>,
+    pub tasks: Vec<crate::infrastructure::lifecycle::DomainTask>,
 }
 
 /// 业务作用: 区分静态创世信息选择的双节点与多数派运行时，分支在进程生命周期内不可改变。
@@ -414,6 +415,8 @@ enum CoordinatorProtocolRuntime {
 /// 业务作用: 向托管复制 HA 控制面提供协议无关的观察上报、动作批准、动作完成和路由权威检查接口。
 /// 字段说明: 所有克隆句柄都指向同一协议运行时和持久化状态，不允许每个代理项自行选举。
 pub struct CoordinatorHandle {
+    background_tasks: crate::infrastructure::lifecycle::TaskSpawner,
+    stopping: std::sync::atomic::AtomicBool,
     cluster_id: Arc<str>,
     local_node_id: u64,
     bootstrap_node_id: u64,
@@ -427,6 +430,7 @@ pub struct CoordinatorHandle {
     last_raft_authority_contact: Arc<Mutex<Instant>>,
     cluster_config: Arc<ClusterConfigRuntime>,
     configuration_transaction: Mutex<()>,
+    ha_control_gate: RwLock<()>,
 }
 
 impl std::fmt::Debug for CoordinatorHandle {
@@ -464,6 +468,21 @@ impl StartedCoordinator {
         config: ProxyClusterCoordinationConfig,
         shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<Self> {
+        Self::start_with_shutdown_dependencies(config, shutdown, Vec::new()).await
+    }
+
+    /// 业务作用: 启动协调资源，并在所有依赖领域任务结束后才关闭其事务收尾和传输。
+    /// 参数说明:
+    /// - `config`: 静态成员、协议、传输身份与存储配置。
+    /// - `shutdown`: 进程停止信号，收到后立即拒绝新的配置事务。
+    /// - `dependencies`: 配置、业务运行代和管理服务的结束通知；断开也表示原所有者已撤销。
+    ///
+    /// 返回: 控制监听就绪后的句柄和监督任务；所有等待继续消费 Application 的统一关闭预算。
+    pub async fn start_with_shutdown_dependencies(
+        config: ProxyClusterCoordinationConfig,
+        mut shutdown: watch::Receiver<bool>,
+        dependencies: Vec<watch::Receiver<bool>>,
+    ) -> anyhow::Result<Self> {
         // 主进程通常已经校验完整 ProxyConfig；这里仍重复校验协调子配置，使库调用方和未来
         // 其它启动入口无法绕过静态成员、计时互斥或 TLS 字段约束。
         config.validate()?;
@@ -488,6 +507,7 @@ impl StartedCoordinator {
             CoordinatorLogStore::open(Path::new(&config.data_dir), genesis)?;
         let network = CoordinatorNetworkFactory::from_config(&config)?;
         let last_raft_authority_contact = Arc::new(Mutex::new(Instant::now()));
+        let cluster_config = Arc::new(ClusterConfigRuntime::open(Path::new(&config.data_dir))?);
 
         let (protocol_runtime, raft, pair) = match protocol {
             ProxyClusterProtocol::Pair => {
@@ -524,6 +544,37 @@ impl StartedCoordinator {
                 )
                 .await
                 .context("create quorum coordinator runtime")?;
+                if config.node_id == config.bootstrap_node_id {
+                    // 静态成员初始化在长期任务移交前完成；失败必须先关闭 Raft 才交还启动错误。
+                    let initialized: anyhow::Result<()> = async {
+                        if !raft
+                            .is_initialized()
+                            .await
+                            .context("inspect quorum initialization state")?
+                        {
+                            let bootstrap_members = members
+                                .iter()
+                                .map(|(node_id, address)| {
+                                    (
+                                        *node_id,
+                                        BasicNode {
+                                            addr: address.clone(),
+                                        },
+                                    )
+                                })
+                                .collect::<BTreeMap<_, _>>();
+                            raft.initialize(bootstrap_members)
+                                .await
+                                .context("initialize static quorum membership")?;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(error) = initialized {
+                        let _ = raft.shutdown().await;
+                        return Err(error);
+                    }
+                }
                 (
                     CoordinatorProtocolRuntime::Quorum(raft.clone()),
                     Some(raft),
@@ -532,7 +583,10 @@ impl StartedCoordinator {
             }
         };
 
+        let background_tasks = crate::infrastructure::lifecycle::TaskScope::default();
         let handle = Arc::new(CoordinatorHandle {
+            background_tasks: background_tasks.spawner(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             cluster_id: Arc::from(wire_cluster_id(&config)),
             local_node_id: config.node_id,
             bootstrap_node_id: config.bootstrap_node_id,
@@ -544,8 +598,9 @@ impl StartedCoordinator {
             route_guard_timeout: Duration::from_millis(config.route_guard_timeout_ms),
             action_timeout: Duration::from_millis(config.action_timeout_ms),
             last_raft_authority_contact: last_raft_authority_contact.clone(),
-            cluster_config: Arc::new(ClusterConfigRuntime::open(Path::new(&config.data_dir))?),
+            cluster_config,
             configuration_transaction: Mutex::new(()),
+            ha_control_gate: RwLock::new(()),
         });
         let service = CoordinatorRpcService::new(
             &config,
@@ -555,59 +610,73 @@ impl StartedCoordinator {
             handle.clone(),
         );
         let mut tasks = Vec::new();
+        let (control_stop, control_shutdown) = watch::channel(false);
         let server_config = config.clone();
-        let server_shutdown = shutdown.clone();
-        tasks.push(tokio::spawn(async move {
-            rpc::serve(server_config, service, server_shutdown).await
-        }));
+        let server_shutdown = control_shutdown.clone();
+        let (server_ready_tx, server_ready_rx) = tokio::sync::oneshot::channel();
+        tasks.push(crate::infrastructure::lifecycle::DomainTask::from(
+            tokio::spawn(async move {
+                rpc::serve(server_config, service, server_shutdown, server_ready_tx).await
+            }),
+        ));
         let guard_handle = handle.clone();
-        let guard_shutdown = shutdown.clone();
-        tasks.push(tokio::spawn(async move {
-            guard_handle
-                .run_cluster_configuration_guard(guard_shutdown)
-                .await;
-            Ok(())
-        }));
+        let guard_shutdown = control_shutdown.clone();
+        tasks.push(crate::infrastructure::lifecycle::DomainTask::from(
+            tokio::spawn(async move {
+                guard_handle
+                    .run_cluster_configuration_guard(guard_shutdown)
+                    .await
+            }),
+        ));
         if let Some(pair) = pair {
-            let pair_shutdown = shutdown.clone();
-            tasks.push(tokio::spawn(async move {
-                pair.run(pair_shutdown).await;
-                Ok(())
-            }));
+            let pair_shutdown = control_shutdown.clone();
+            tasks.push(crate::infrastructure::lifecycle::DomainTask::from(
+                tokio::spawn(async move {
+                    pair.run(pair_shutdown).await;
+                    Ok(())
+                }),
+            ));
         }
         if let Some(raft) = raft {
-            if config.node_id == config.bootstrap_node_id {
-                let bootstrap_members = members
-                    .iter()
-                    .map(|(node_id, address)| {
-                        (
-                            *node_id,
-                            BasicNode {
-                                addr: address.clone(),
-                            },
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                // 初始化是启动门禁而不是长期服务。若把它作为普通后台任务加入主进程任务列表，
-                // 正常完成会被误判为监听器退出并触发整进程关闭，因此必须在返回前明确完成。
-                if !raft
-                    .is_initialized()
-                    .await
-                    .context("inspect quorum initialization state")?
-                {
-                    raft.initialize(bootstrap_members)
-                        .await
-                        .context("initialize static quorum membership")?;
-                }
-            }
             let authority_handle = handle.clone();
-            let authority_shutdown = shutdown;
-            tasks.push(tokio::spawn(async move {
-                authority_handle
-                    .run_quorum_authority_probe(authority_shutdown)
-                    .await;
-                Ok(())
-            }));
+            let authority_shutdown = control_shutdown;
+            tasks.push(crate::infrastructure::lifecycle::DomainTask::from(
+                tokio::spawn(async move {
+                    authority_handle
+                        .run_quorum_authority_probe(authority_shutdown)
+                        .await;
+                    // 权威探测停止后同时关闭 Raft 核心与 tick，防止协调任务结束但共识线程仍持有存储。
+                    raft.shutdown()
+                        .await
+                        .context("stop quorum consensus runtime")
+                }),
+            ));
+        }
+        let closing_handle = handle.clone();
+        let control_stop = crate::infrastructure::lifecycle::CompletionSignal::new(control_stop);
+        tasks.push(crate::infrastructure::lifecycle::DomainTask::from(
+            tokio::spawn(async move {
+                let _control_stop = control_stop;
+                while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+                // 先拒绝新事务，保留协调传输供已接纳的领域动作与失败补偿收口。
+                closing_handle
+                    .stopping
+                    .store(true, std::sync::atomic::Ordering::Release);
+                for mut dependency in dependencies {
+                    while !*dependency.borrow() && dependency.changed().await.is_ok() {}
+                }
+                let result = background_tasks.finish().await;
+                drop(_control_stop);
+                result
+            }),
+        ));
+        // 先确认控制监听已真正可用，再移交任务并启动集群配置同步；失败不会发布业务 Ready。
+        if server_ready_rx.await.is_err() {
+            tasks
+                .remove(0)
+                .await
+                .context("join coordination startup task")??;
+            anyhow::bail!("coordination listener stopped before readiness");
         }
         info!(
             cluster_id = %config.cluster_id,
@@ -800,6 +869,7 @@ impl CoordinatorHandle {
     }
 
     /// 业务作用: 返回静态创世成员表的多数派门槛，存活节点数变化不会降低该值。
+    ///
     /// 返回: 返回 `成员总数 / 2 + 1`。
     pub fn majority(&self) -> usize {
         self.member_count / 2 + 1
@@ -845,19 +915,53 @@ impl CoordinatorHandle {
             .await
     }
 
-    /// 业务作用: 返回单次外部协调动作的最长批准窗口，供代理启动阶段等待领导者完成初始拓扑修复。
+    /// 业务作用: 返回单次外部协调动作的最长批准窗口，供代理启动阶段等待领导者完成初始拓扑收敛。
+    ///
     /// 返回: 返回由 `coordination.action_timeout_ms` 构造的持续时间。
     pub fn action_timeout(&self) -> Duration {
         self.action_timeout
     }
 
     /// 业务作用: 返回数据路由允许沿用最近一次协调权威的保护窗口，供托管复制 HA 数据面建立独立失权监视器。
+    ///
     /// 返回: 返回由 `coordination.route_guard_timeout_ms` 构造的持续时间。
     pub fn route_guard_timeout(&self) -> Duration {
         self.route_guard_timeout
     }
 
+    /// 业务作用: 为普通 HA 控制动作取得配置事务之外的共享执行许可，避免旧拓扑覆盖预提交结果。
+    ///
+    /// 参数说明:
+    /// - `runtime_revision`: 发起动作的 HA 运行代绑定的集群配置版本。
+    ///
+    /// 返回: 配置事务未独占控制面且运行代未被候选冻结时返回许可；调用方须持有到动作收口。
+    pub(crate) async fn try_regular_ha_control(
+        &self,
+        runtime_revision: u64,
+    ) -> anyhow::Result<tokio::sync::RwLockReadGuard<'_, ()>> {
+        // 配置事务先排空普通动作，再独占执行 precommit、提交和激活。普通动作不能
+        // 等待写锁，否则激活时等待旧运行代退出会与该运行代等待事务解锁形成环路。
+        let permit = self
+            .ha_control_gate
+            .try_read()
+            .context("HA control is reserved by a cluster configuration transaction")?;
+        // 远端 prepare 也会冻结旧运行代。即使本成员随后取得领导权，也不能在候选
+        // 仍待提交或中止时按旧配置改写后端；已激活的新版本不受旧冻结约束。
+        if self
+            .cluster_config
+            .serving_freeze
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|freeze| runtime_revision < freeze.revision)
+        {
+            bail!("HA runtime configuration is frozen by a pending cluster configuration");
+        }
+        Ok(permit)
+    }
+
     /// 业务作用: 判断本节点是否是当前协议确认的领导者，只有领导节点上的 HA watcher 才能执行外部控制动作。
+    ///
     /// 返回: 双节点角色或多数派当前领导者指向本节点时返回真。
     pub async fn is_local_leader(&self) -> bool {
         match &self.protocol {
@@ -1035,13 +1139,17 @@ impl CoordinatorHandle {
         digest: String,
         payload: Vec<u8>,
     ) -> anyhow::Result<ClusterConfigResponse> {
+        anyhow::ensure!(
+            !self.stopping.load(std::sync::atomic::Ordering::Acquire),
+            "coordination is stopping; configuration proposals are closed"
+        );
         let leader = self
             .leader_node_id()
             .await?
             .context("coordination cluster has no current leader")?;
         if leader != self.local_node_id {
             let mut client = self.network.configuration_client(leader).await?;
-            let mut request = tonic::Request::new(ClusterConfigRequest {
+            let mut request = nasa::grpc::Request::new(ClusterConfigRequest {
                 cluster_id: self.cluster_id.to_string(),
                 sender_node_id: self.local_node_id,
                 expected_revision,
@@ -1064,19 +1172,20 @@ impl CoordinatorHandle {
         // HTTP/gRPC 调用方可能在客户端超时或断开后丢弃等待 future。领导节点事务一旦
         // 进入 prepare/HA precommit 就必须自行收口，不能让请求生命周期取消外部副作用。
         let handle = self.clone();
-        tokio::spawn(async move {
-            handle
-                .commit_cluster_config_as_leader(
-                    expected_revision,
-                    transaction_timeout,
-                    force_revision,
-                    digest,
-                    payload,
-                )
-                .await
-        })
-        .await
-        .context("join cluster configuration transaction task")?
+        self.background_tasks
+            .spawn(async move {
+                handle
+                    .commit_cluster_config_as_leader(
+                        expected_revision,
+                        transaction_timeout,
+                        force_revision,
+                        digest,
+                        payload,
+                    )
+                    .await
+            })?
+            .await
+            .context("join cluster configuration transaction task")?
     }
 
     /// 业务作用: 由当前领导者执行多数派配置事务并通知全部可达成员并发发布。
@@ -1102,6 +1211,12 @@ impl CoordinatorHandle {
             bail!("cluster configuration transaction timeout must be > 0");
         }
         let started = Instant::now();
+        // 先排空已进入的普通控制动作，再把 HA precommit 到配置激活作为一个独占
+        // 窗口。否则后台收敛可能在 checkpoint 后重新启用旧 owner，并以新动作阻止提交。
+        // 只约束本地控制顺序，实际副作用仍逐步复验共识领导权和动作令牌。
+        let _control = tokio::time::timeout(transaction_timeout, self.ha_control_gate.write())
+            .await
+            .context("cluster configuration timed out waiting for current HA control actions")?;
         // 不能用 tokio::time::timeout 直接丢弃整个事务 future：HA precommit 已经进入
         // supervisor 后会独立执行 fencing、切主或持久化交接，取消等待者并不会取消这些
         // 外部副作用。这里让各网络和后端步骤继续使用自身有界超时，并把已经开始的事务
@@ -1234,7 +1349,7 @@ impl CoordinatorHandle {
             let digest = digest.clone();
             async move {
                 let mut client = network.configuration_client(member).await?;
-                let mut request = tonic::Request::new(request);
+                let mut request = nasa::grpc::Request::new(request);
                 request.set_timeout(transaction_timeout);
                 let response = client
                     .prepare_cluster_config(request)
@@ -1316,7 +1431,7 @@ impl CoordinatorHandle {
             let digest = digest.clone();
             async move {
                 let mut client = network.configuration_client(member).await?;
-                let mut request = tonic::Request::new(request);
+                let mut request = nasa::grpc::Request::new(request);
                 request.set_timeout(transaction_timeout);
                 let response = client
                     .prepare_cluster_config(request)
@@ -1459,7 +1574,7 @@ impl CoordinatorHandle {
             let digest = digest.clone();
             async move {
                 let mut client = network.configuration_client(member).await?;
-                let mut request = tonic::Request::new(request);
+                let mut request = nasa::grpc::Request::new(request);
                 request.set_timeout(transaction_timeout);
                 let response = client
                     .activate_cluster_config(request)
@@ -1507,7 +1622,7 @@ impl CoordinatorHandle {
                 let Ok(mut client) = network.configuration_client(member).await else {
                     return;
                 };
-                let mut request = tonic::Request::new(request);
+                let mut request = nasa::grpc::Request::new(request);
                 request.set_timeout(network.rpc_timeout());
                 let _ = client.abort_cluster_config(request).await;
             }
@@ -1685,7 +1800,7 @@ impl CoordinatorHandle {
     /// - `observation_window`: 允许计票的观察时间窗口。
     /// - `required_observations`: 至少需要的不同代理报告数。
     ///
-    /// 返回: 批准时返回绑定任期和日志位置的动作令牌，拒绝时返回具体原因。
+    /// 返回: 当前领导权已确认且状态机批准时返回绑定任期和日志位置的动作令牌；失权、超时或状态机拒绝时返回错误。
     #[allow(clippy::too_many_arguments)]
     pub async fn begin_action(
         &self,
@@ -1701,11 +1816,16 @@ impl CoordinatorHandle {
         required_observations: usize,
     ) -> anyhow::Result<String> {
         self.wait_for_active_action_quiescence(group_id).await?;
-        let cutoff = now_unix_millis()?
-            .saturating_sub(u64::try_from(observation_window.as_millis()).unwrap_or(u64::MAX));
+        // 新领导者不能依赖上一任期留下的心跳时间开始外部动作；先取得本任期的多数派证据。
+        // 此确认仅发生在控制动作申请阶段，业务命令仍直接使用已发布的数据面门禁。
+        self.confirm_action_leadership().await?;
+        let cutoff = now_unix_millis()?.saturating_sub(
+            crate::infrastructure::time::duration_millis_saturating(observation_window),
+        );
         let requested_at_unix_ms = now_unix_millis()?;
-        let expires_at_unix_ms = requested_at_unix_ms
-            .saturating_add(u64::try_from(self.action_timeout.as_millis()).unwrap_or(u64::MAX));
+        let expires_at_unix_ms = requested_at_unix_ms.saturating_add(
+            crate::infrastructure::time::duration_millis_saturating(self.action_timeout),
+        );
         let response = self
             .submit(CoordinationCommand::BeginAction {
                 group_id: group_id.to_string(),
@@ -1734,6 +1854,44 @@ impl CoordinatorHandle {
         response
             .action_token
             .context("coordinator accepted action without returning a token")
+    }
+
+    /// 业务作用: 在申请 HA 外部动作前确认当前领导权，并为多数派协议建立保守的本任期权威时间。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回: 本节点仍为领导者且取得有效权威时成功；多数派不足、确认超时或任期变化时拒绝申请。
+    async fn confirm_action_leadership(&self) -> anyhow::Result<()> {
+        if !self.is_local_leader().await {
+            // 跟随者不能通过转发动作申请取得执行外部副作用的资格。
+            bail!("local coordinator is not the current leader");
+        }
+        match &self.protocol {
+            CoordinatorProtocolRuntime::Pair(pair) => {
+                if !pair.route_authoritative().await {
+                    bail!("pair coordinator cannot confirm action authority");
+                }
+            }
+            CoordinatorProtocolRuntime::Quorum(raft) => {
+                let term = raft.metrics().borrow().current_term;
+                let started = Instant::now();
+                tokio::time::timeout(self.route_guard_timeout, raft.ensure_linearizable())
+                    .await
+                    .context("timed out confirming quorum action authority")?
+                    .context("confirm quorum action authority")?;
+                // 确认期间角色或任期变化时，旧请求的多数派响应不能授权新一轮控制动作。
+                if raft.current_leader().await != Some(self.local_node_id)
+                    || raft.metrics().borrow().current_term != term
+                    || started.elapsed() >= self.route_guard_timeout
+                {
+                    bail!("quorum action authority changed while being confirmed");
+                }
+                // 从请求发起时计算有效窗口，避免慢响应把过期证据延长；并发的新证据不能被覆盖回退。
+                let mut contact = self.last_raft_authority_contact.lock().await;
+                *contact = (*contact).max(started);
+            }
+        }
+        Ok(())
     }
 
     /// 业务作用: 新领导者替换遗留动作前等待完整动作窗口和路由保护窗口，隔离不同领导任期中的外部副作用。
@@ -1807,7 +1965,37 @@ impl CoordinatorHandle {
         Ok(response)
     }
 
+    /// 业务作用: 将中断动作的失败报告登记到协调器关闭屏障，避免请求析构后补偿脱离进程监督。
+    /// 参数说明:
+    /// - `group_id`: 原动作所属 HA 组，不授予新的动作权威。
+    /// - `token`: 原动作令牌，仅能结束对应活动动作。
+    /// - `target_master`: 原动作目标，失败报告不会发布该节点为新主。
+    ///
+    /// 返回: 接纳后等待一次尽力报告；传输或权威失败记录日志并依赖令牌失效，不绕过共识。
+    pub(crate) fn schedule_action_cleanup(
+        self: &Arc<Self>,
+        group_id: String,
+        token: String,
+        target_master: String,
+    ) -> anyhow::Result<()> {
+        let handle = self.clone();
+        self.background_tasks.spawn(async move {
+            if let Err(error) = handle
+                .complete_action(&group_id, token, false, target_master)
+                .await
+            {
+                tracing::warn!(
+                    group_id = %group_id,
+                    error = %error,
+                    "清理未完成的 replication HA 集群协调动作失败"
+                );
+            }
+        })?;
+        Ok(())
+    }
+
     /// 业务作用: 判断当前节点最近是否拥有可验证的集群权威，数据面据此在失去领导通信后进入保护态。
+    ///
     /// 返回: 双节点依据对端心跳或 fencing，多数派依据当前领导和最近共识联系判断。
     pub async fn route_authoritative(&self) -> bool {
         // 持久化层一旦出现无法确认最终落盘状态的错误会永久失败关闭。即使共识运行时仍暂存
@@ -1826,6 +2014,7 @@ impl CoordinatorHandle {
     }
 
     /// 业务作用: 返回最近已提交的完整业务状态副本，读取不会绕过路由权威检查自动开放服务。
+    ///
     /// 返回: 返回持久化状态副本。
     pub fn state(&self) -> anyhow::Result<CoordinationState> {
         self.state_store.read_state()
@@ -1885,19 +2074,31 @@ impl CoordinatorHandle {
     /// 参数说明:
     /// - `shutdown`: 主进程统一关闭信号。
     ///
-    /// 返回: 收到关闭信号后结束；读取错误按不一致处理并保持关闭式保护。
-    async fn run_cluster_configuration_guard(&self, mut shutdown: watch::Receiver<bool>) {
+    /// 返回: 收到关闭信号后成功结束；配置读取错误保持保护，受管事务任务异常则报告关键任务失败。
+    async fn run_cluster_configuration_guard(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(25));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    if *shutdown.borrow() {
+                        self.cluster_config.serving.send_replace(false);
+                        return Ok(());
+                    }
+                    if let Err(error) = self.background_tasks.check() {
+                        // 事务执行权异常丢失时不能继续以旧配置开放数据面，先保护再交给 Application 停止。
+                        self.cluster_config.serving.send_replace(false);
+                        return Err(error);
+                    }
                     let _ = self.cluster_configuration_ready().await;
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         self.cluster_config.serving.send_replace(false);
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -2000,29 +2201,6 @@ fn validate_persisted_cluster_config(persisted: &PersistedClusterConfig) -> anyh
         bail!("cluster configuration payload digest does not match committed digest");
     }
     Ok(())
-}
-
-/// 业务作用: 读取当前纪元毫秒作为观察日志中的显式数据，状态机自身不访问各节点本地时钟。
-/// 参数说明: 无。
-/// 返回: 返回饱和到 u64 的纪元毫秒；系统时间非法时返回错误。
-fn now_unix_millis() -> anyhow::Result<u64> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_millis();
-    Ok(u64::try_from(millis).unwrap_or(u64::MAX))
-}
-
-/// 业务作用: 将内部持续时间安全转换为协议使用的毫秒整数。
-///
-/// 参数说明:
-/// - `duration`: 需要写入 gRPC 请求或诊断文本的持续时间。
-///
-/// 返回: 至少为一毫秒并在溢出时饱和到 `u64::MAX` 的数值。
-fn duration_millis_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(1)
 }
 
 /// 业务作用: 根据已完成发布的静态成员数判断集群配置事务能否向运维端返回成功。

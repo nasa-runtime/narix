@@ -2,6 +2,9 @@
 # 该文件显式展开所有通用字段和 Dragonfly 产品字段；互斥协调器字段使用 null。
 # 生产应配置真实 external-command fencing；多机多 NARIX 使用 proxy-cluster 或独立 Redis 协调器。
 
+# 本模式为每个前端绑定独立后端连接，以 max_connections 限制连接总量。
+# 下列通用 pipeline 池与 DedicatedTunnel 池参数不参与本模式的数据转发。
+
 reload: # 配置文件、证书依赖和显式请求的热更新策略。
   enabled: true # 是否允许文件检查、SIGHUP 和管理接口触发热更新。
   poll_interval_ms: 1000 # 检查配置来源和 TLS 依赖文件内容的周期，单位毫秒。

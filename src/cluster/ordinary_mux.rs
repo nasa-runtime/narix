@@ -5,11 +5,13 @@ use std::time::Duration;
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::admin::ProxyMetrics;
+use crate::backend::BackendProfile;
 use crate::cluster::backend::{BackendConnectOptions, BackendConnection, BackendTlsConfig};
 use crate::config::{AuthMode, ProxyItem};
+use crate::infrastructure::lifecycle::TaskScope;
 
 const ORDINARY_MUX_MAX_BATCH: usize = 256;
 
@@ -17,6 +19,7 @@ const ORDINARY_MUX_MAX_BATCH: usize = 256;
 #[derive(Debug)]
 // 表示 OrdinaryBackendMux 的数据结构，用于让普通单命令共享同一条后端连接。
 pub struct OrdinaryBackendMux {
+    tasks: TaskScope,
     factory: Arc<BackendConnectionFactory>,
     nodes: StdMutex<HashMap<String, mpsc::Sender<OrdinaryJob>>>,
     queue_size: usize,
@@ -27,8 +30,9 @@ pub struct OrdinaryBackendMux {
 #[derive(Debug)]
 // 表示 BackendConnectionFactory 的数据结构，用于创建 ordinary mux 持有的后端连接。
 struct BackendConnectionFactory {
+    profile: BackendProfile,
     username: Option<String>,
-    password: Option<String>,
+    password: Option<crate::infrastructure::credentials::SecretText>,
     connect_timeout_ms: u64,
     request_timeout_ms: u64,
     tcp_keepalive_ms: u64,
@@ -51,10 +55,13 @@ impl OrdinaryBackendMux {
     /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
     /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
     ///
+    /// 返回: 独占 worker 生命周期的节点池，首次访问节点时创建 worker，关闭时统一取消并等待。
     pub fn new(item: &ProxyItem, metrics: ProxyMetrics) -> Self {
         let (username, password) = backend_credentials(item);
         Self {
+            tasks: TaskScope::default(),
             factory: Arc::new(BackendConnectionFactory {
+                profile: item.backend_profile,
                 username,
                 password,
                 connect_timeout_ms: item.connect_timeout_ms,
@@ -118,7 +125,7 @@ impl OrdinaryBackendMux {
             .entry(mux_key(node, protocol_version))
             .or_insert_with(|| {
                 let (tx, rx) = mpsc::channel(self.queue_size);
-                tokio::spawn(run_ordinary_mux_worker(
+                let _ = self.tasks.spawner().spawn(run_ordinary_mux_worker(
                     node.to_string(),
                     protocol_version,
                     self.factory.clone(),
@@ -127,6 +134,14 @@ impl OrdinaryBackendMux {
                 tx
             })
             .clone()
+    }
+
+    /// 业务作用: 在前端会话停止后关闭节点 worker 并等待其后端连接释放。
+    /// 参数说明: 无。
+    ///
+    /// 返回: worker 全部完成取消且没有任务异常时成功；不为本次等待分配独立关闭预算。
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.tasks.cancel_and_wait().await
     }
 }
 
@@ -275,13 +290,7 @@ async fn connect_with_retry(
     for attempt in 1..=CONNECT_ATTEMPTS {
         match factory.connect(node, protocol_version).await {
             Ok(conn) => return Ok(conn),
-            Err(err) if attempt < CONNECT_ATTEMPTS => {
-                debug!(
-                    backend = %node,
-                    attempt,
-                    error = %err,
-                    "ordinary backend mux connect failed, retrying"
-                );
+            Err(_) if attempt < CONNECT_ATTEMPTS => {
                 tokio::time::sleep(Duration::from_millis((attempt * 20) as u64)).await;
             }
             Err(err) => return Err(err),
@@ -315,6 +324,7 @@ impl BackendConnectionFactory {
             tls: self.tls.as_ref(),
         })
         .await?;
+        conn.prepare_command_compatibility(self.profile).await?;
         if let Some(protocol_version) = protocol_version {
             conn.set_protocol_version(protocol_version).await?;
         }
@@ -340,7 +350,12 @@ fn mux_key(node: &str, protocol_version: Option<u8>) -> String {
 /// - `item`: 当前代理配置项，包含模式、监听地址、后端、认证和资源限制。
 ///
 // 生成后端认证配置，用于确保 pass-through 模式不会被 ordinary mux 连接提前认证。
-fn backend_credentials(item: &ProxyItem) -> (Option<String>, Option<String>) {
+fn backend_credentials(
+    item: &ProxyItem,
+) -> (
+    Option<String>,
+    Option<crate::infrastructure::credentials::SecretText>,
+) {
     if item.effective_auth_mode() == AuthMode::PassThrough {
         (None, None)
     } else {
