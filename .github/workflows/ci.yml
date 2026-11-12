@@ -10,8 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+      - name: 安装 Rust 1.94 工具链
+        uses: dtolnay/rust-toolchain@1.94.0
 
       - name: 安装格式化与静态分析组件
         run: rustup component add rustfmt clippy
