@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "narix"
-version = "1.0.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",

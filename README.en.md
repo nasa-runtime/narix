@@ -204,7 +204,7 @@ External-file selection follows `--config` → `APP_CONFIG_FILE` → the compati
 Prepare `deploy/narix/config/narix.yml` with the business listener at `0.0.0.0:6379`, administration at `0.0.0.0:18080`, and real backend addresses and credentials. Create `deploy/narix/data` and `deploy/narix/logs`. Image user `10001:10001` must be able to read configuration and write data and logs.
 
 ```sh
-docker build -f docker/Dockerfile -t narix:1.0.1 .
+docker build -f docker/Dockerfile -t narix:1.0.0 .
 docker run -d --name narix \
   --restart unless-stopped --stop-timeout 70 \
   -p 6379:6379 -p 127.0.0.1:18080:18080 \
@@ -212,7 +212,7 @@ docker run -d --name narix \
   -v "$PWD/deploy/narix/data:/var/lib/narix" \
   -v "$PWD/deploy/narix/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  narix:1.0.1
+  narix:1.0.0
 ```
 
 The image defaults to `APP_CONFIG_FILE=/etc/narix/narix.yml`. Configuration is read-only; data and logs persist on the host. The read-only `/etc/localtime` mount uses the host time zone; this file must exist and be mountable on the Docker host. Keep coordination storage under `/var/lib/narix`, with a separate directory for each member. The business port is published; administration is limited to host loopback. If the backend is another container, attach both to the same Docker network.

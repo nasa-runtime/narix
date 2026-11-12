@@ -13,7 +13,7 @@ Replication remains asynchronous: HA does not guarantee zero data loss. Producti
 | Item | Value |
 | --- | --- |
 | Docker Hub | `nasaruntime/narix` |
-| Version tag | `1.0.1`; `latest` follows releases, while a digest pins content |
+| Version tag | `1.0.0`; `latest` follows releases, while a digest pins content |
 | Target platforms | `linux/amd64`, `linux/arm64` |
 | User | Non-root `10001:10001` |
 | Working directory / program | `/app` / `/app/narix` |
@@ -24,7 +24,7 @@ The [Dockerfile](https://github.com/nasa-runtime/narix/blob/release/docker/Docke
 Use a tag available in the image registry, or first build a local image with the same name on each Docker host:
 
 ```sh
-docker build -f docker/Dockerfile -t nasaruntime/narix:1.0.1 .
+docker build -f docker/Dockerfile -t nasaruntime/narix:1.0.0 .
 ```
 
 ## Shared preparation
@@ -57,7 +57,7 @@ docker run -d --name narix-standalone --network narix-net \
   -v "$PWD/deploy/standalone/data:/var/lib/narix" \
   -v "$PWD/deploy/standalone/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Fixed Dragonfly backend
@@ -72,7 +72,7 @@ docker run -d --name narix-dragonfly --network narix-net \
   -v "$PWD/deploy/dragonfly/data:/var/lib/narix" \
   -v "$PWD/deploy/dragonfly/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Sentinel primary discovery
@@ -87,7 +87,7 @@ docker run -d --name narix-sentinel --network narix-net \
   -v "$PWD/deploy/sentinel/data:/var/lib/narix" \
   -v "$PWD/deploy/sentinel/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Standard Cluster, single entry point
@@ -102,7 +102,7 @@ docker run -d --name narix-cluster --network narix-net \
   -v "$PWD/deploy/cluster/data:/var/lib/narix" \
   -v "$PWD/deploy/cluster/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Cluster per-node proxy
@@ -117,7 +117,7 @@ docker run -d --name narix-node-proxy --network narix-net \
   -v "$PWD/deploy/node-proxy/data:/var/lib/narix" \
   -v "$PWD/deploy/node-proxy/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA: single controller
@@ -132,7 +132,7 @@ docker run -d --name narix-ha --network narix-net \
   -v "$PWD/deploy/ha/data:/var/lib/narix" \
   -v "$PWD/deploy/ha/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA: same-host file lease
@@ -148,7 +148,7 @@ docker run -d --name narix-ha-1 --network narix-net \
   -v "$PWD/deploy/local-file-1/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
   -v "$PWD/deploy/shared-leases:/var/lib/narix/leases" \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ```sh
@@ -160,7 +160,7 @@ docker run -d --name narix-ha-2 --network narix-net \
   -v "$PWD/deploy/local-file-2/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
   -v "$PWD/deploy/shared-leases:/var/lib/narix/leases" \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA: independent Redis lease
@@ -175,7 +175,7 @@ docker run -d --name narix-ha-redis-lease --network narix-net \
   -v "$PWD/deploy/redis-lease/data:/var/lib/narix" \
   -v "$PWD/deploy/redis-lease/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA: three-member coordination cluster
@@ -190,7 +190,7 @@ docker run -d --name narix-1 --network narix-net \
   -v "$PWD/deploy/coordination-1/data:/var/lib/narix" \
   -v "$PWD/deploy/coordination-1/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ```sh
@@ -201,7 +201,7 @@ docker run -d --name narix-2 --network narix-net \
   -v "$PWD/deploy/coordination-2/data:/var/lib/narix" \
   -v "$PWD/deploy/coordination-2/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ```sh
@@ -212,7 +212,7 @@ docker run -d --name narix-3 --network narix-net \
   -v "$PWD/deploy/coordination-3/data:/var/lib/narix" \
   -v "$PWD/deploy/coordination-3/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Readonly queries / HA observation
@@ -227,7 +227,7 @@ docker run -d --name narix-readonly --network narix-net \
   -v "$PWD/deploy/readonly/data:/var/lib/narix" \
   -v "$PWD/deploy/readonly/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Multiple proxies in one process
@@ -242,7 +242,7 @@ docker run -d --name narix-multi --network narix-net \
   -v "$PWD/deploy/multi/data:/var/lib/narix" \
   -v "$PWD/deploy/multi/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ## Mounts and operational options

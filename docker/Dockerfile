@@ -8,7 +8,7 @@ RUN cargo build --locked --release --bin narix -j 2 \
     && strip target/release/narix
 
 FROM docker.io/library/debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
-ARG APP_VERSION=1.0.1
+ARG APP_VERSION=1.0.0
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.title="NARIX" \
     org.opencontainers.image.description="High-performance RESP2/RESP3 proxy with Dragonfly HA and managed replication" \

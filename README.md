@@ -215,7 +215,7 @@ APP_CONFIG_FILE=/etc/narix/narix.yml target/release/narix
 准备 `deploy/narix/config/narix.yml`，将业务监听设为 `0.0.0.0:6379`、管理监听设为 `0.0.0.0:18080`，并填写真实后端地址和凭据。创建 `deploy/narix/data`、`deploy/narix/logs`，确保镜像用户 `10001:10001` 可读配置、可写数据和日志目录。
 
 ```sh
-docker build -f docker/Dockerfile -t narix:1.0.1 .
+docker build -f docker/Dockerfile -t narix:1.0.0 .
 docker run -d --name narix \
   --restart unless-stopped --stop-timeout 70 \
   -p 6379:6379 -p 127.0.0.1:18080:18080 \
@@ -223,7 +223,7 @@ docker run -d --name narix \
   -v "$PWD/deploy/narix/data:/var/lib/narix" \
   -v "$PWD/deploy/narix/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  narix:1.0.1
+  narix:1.0.0
 ```
 
 镜像默认 `APP_CONFIG_FILE=/etc/narix/narix.yml`。配置目录只读，数据与日志保留在宿主机，`/etc/localtime` 只读挂载使容器使用宿主时区；该文件须在 Docker 宿主上存在且可挂载。协调数据路径放在 `/var/lib/narix` 下；每个协调成员使用独立目录。示例发布业务端口，管理端口仅限宿主回环访问。后端在另一个容器时加入双方共用的 Docker 网络。

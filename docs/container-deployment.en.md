@@ -2,7 +2,7 @@
 
 [简体中文](container-deployment.md)
 
-The image repository is `nasaruntime/narix`, with version tag `1.0.1`. See the [Docker Hub overview](../docker/README.en.md). A version tag selects a release; a digest pins content, while `latest` may change. Target platforms are `linux/amd64` and `linux/arm64`.
+The image repository is `nasaruntime/narix`, with version tag `1.0.0`. See the [Docker Hub overview](../docker/README.en.md). A version tag selects a release; a digest pins content, while `latest` may change. Target platforms are `linux/amd64` and `linux/arm64`.
 
 ## Configuration and startup
 
@@ -67,8 +67,8 @@ Shutdown budget is 15 seconds for an empty proxy list, or `max(10000, largest gr
 Build for the host architecture from the repository root:
 
 ```sh
-docker build --file docker/Dockerfile --tag narix:1.0.1 .
-docker run --rm narix:1.0.1 --version
+docker build --file docker/Dockerfile --tag narix:1.0.0 .
+docker run --rm narix:1.0.0 --version
 ```
 
 The Dockerfile pins base-image digests, resolves dependencies from crates.io using `Cargo.lock`, retains standard release optimization with thin LTO and one codegen unit, then strips symbols. The runtime excludes build caches. `.dockerignore` admits only product build inputs; never place deployment credentials in these paths.
@@ -82,18 +82,18 @@ docker login
 export SOURCE_REVISION=replace-with-the-full-verified-git-sha
 docker buildx build --file docker/Dockerfile \
   --platform linux/amd64,linux/arm64 \
-  --build-arg APP_VERSION=1.0.1 \
+  --build-arg APP_VERSION=1.0.0 \
   --build-arg SOURCE_REVISION="$SOURCE_REVISION" \
-  --tag nasaruntime/narix:1.0.1 \
+  --tag nasaruntime/narix:1.0.0 \
   --provenance=true --sbom=true --push .
-docker buildx imagetools inspect nasaruntime/narix:1.0.1
+docker buildx imagetools inspect nasaruntime/narix:1.0.0
 ```
 
 Verify both platform images, including startup, configuration loading, labels, license and runtime requirements. A successful run on one architecture does not establish the other. Provenance/SBOM can add attestation descriptors that are not runnable platforms. If a version tag already exists with different content, stop and choose a new patch version instead of replacing it. Move `latest` only after validating the versioned image:
 
 ```sh
 docker buildx imagetools create \
-  --tag nasaruntime/narix:latest nasaruntime/narix:1.0.1
+  --tag nasaruntime/narix:latest nasaruntime/narix:1.0.0
 docker buildx imagetools inspect nasaruntime/narix:latest
 ```
 

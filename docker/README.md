@@ -13,7 +13,7 @@ Dragonfly HA 将主路由、故障切换、副本收敛和快照责任纳入一�
 | 项目 | 值 |
 | --- | --- |
 | Docker Hub | `nasaruntime/narix` |
-| 版本标签 | `1.0.1`；`latest` 随发布更新，固定内容使用 digest |
+| 版本标签 | `1.0.0`；`latest` 随发布更新，固定内容使用 digest |
 | 目标平台 | `linux/amd64`、`linux/arm64` |
 | 用户 | `10001:10001`，非 root |
 | 工作目录 / 程序 | `/app` / `/app/narix` |
@@ -24,7 +24,7 @@ Dragonfly HA 将主路由、故障切换、副本收敛和快照责任纳入一�
 需要镜像仓库已提供所选标签，或先在各 Docker 宿主从本仓库构建同名本地镜像：
 
 ```sh
-docker build -f docker/Dockerfile -t nasaruntime/narix:1.0.1 .
+docker build -f docker/Dockerfile -t nasaruntime/narix:1.0.0 .
 ```
 
 ## 通用准备
@@ -57,7 +57,7 @@ docker run -d --name narix-standalone --network narix-net \
   -v "$PWD/deploy/standalone/data:/var/lib/narix" \
   -v "$PWD/deploy/standalone/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### 固定 Dragonfly 后端
@@ -72,7 +72,7 @@ docker run -d --name narix-dragonfly --network narix-net \
   -v "$PWD/deploy/dragonfly/data:/var/lib/narix" \
   -v "$PWD/deploy/dragonfly/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Sentinel 动态主节点
@@ -87,7 +87,7 @@ docker run -d --name narix-sentinel --network narix-net \
   -v "$PWD/deploy/sentinel/data:/var/lib/narix" \
   -v "$PWD/deploy/sentinel/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### 标准 Cluster 单入口
@@ -102,7 +102,7 @@ docker run -d --name narix-cluster --network narix-net \
   -v "$PWD/deploy/cluster/data:/var/lib/narix" \
   -v "$PWD/deploy/cluster/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Cluster 每节点代理
@@ -117,7 +117,7 @@ docker run -d --name narix-node-proxy --network narix-net \
   -v "$PWD/deploy/node-proxy/data:/var/lib/narix" \
   -v "$PWD/deploy/node-proxy/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA：单控制实例
@@ -132,7 +132,7 @@ docker run -d --name narix-ha --network narix-net \
   -v "$PWD/deploy/ha/data:/var/lib/narix" \
   -v "$PWD/deploy/ha/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA：同机文件租约
@@ -148,7 +148,7 @@ docker run -d --name narix-ha-1 --network narix-net \
   -v "$PWD/deploy/local-file-1/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
   -v "$PWD/deploy/shared-leases:/var/lib/narix/leases" \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ```sh
@@ -160,7 +160,7 @@ docker run -d --name narix-ha-2 --network narix-net \
   -v "$PWD/deploy/local-file-2/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
   -v "$PWD/deploy/shared-leases:/var/lib/narix/leases" \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA：独立 Redis 租约
@@ -175,7 +175,7 @@ docker run -d --name narix-ha-redis-lease --network narix-net \
   -v "$PWD/deploy/redis-lease/data:/var/lib/narix" \
   -v "$PWD/deploy/redis-lease/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### Dragonfly HA：三节点协调集群
@@ -190,7 +190,7 @@ docker run -d --name narix-1 --network narix-net \
   -v "$PWD/deploy/coordination-1/data:/var/lib/narix" \
   -v "$PWD/deploy/coordination-1/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ```sh
@@ -201,7 +201,7 @@ docker run -d --name narix-2 --network narix-net \
   -v "$PWD/deploy/coordination-2/data:/var/lib/narix" \
   -v "$PWD/deploy/coordination-2/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ```sh
@@ -212,7 +212,7 @@ docker run -d --name narix-3 --network narix-net \
   -v "$PWD/deploy/coordination-3/data:/var/lib/narix" \
   -v "$PWD/deploy/coordination-3/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### 只读查询 / HA 旁路观察
@@ -227,7 +227,7 @@ docker run -d --name narix-readonly --network narix-net \
   -v "$PWD/deploy/readonly/data:/var/lib/narix" \
   -v "$PWD/deploy/readonly/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ### 一个进程承载多个代理项
@@ -242,7 +242,7 @@ docker run -d --name narix-multi --network narix-net \
   -v "$PWD/deploy/multi/data:/var/lib/narix" \
   -v "$PWD/deploy/multi/logs:/usr/local/logs/narix" \
   -v /etc/localtime:/etc/localtime:ro \
-  nasaruntime/narix:1.0.1
+  nasaruntime/narix:1.0.0
 ```
 
 ## 挂载与运维选项

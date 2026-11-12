@@ -2,7 +2,7 @@
 
 [English](container-deployment.en.md)
 
-NARIX 镜像命名为 `nasaruntime/narix`，版本标签为 `1.0.1`。Docker Hub 展示内容见 [镜像概览](../docker/README.md)。版本标签用于固定发布，digest 用于固定内容；`latest` 可以变化。发布目标平台为 `linux/amd64` 和 `linux/arm64`。
+NARIX 镜像命名为 `nasaruntime/narix`，版本标签为 `1.0.0`。Docker Hub 展示内容见 [镜像概览](../docker/README.md)。版本标签用于固定发布，digest 用于固定内容；`latest` 可以变化。发布目标平台为 `linux/amd64` 和 `linux/arm64`。
 
 ## 配置与启动
 
@@ -67,8 +67,8 @@ checkpoint 指数据节点的原生持久化点，其数据盘属于后端容器
 从仓库根目录构建本机架构镜像：
 
 ```sh
-docker build --file docker/Dockerfile --tag narix:1.0.1 .
-docker run --rm narix:1.0.1 --version
+docker build --file docker/Dockerfile --tag narix:1.0.0 .
+docker run --rm narix:1.0.0 --version
 ```
 
 Dockerfile 固定基础镜像 digest，使用 `Cargo.lock` 从 crates.io 获取依赖，标准 release 优化保持 thin LTO、单 codegen unit，随后裁剪符号。运行层不携带构建缓存。`.dockerignore` 只允许产品构建材料进入上下文，宿主配置和凭据不得放入这些路径。
@@ -82,18 +82,18 @@ docker login
 export SOURCE_REVISION=replace-with-the-full-verified-git-sha
 docker buildx build --file docker/Dockerfile \
   --platform linux/amd64,linux/arm64 \
-  --build-arg APP_VERSION=1.0.1 \
+  --build-arg APP_VERSION=1.0.0 \
   --build-arg SOURCE_REVISION="$SOURCE_REVISION" \
-  --tag nasaruntime/narix:1.0.1 \
+  --tag nasaruntime/narix:1.0.0 \
   --provenance=true --sbom=true --push .
-docker buildx imagetools inspect nasaruntime/narix:1.0.1
+docker buildx imagetools inspect nasaruntime/narix:1.0.0
 ```
 
 发布账户须确认两种架构都有对应运行镜像，分别核对启动、配置加载、标签、许可证和平台运行条件；不能用一个架构的运行结果声称两个都已通过。启用 provenance/SBOM 时清单可能附带证明描述符，它们不是运行平台。版本标签若已存在且 digest 不同，应停止并选择新的补丁版本，不覆盖既有发布。只有版本内容核对无误后才移动 `latest`：
 
 ```sh
 docker buildx imagetools create \
-  --tag nasaruntime/narix:latest nasaruntime/narix:1.0.1
+  --tag nasaruntime/narix:latest nasaruntime/narix:1.0.0
 docker buildx imagetools inspect nasaruntime/narix:latest
 ```
 
