@@ -215,6 +215,32 @@ docker run -d --name narix-3 --network narix-net \
   nasaruntime/narix:1.0.0
 ```
 
+### Dragonfly HA：双节点协调集群
+
+从协调集群模板准备两份成员配置，静态 peers 恰好两项，node_id、证书与数据目录分别独立。以下命令各在一台宿主运行，HA group 和业务端口保持一致，公布地址可达并启用 mTLS。保持 `pair_allow_single_survivor: false`、对端隔离命令为空；默认严格 2/2 协议在失去任一成员时保护路由。单存活接管必须额外配置可靠且可验证的对端 fencing，不能只为绕过失联保护而开启。
+
+```sh
+docker run -d --name narix-pair-1 --network narix-net \
+  --restart unless-stopped --stop-timeout 70 \
+  -p 6379:6379 -p 127.0.0.1:18080:18080 -p 19090:19090 \
+  -v "$PWD/deploy/pair-1/config:/etc/narix:ro" \
+  -v "$PWD/deploy/pair-1/data:/var/lib/narix" \
+  -v "$PWD/deploy/pair-1/logs:/usr/local/logs/narix" \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/narix:1.0.0
+```
+
+```sh
+docker run -d --name narix-pair-2 --network narix-net \
+  --restart unless-stopped --stop-timeout 70 \
+  -p 6379:6379 -p 127.0.0.1:18080:18080 -p 19090:19090 \
+  -v "$PWD/deploy/pair-2/config:/etc/narix:ro" \
+  -v "$PWD/deploy/pair-2/data:/var/lib/narix" \
+  -v "$PWD/deploy/pair-2/logs:/usr/local/logs/narix" \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/narix:1.0.0
+```
+
 ### 只读查询 / HA 旁路观察
 
 在相应模式配置中设 `read_only: true`。若已有控制面，只观察 Dragonfly HA 时再设 `ha.observer: true`，禁止该实例执行控制写；只读业务门禁和控制观察模式是两个独立设置。保留认证与最小权限。示例以宿主 6380 提供查询入口。

@@ -64,6 +64,10 @@ checkpoint 指数据节点的原生持久化点，其数据盘属于后端容器
 
 ## 构建与发布到 Docker Hub
 
+仓库提供 `docker-publish.yml`，在 GitHub Release 发布完成后上传镜像。设置仓库变量 `DOCKERHUB_USERNAME` 与密钥 `DOCKERHUB_TOKEN`，从 `release` 发起工作流，`release_ci_run_id` 填该 release 提交上成功完成的 CI 编号。工作流复验版本 tag 与两个分支，使用原生 runner 分别构建和启动 amd64 / arm64 镜像，核对归档身份后上传同一份内容；先发布版本清单和完整 Docker Hub README，再移动 `latest`。已有版本若内容不同会拒绝覆盖。
+
+
+
 从仓库根目录构建本机架构镜像：
 
 ```sh

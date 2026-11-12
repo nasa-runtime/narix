@@ -64,6 +64,10 @@ Shutdown budget is 15 seconds for an empty proxy list, or `max(10000, largest gr
 
 ## Build and publish to Docker Hub
 
+The repository provides `docker-publish.yml` for publication after the GitHub release is published. Set repository variable `DOCKERHUB_USERNAME` and secret `DOCKERHUB_TOKEN`. Dispatch it from `release`, supplying `release_ci_run_id` for a successful CI run on that exact release commit. The workflow checks the version tag and both branches, builds and starts amd64/arm64 images on native runners, verifies archive identities, and then uploads those exact images. It publishes the version manifest and complete Docker Hub README before moving `latest`. Existing version tags with different content are rejected.
+
+
+
 Build for the host architecture from the repository root:
 
 ```sh

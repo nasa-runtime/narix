@@ -215,6 +215,32 @@ docker run -d --name narix-3 --network narix-net \
   nasaruntime/narix:1.0.0
 ```
 
+### Dragonfly HA: two-member coordination cluster
+
+Prepare two member configurations from the coordinator-cluster template, with exactly two static peers and distinct node IDs, certificates and state directories. Run one command on each host. Keep the HA group and business ports consistent, use reachable advertised addresses and mTLS, and retain `pair_allow_single_survivor: false` with an empty peer-fencing command. The default protocol requires both members for authority; losing a member protects routing. Single-survivor operation requires separately configured, verifiable peer fencing and must not be enabled merely to bypass loss of quorum.
+
+```sh
+docker run -d --name narix-pair-1 --network narix-net \
+  --restart unless-stopped --stop-timeout 70 \
+  -p 6379:6379 -p 127.0.0.1:18080:18080 -p 19090:19090 \
+  -v "$PWD/deploy/pair-1/config:/etc/narix:ro" \
+  -v "$PWD/deploy/pair-1/data:/var/lib/narix" \
+  -v "$PWD/deploy/pair-1/logs:/usr/local/logs/narix" \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/narix:1.0.0
+```
+
+```sh
+docker run -d --name narix-pair-2 --network narix-net \
+  --restart unless-stopped --stop-timeout 70 \
+  -p 6379:6379 -p 127.0.0.1:18080:18080 -p 19090:19090 \
+  -v "$PWD/deploy/pair-2/config:/etc/narix:ro" \
+  -v "$PWD/deploy/pair-2/data:/var/lib/narix" \
+  -v "$PWD/deploy/pair-2/logs:/usr/local/logs/narix" \
+  -v /etc/localtime:/etc/localtime:ro \
+  nasaruntime/narix:1.0.0
+```
+
 ### Readonly queries / HA observation
 
 Set `read_only: true` in the chosen mode. When following an existing HA controller, also set `ha.observer: true` to prevent this instance from issuing control writes. Readonly business access and control-plane observation are independent settings. Retain authentication and least privilege. This example exposes queries on host port 6380.
