@@ -1,5 +1,32 @@
 impl ReplicationHaRuntime {
-/// 业务作用: 在每轮拓扑收敛开始前检查进程级协调权威，超过保护窗口立即关闭新旧业务路由。
+    /// 业务作用: 将后台收敛和人工控制限制在配置事务以外，防止旧运行代恢复已交出的后端职责。
+    ///
+    /// 参数说明: 无。
+    ///
+    /// 返回: 非 proxy-cluster 模式无需许可；集群模式返回持有至动作结束的共享许可，事务冲突时保护并拒绝。
+    async fn acquire_regular_control(
+        &self,
+    ) -> anyhow::Result<Option<tokio::sync::RwLockReadGuard<'_, ()>>> {
+        let Some(cluster) = &self.cluster_coordinator else {
+            return Ok(None);
+        };
+        match cluster
+            .handle
+            .try_regular_ha_control(self.cluster_config_revision.load(Ordering::Acquire))
+            .await
+        {
+            Ok(permit) => Ok(Some(permit)),
+            Err(error) => {
+                // 候选预提交可能已经改变持久化 owner 或主节点。旧运行代必须停止
+                // 控制和路由，等待事务提交后的新代或中止后的重新观测。
+                self.enter_protection(error.to_string()).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// 业务作用: 在每轮拓扑收敛开始前检查进程级协调权威，超过保护窗口立即关闭新旧业务路由。
+    ///
     /// 返回: 非集群协调模式或权威新鲜时返回成功；否则进入保护态并返回错误。
     async fn ensure_cluster_route_authority(&self) -> anyhow::Result<()> {
         let Some(cluster) = &self.cluster_coordinator else {
@@ -15,15 +42,51 @@ impl ReplicationHaRuntime {
         bail!(reason)
     }
 
+    /// 业务作用: 无健康主节点时同步共识已提交的故障目标，避免本地路由尚未跟随的新主故障无法形成一致观察票。
+    /// 参数说明:
+    /// - `current`: 本地上次确认的主节点，可能落后于已提交的切主结果。
+    ///
+    /// 返回: 返回当前配置内已提交的主节点；目标改变时先保护路由并清空旧目标的短期故障证据。
+    /// 配置绑定不一致或提交目标不在本地配置中时保持保护并返回错误；无协调结果时保留原目标。
+    async fn sync_unavailable_committed_master(&self, current: HaNode) -> anyhow::Result<HaNode> {
+        let Some(cluster) = &self.cluster_coordinator else {
+            return Ok(current);
+        };
+        let Some(group) = cluster.handle.group_state(&cluster.group_id)? else {
+            return Ok(current);
+        };
+        let Some(committed) = group.current_master else {
+            return Ok(current);
+        };
+        if committed == current.client_addr {
+            return Ok(current);
+        }
+        // 共识提交先于本地目标更新；目标尚未经过健康验证，必须先关闭新旧业务连接。
+        self.enter_protection(format!(
+            "replication HA committed master `{committed}` is unavailable; synchronizing the protected recovery target"
+        ))
+        .await;
+        let (revision, digest) = self.cluster_runtime_binding()?;
+        // 退休或尚未激活的配置不能采纳另一配置代的控制目标，更不能据此生成故障票。
+        if group.config_revision != revision || group.config_digest.as_deref() != Some(&digest) {
+            bail!("replication HA committed recovery target belongs to a different runtime configuration");
+        }
+        let target = self.find_node(&committed)?;
+        *self.current_master.write().await = target.clone();
+        // 旧目标的连败、接管者与退避不能证明新目标故障，必须重新经过完整观察门槛。
+        self.master_failure_streak.store(0, Ordering::Relaxed);
+        self.automatic_retry_not_before_ms
+            .store(0, Ordering::Relaxed);
+        self.reset_observed_takeover().await;
+        Ok(target)
+    }
+
     /// 业务作用: 首次启动且协调状态尚无主节点时，由唯一领导者把已探测到的单主拓扑写入复制状态机，跟随者保持协调服务在线并等待结果。
     /// 参数说明:
     /// - `master`: 已通过真实角色探测确认的唯一主节点。
     ///
     /// 返回: 已提交主节点与探测结果一致时返回成功；出现冲突或在动作窗口内无法形成提交时拒绝开放数据路由。
-    async fn ensure_cluster_initial_master_committed(
-        &self,
-        master: &HaNode,
-    ) -> anyhow::Result<()> {
+    async fn ensure_cluster_initial_master_committed(&self, master: &HaNode) -> anyhow::Result<()> {
         let Some(cluster) = &self.cluster_coordinator else {
             return Ok(());
         };
@@ -104,7 +167,7 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 冷启动待恢复收尾——状态机从未提交过主节点而恢复目标已自行回归时，
-    /// 由协调领导者以拓扑修复动作提交该节点为初始主，消除"未提交即保护"的死锁。
+    /// 由协调领导者以拓扑收敛动作提交该节点为初始主，消除"未提交即保护"的死锁。
     /// 参数说明:
     /// - `master`: 已探测为唯一主且与本代恢复目标一致的节点。
     ///
@@ -281,9 +344,9 @@ impl ReplicationHaRuntime {
         })
     }
 
-    /// 业务作用: 为管理接口发起的切主或拓扑修复申请进程级协调令牌，确保人工操作与自动故障转移共享同一组内互斥和路由代际。
+    /// 业务作用: 为管理接口发起的切主或拓扑收敛申请进程级协调令牌，确保人工操作与自动故障转移共享同一组内互斥和路由代际。
     /// 参数说明:
-    /// - `kind`: 本次操作是主节点变更还是不改变服务主节点的拓扑修复。
+    /// - `kind`: 本次操作是主节点变更还是不改变服务主节点的拓扑收敛。
     /// - `purpose`: 可观察的人工操作名称，用于构造不可重复动作编号。
     /// - `expected_master`: 操作前本代理认定的主节点，必须与已提交协调状态一致。
     /// - `target_master`: 操作成功后应由全体代理采用的主节点。
@@ -346,9 +409,8 @@ impl ReplicationHaRuntime {
             .await?;
         if let Some(action) = cluster_action {
             if let Err(error) = action.ensure_active().await {
-                let reason = format!(
-                    "replication HA action lost proxy-cluster authority {step}: {error}"
-                );
+                let reason =
+                    format!("replication HA action lost proxy-cluster authority {step}: {error}");
                 self.enter_protection(reason.clone()).await;
                 bail!(reason);
             }
@@ -402,7 +464,8 @@ impl ReplicationHaRuntime {
     ) -> anyhow::Result<()> {
         self.ensure_not_retired("while verifying cluster action authority")?;
         if let Err(error) = action.ensure_active().await {
-            let reason = format!("replication HA proxy-cluster action lost authority {step}: {error}");
+            let reason =
+                format!("replication HA proxy-cluster action lost authority {step}: {error}");
             self.enter_protection(reason.clone()).await;
             bail!(reason);
         }
@@ -448,8 +511,9 @@ impl ReplicationHaRuntime {
         step: &str,
     ) -> anyhow::Result<()> {
         if let Err(error) = action.complete_success(resulting_master).await {
-            let reason =
-                format!("replication HA proxy-cluster action result was not committed {step}: {error}");
+            let reason = format!(
+                "replication HA proxy-cluster action result was not committed {step}: {error}"
+            );
             self.enter_protection(reason.clone()).await;
             bail!(reason);
         }
@@ -496,6 +560,7 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 按配置选择本地文件或外部 Redis 租约后端；proxy-cluster 使用独立动作令牌。
+    ///
     /// 返回: 返回当前协调模式对应的租约后端；配置缺失或模式不适用时返回错误。
     fn coordinator_lease_backend(&self) -> anyhow::Result<LeaseBackend> {
         match self.coordinator.mode {
@@ -526,10 +591,7 @@ impl ReplicationHaRuntime {
     ///
     /// 返回: 无需外部租约时返回空，成功竞争时返回守卫；超时、忙碌或后端失败时返回错误。
     // 获取 failover 租约，用于在多 proxy 同时探测到故障时保证只有一个执行拓扑改写。
-    async fn acquire_failover_lease(
-        &self,
-        purpose: &str,
-    ) -> anyhow::Result<Option<LeaseGuard>> {
+    async fn acquire_failover_lease(&self, purpose: &str) -> anyhow::Result<Option<LeaseGuard>> {
         if self.coordinator.mode == HaCoordinatorMode::None {
             return Ok(None);
         }
@@ -542,6 +604,7 @@ impl ReplicationHaRuntime {
             self.coordinator.lease_ttl_ms,
             self.coordinator.lease_renew_interval_ms,
             self.coordinator.lease_acquire_timeout_ms,
+            self.cleanup_tasks.spawner(),
         )
         .await
         {
@@ -585,12 +648,14 @@ impl ReplicationHaRuntime {
         let label = backend.label();
         let started = Instant::now();
         let timeout = Duration::from_millis(self.coordinator.lease_acquire_timeout_ms);
+        // 与前一动作隔离完整 owner，避免网络超时后迟到的释放或续期作用于新租约。
+        let lease_owner_id = new_lease_owner_id(&self.coordinator.owner_id)?;
         let mut last_error = None;
         let mut observed_owned_lease = false;
         loop {
             match try_acquire_coordinator_lease(
                 &backend,
-                &self.coordinator.owner_id,
+                &lease_owner_id,
                 self.coordinator.lease_ttl_ms,
             )
             .await
@@ -598,9 +663,10 @@ impl ReplicationHaRuntime {
                 Ok(true) => {
                     let lease = LeaseGuard::from_acquired(
                         backend,
-                        self.coordinator.owner_id.clone(),
+                        lease_owner_id.clone(),
                         self.coordinator.lease_ttl_ms,
                         self.coordinator.lease_renew_interval_ms,
+                        self.cleanup_tasks.spawner(),
                     );
                     let already_converged = if observed_owned_lease {
                         self.wait_for_observed_failover(current, &lease).await?
@@ -683,6 +749,7 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 计算等待其它 proxy failover 结果的短收敛窗口，限制在探活间隔的合理范围内。
+    ///
     /// 返回: 等待窗口毫秒数，最小 500ms、最大 2000ms。
     // 曾观察到其它 owner 持锁时，抢到锁后只给 outcome/拓扑一个短收敛窗口。
     fn failover_lease_settle_ms(&self) -> u64 {
@@ -701,9 +768,10 @@ impl ReplicationHaRuntime {
         step: &str,
     ) -> anyhow::Result<()> {
         if let Some(lease_guard) = lease_guard {
-            lease_guard.ensure_active().await.with_context(|| {
-                format!("replication HA action lost coordinator lease {step}")
-            })?;
+            lease_guard
+                .ensure_active()
+                .await
+                .with_context(|| format!("replication HA action lost coordinator lease {step}"))?;
         }
         Ok(())
     }
@@ -788,10 +856,8 @@ impl ReplicationHaRuntime {
                         .coordinator
                         .lease_ttl_ms
                         .max(self.probe_interval_ms.saturating_mul(10));
-                    self.repair_retry_not_before_ms.store(
-                        now_ms().saturating_add(retry_delay_ms),
-                        Ordering::Relaxed,
-                    );
+                    self.repair_retry_not_before_ms
+                        .store(now_ms().saturating_add(retry_delay_ms), Ordering::Relaxed);
                     self.repair_failure_count.fetch_add(1, Ordering::Relaxed);
                 }
                 demote_result.with_context(|| {
@@ -870,9 +936,11 @@ impl ReplicationHaRuntime {
         Ok(false)
     }
 
-    /// 业务作用: 把协调租约被其它实例持有转换为明确的忙碌结果和重试原因。
-    /// 返回: 租约由其它 owner 持有时返回真，空闲或自身持有时返回假；读取失败返回错误。
-    async fn coordinator_lease_held_by_other_result(&self) -> anyhow::Result<bool> {
+    /// 业务作用: 在本次竞争失败且没有活动守卫时区分租约占用与存储故障，供持久化保持保护或等待。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 任一动作仍持有租约时为真；空闲时为假，读取失败返回错误。实例前缀相同也不授予本次动作权威。
+    async fn coordinator_lease_is_occupied_result(&self) -> anyhow::Result<bool> {
         if self.coordinator.mode == HaCoordinatorMode::None {
             return Ok(false);
         }
@@ -886,11 +954,8 @@ impl ReplicationHaRuntime {
         }
         let backend = self.coordinator_lease_backend()?;
         match backend {
-            LeaseBackend::LocalFile { path } => Ok(read_active_local_lease_owner(&path)?
-                .is_some_and(|owner| owner != self.coordinator.owner_id)),
-            LeaseBackend::Redis { config } => Ok(read_redis_lease_owner(&config)
-                .await?
-                .is_some_and(|owner| owner != self.coordinator.owner_id)),
+            LeaseBackend::LocalFile { path } => Ok(read_active_local_lease_owner(&path)?.is_some()),
+            LeaseBackend::Redis { config } => Ok(read_redis_lease_owner(&config).await?.is_some()),
         }
     }
 

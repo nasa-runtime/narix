@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -13,6 +14,7 @@ use crate::admin::{AdminAuth, AdminState, RuntimeRegistry};
 use crate::config::{listen_addresses_conflict, ProxyConfig, ProxyItem, ProxyMode};
 use crate::coordinator::runtime::CoordinatorHandle;
 use crate::ha::model::parse_nodes as parse_ha_nodes;
+use crate::infrastructure::lifecycle::{AdmissionGate, DomainTask};
 use crate::proxy;
 
 use super::{
@@ -31,7 +33,7 @@ struct ManagedProxy {
     activated: Option<oneshot::Receiver<()>>,
     listener_closed: Option<oneshot::Receiver<()>>,
     shutdown: watch::Sender<bool>,
-    join: JoinHandle<anyhow::Result<()>>,
+    join: DomainTask,
 }
 
 /// 代理任务退出后发送给运行时 supervisor 的结果。
@@ -47,12 +49,13 @@ pub struct RuntimeSupervisor;
 /// 运行时 supervisor 启动后返回的动态就绪地址订阅和后台任务。
 type RuntimeSupervisorHandle = (
     watch::Receiver<Vec<SocketAddr>>,
+    oneshot::Receiver<()>,
     JoinHandle<anyhow::Result<()>>,
 );
 
 /// 在多代理发布窗口内关闭新连接入口，并且只在明确成功或完整回滚后重新开放。
 struct PublicationPause {
-    gate: watch::Sender<bool>,
+    gate: AdmissionGate,
     reopened: bool,
 }
 
@@ -60,15 +63,20 @@ impl PublicationPause {
     /// 业务作用: 关闭进程内全部代理监听器的新连接入口。
     ///
     /// 参数说明:
-    /// - `gate`: 由运行时 supervisor 独占写入、全部监听器订阅的发布门禁。
+    /// - `gate`: 由运行时 supervisor 与进程停止共同控制、全部监听器订阅的准入门禁。
     ///
-    /// 返回: 必须在发布成功或完整回滚后显式调用 `reopen` 的发布窗口守卫。
-    fn begin(gate: &watch::Sender<bool>) -> Self {
-        gate.send_replace(false);
-        Self {
+    /// 返回: 停止先于发布时拒绝；成功时返回必须在发布或完整回滚后显式重新开放的守卫。
+    fn begin(gate: &AdmissionGate) -> Result<Self, String> {
+        // 停止和发布共用门禁决定先后，防止异步准备完成后安装一个已经失去发布资格的候选。
+        if !gate.begin_publication() {
+            return Err(
+                "application is stopping; candidate publication is not allowed".to_string(),
+            );
+        }
+        Ok(Self {
             gate: gate.clone(),
             reopened: false,
-        }
+        })
     }
 
     /// 业务作用: 在全部代理已经处于同一配置版本后重新开放新连接。
@@ -96,14 +104,16 @@ impl RuntimeSupervisor {
     /// - `coordinator`: 可选的进程级 HA 协调器。
     /// - `apply_rx`: 配置 supervisor 发送的串行预检或发布请求。
     /// - `shutdown`: 进程级关闭信号。
+    /// - `admission`: Application 和配置事务共同约束的准入门禁。
     ///
-    /// 返回: 始终指向最新活动运行代监听地址的订阅和运行时 supervisor 后台任务。
+    /// 返回: 最新监听地址订阅、首代完成绑定和激活的通知，以及受监督的后台任务。
     pub fn spawn(
         initial: LoadedConfig,
         admin_state: AdminState,
         coordinator: Option<Arc<CoordinatorHandle>>,
         apply_rx: mpsc::Receiver<ApplyConfigRequest>,
         shutdown: watch::Receiver<bool>,
+        admission: AdmissionGate,
     ) -> anyhow::Result<RuntimeSupervisorHandle> {
         // 协调节点必须先从集群日志恢复权威版本，不能让本地旧文件提前创建数据面并以旧摘要
         // 注册 HA 组。单节点仍立即启动首代代理，保持原有启动路径。
@@ -114,9 +124,11 @@ impl RuntimeSupervisor {
             readiness_addresses(initial.config().as_ref())?
         };
         let (readiness_tx, readiness_rx) = watch::channel(readiness);
+        let (startup_tx, startup_rx) = oneshot::channel();
         let registry = admin_state.registry();
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
-        let (publication_tx, publication_rx) = watch::channel(true);
+        let publication_tx = admission;
+        let publication_rx = publication_tx.subscribe();
         let mut proxies = HashMap::new();
         let mut next_generation = 1_u64;
         if !awaiting_cluster_bootstrap {
@@ -149,9 +161,10 @@ impl RuntimeSupervisor {
             exit_rx,
             publication_tx,
             readiness_tx,
+            startup_tx,
             shutdown,
         ));
-        Ok((readiness_rx, task))
+        Ok((readiness_rx, startup_rx, task))
     }
 }
 
@@ -170,6 +183,7 @@ impl RuntimeSupervisor {
 /// - `exit_rx`: 全部代理任务共享的退出事件接收端。
 /// - `publication_gate`: 多代理配置事务统一暂停和开放新连接的进程级门禁。
 /// - `readiness_tx`: 每次成功发布后原子替换为最新活动运行代的监听地址集合。
+/// - `startup`: 首代监听与运行时准备完成通知，不依赖业务 accept 开放。
 /// - `shutdown`: 进程级关闭信号。
 ///
 /// 返回: 正常关闭时返回成功；活动代理意外退出时返回错误并触发进程关闭。
@@ -185,13 +199,54 @@ async fn run_runtime_supervisor(
     mut apply_rx: mpsc::Receiver<ApplyConfigRequest>,
     exit_tx: mpsc::UnboundedSender<ProxyExit>,
     mut exit_rx: mpsc::UnboundedReceiver<ProxyExit>,
-    publication_gate: watch::Sender<bool>,
+    publication_gate: AdmissionGate,
     readiness_tx: watch::Sender<Vec<SocketAddr>>,
+    startup: oneshot::Sender<()>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut retiring = HashSet::new();
+    let mut retired_drains: Vec<ManagedProxy> = Vec::new();
+    let mut failure = None;
+    let mut task_health = tokio::time::interval(Duration::from_millis(100));
+    task_health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut startup = Some(startup);
+    if !awaiting_cluster_bootstrap {
+        let timeout = Duration::from_millis(current_config.config().reload.transaction_timeout_ms);
+        // 以监听器和运行代的显式确认作为启动证据，业务准入仍保持关闭。
+        for proxy in proxies.values_mut() {
+            wait_proxy_ready(proxy, timeout).await?;
+            activate_proxy(proxy, timeout).await?;
+        }
+        if let Some(startup) = startup.take() {
+            let _ = startup.send(());
+        }
+    }
     loop {
+        let mut index = 0;
+        while index < retired_drains.len() {
+            if retired_drains[index].join.is_finished() {
+                // 退休不等于成功排空；必须取得等待结果，保留旧代收尾失败与 panic。
+                if let Err(error) = stop_proxy(retired_drains.swap_remove(index)).await {
+                    failure.get_or_insert(error);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
+        if *shutdown.borrow() {
+            break;
+        }
         tokio::select! {
+            _ = task_health.tick() => {
+                if !*shutdown.borrow() && proxies.values().any(|proxy| proxy.join.is_finished()) {
+                    // panic 无法发送正常退出事件，独立观察任务状态才能及时撤销业务准入。
+                    failure = Some(anyhow::anyhow!("active proxy task exited before shutdown"));
+                    break;
+                }
+            }
             Some(request) = apply_rx.recv() => {
                 let candidate = request.candidate().clone();
                 let mode = request.mode();
@@ -212,6 +267,7 @@ async fn run_runtime_supervisor(
                             coordinator.clone(),
                             &exit_tx,
                             &mut retiring,
+                            &mut retired_drains,
                             &admin_state,
                             &current_config,
                             &candidate,
@@ -225,6 +281,10 @@ async fn run_runtime_supervisor(
                             readiness_tx.send_replace(candidate_readiness);
                             if origin == ApplyOrigin::Cluster {
                                 awaiting_cluster_bootstrap = false;
+                                if let Some(startup) = startup.take() {
+                                    // 首个权威配置已完成监听激活与 HA 绑定，才能解除进程启动等待。
+                                    let _ = startup.send(());
+                                }
                             }
                         }
                         result
@@ -234,6 +294,9 @@ async fn run_runtime_supervisor(
                 request.complete(result);
             }
             Some(exit) = exit_rx.recv() => {
+                if *shutdown.borrow() {
+                    break;
+                }
                 if retiring.remove(&(exit.name.clone(), exit.generation)) {
                     continue;
                 }
@@ -246,12 +309,13 @@ async fn run_runtime_supervisor(
                 let result = exit.result
                     .map(|_| "proxy task exited without a shutdown request".to_string())
                     .unwrap_or_else(|error| error);
-                return Err(anyhow::anyhow!(
+                failure = Some(anyhow::anyhow!(
                     "proxy `{}` generation {} stopped unexpectedly: {}",
                     exit.name,
                     exit.generation,
                     result
                 ));
+                break;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -262,14 +326,29 @@ async fn run_runtime_supervisor(
         }
     }
 
+    // 失去关键监听或收到停止后先封闭新连接，再同时通知活动与退休运行代排空。
+    publication_gate.send_replace(false);
+    for proxy in proxies.values().chain(retired_drains.iter()) {
+        proxy.shutdown.send_replace(true);
+    }
+    let mut drains = FuturesUnordered::new();
     for (name, proxy) in proxies {
-        retiring.insert((name.clone(), proxy.generation));
-        if let Err(error) = stop_proxy(proxy).await {
-            warn!(proxy = %name, error = %error, "proxy generation stopped with error");
-        }
+        drains.push(stop_proxy(proxy));
         registry.unregister_proxy(&name).await;
     }
-    Ok(())
+    for proxy in retired_drains {
+        drains.push(stop_proxy(proxy));
+    }
+    while let Some(result) = drains.next().await {
+        if let Err(error) = result {
+            warn!(error = %error, "proxy generation stopped with error");
+            failure.get_or_insert(error);
+        }
+    }
+    match failure {
+        Some(error) => Err(error.context("proxy generation shutdown failed")),
+        None => Ok(()),
+    }
 }
 
 /// 业务作用: 将首次权威集群发布转换为“从空数据面新增全部代理”的运行时差异。
@@ -295,6 +374,7 @@ fn cluster_bootstrap_diff(candidate: &LoadedConfig, original: &ConfigDiff) -> Co
         admin_changed: original.admin_changed,
         coordination_changed: original.coordination_changed,
         process_changed: original.process_changed,
+        log_changed: original.log_changed,
         reload_changed: original.reload_changed,
     }
 }
@@ -308,6 +388,7 @@ fn cluster_bootstrap_diff(candidate: &LoadedConfig, original: &ConfigDiff) -> Co
 /// - `coordinator`: 可选进程级 HA 协调器。
 /// - `exit_tx`: 新任务使用的退出事件发送端。
 /// - `retiring`: 正在按预期退出、不能判为进程故障的运行代集合。
+/// - `retired_drains`: 仍持有旧连接的退休运行代，始终由进程资源树负责等待或取消。
 /// - `admin_state`: 共享管理状态，用于在发布点替换认证策略。
 /// - `current_config`: 当前活动配置，用于判断管理 listener 是否可原位更新。
 /// - `candidate`: 已完成加载和静态校验的候选配置。
@@ -325,14 +406,19 @@ async fn apply_candidate(
     coordinator: Option<Arc<CoordinatorHandle>>,
     exit_tx: &mpsc::UnboundedSender<ProxyExit>,
     retiring: &mut HashSet<(String, u64)>,
+    retired_drains: &mut Vec<ManagedProxy>,
     admin_state: &AdminState,
     current_config: &LoadedConfig,
     candidate: &LoadedConfig,
     diff: &ConfigDiff,
     mode: ApplyMode,
     origin: ApplyOrigin,
-    publication_gate: &watch::Sender<bool>,
+    publication_gate: &AdmissionGate,
 ) -> Result<(), String> {
+    // 已经停止时不再准备日志、凭据或发出控制动作，后续由监督器统一排空现有运行代。
+    if publication_gate.is_stopping() {
+        return Err("application is stopping; candidate preparation is not allowed".to_string());
+    }
     let current_config = current_config.config();
     let candidate_config = candidate.config();
     if candidate.cluster_payload().len() > MAX_CLUSTER_CONFIG_BYTES {
@@ -371,6 +457,20 @@ async fn apply_candidate(
             "process-level configuration change requires an implemented hot-reload adapter"
                 .to_string(),
         );
+    }
+    let mut prepared_log = if diff.log_changed {
+        let logging = admin_state.logging().map_err(|error| error.to_string())?;
+        let prepared = logging
+            .prepare(&candidate_config.log)
+            .await
+            .map_err(|error| error.to_string())?;
+        Some((logging, prepared))
+    } else {
+        None
+    };
+    // 日志准备可能等待 I/O；停止期间完成的准备资源只能释放，不能继续进入控制动作。
+    if publication_gate.is_stopping() {
+        return Err("application stopped during candidate log preparation".to_string());
     }
     let candidate_admin_auth = if diff.admin_changed {
         let admin = &candidate_config.admin;
@@ -437,6 +537,10 @@ async fn apply_candidate(
         diff,
     )
     .await?;
+    // 后端预检可能阻塞到停止之后，此时保留旧配置并释放候选材料，不申请运行代发布。
+    if publication_gate.is_stopping() {
+        return Err("application stopped during candidate backend preparation".to_string());
+    }
     if mode == ApplyMode::ValidateOnly {
         return Ok(());
     }
@@ -528,14 +632,16 @@ async fn apply_candidate(
         staged.insert(name.clone(), managed);
     }
 
-    let mut publication_pause =
-        if diff.added.is_empty() && diff.updated.is_empty() && diff.removed.is_empty() {
-            None
-        } else {
-            Some(PublicationPause::begin(publication_gate))
-        };
+    // 日志或管理凭据单独变化也必须取得发布资格；停止先于此处时，撤销全部暂存运行代。
+    let mut publication_pause = match PublicationPause::begin(publication_gate) {
+        Ok(pause) => Some(pause),
+        Err(error) => {
+            stop_uninstalled_candidates(staged, retiring).await;
+            abort_stable_updates(proxies, &prepared_stable_updates).await;
+            return Err(error);
+        }
+    };
     let mut old_updated = Vec::new();
-    let mut retired_drains = Vec::new();
     // 删除项也必须在候选新增项绑定前停止，否则“删除旧名称并在同一地址新增新名称”
     // 会被仍占用端口的旧 listener 阻塞。失败回滚时统一从 old_updated 恢复。
     for name in restart_update_names.iter().chain(diff.removed.iter()) {
@@ -743,6 +849,10 @@ async fn apply_candidate(
                     })?;
             }
         }
+        if let Some((logging, prepared)) = &mut prepared_log {
+            // 代理与 HA 绑定准备成功后才安装日志；失败仍进入共同回滚，不能开放半完成的新配置。
+            logging.install(prepared).map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
     .await;
@@ -786,9 +896,7 @@ async fn apply_candidate(
     if let Some(pause) = publication_pause.take() {
         pause.reopen();
     }
-    // JoinHandle 析构只解除等待，不会取消 Tokio 任务。旧 listener 已经释放，旧连接排空
-    // 在门禁重新开放后继续完成，退出事件由 retiring 集合识别为预期退出。
-    drop(retired_drains);
+    // 旧 listener 已释放，旧连接在门禁重新开放后继续排空，任务所有权保留到监督器确认退出。
     info!(
         added = ?diff.added,
         updated = ?diff.updated,
@@ -1266,7 +1374,7 @@ async fn rollback_installed(
     exit_tx: &mpsc::UnboundedSender<ProxyExit>,
     retiring: &mut HashSet<(String, u64)>,
     ready_timeout: Duration,
-    publication_gate: &watch::Sender<bool>,
+    publication_gate: &AdmissionGate,
 ) -> bool {
     let mut restored_all = true;
     for name in installed {
@@ -1420,7 +1528,7 @@ fn spawn_proxy(
         activated: Some(activated_rx),
         listener_closed: Some(listener_closed_rx),
         shutdown: shutdown_tx,
-        join,
+        join: join.into(),
     }
 }
 
@@ -1518,7 +1626,6 @@ async fn stop_proxy(proxy: ManagedProxy) -> anyhow::Result<()> {
     }
     match proxy.join.await {
         Ok(result) => result,
-        Err(error) if error.is_cancelled() => Ok(()),
         Err(error) => Err(anyhow::anyhow!("proxy task join failed: {error}")),
     }
 }

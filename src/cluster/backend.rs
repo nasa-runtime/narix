@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use crate::infrastructure::time::duration_micros as duration_micros_u64;
+use std::borrow::Cow;
 use std::io::{self, ErrorKind, IoSlice};
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ use tokio_rustls::TlsConnector;
 use tracing::warn;
 
 use crate::admin::{BackendConnectionGuard, ProxyMetrics};
+use crate::backend::BackendProfile;
+use crate::cluster::command_compat::{rewrite_garnet_pipeline, rewrite_garnet_relay_pipeline};
 use crate::config::ProxyItem;
 use crate::resp;
 
@@ -37,6 +40,10 @@ pub struct BackendConnection {
     request_timeout_ms: u64,
     /// 当前连接单批允许累计的响应字节上限；None 表示由外层控制。
     response_bytes_limit: Option<usize>,
+    /// 仅在同一已认证连接确认旧 ETag 能力后启用，不跨后端或重连复用能力判断。
+    legacy_garnet_etag: bool,
+    /// 已确认 Garnet MIGRATE 入口可见；仅专用连接使用 KEYS 形态，普通请求路径不增加迁移解析。
+    garnet_single_key_migrate: bool,
     /// 后端活动连接指标守卫；连接析构时自动减少 gauge。
     _backend_connection: Option<BackendConnectionGuard>,
 }
@@ -96,6 +103,10 @@ pub struct BackendRelayParts {
     pub pending_response: Vec<u8>,
     /// 连接存活期间持有的指标守卫，释放时自动减少活跃后端连接数。
     pub backend_connection_guard: Option<BackendConnectionGuard>,
+    /// 专用事务连接继续使用相同的原子别名，不能切换透明隧道后丢失兼容语义。
+    pub legacy_garnet_etag: bool,
+    /// 专用连接保留单 key 迁移规范形态，后续状态命令不能绕过同一连接的兼容语义。
+    pub(crate) garnet_single_key_migrate: bool,
 }
 
 /// 业务作用: 集中传递后端地址、认证、TLS、超时、keepalive、响应限制和指标配置。
@@ -122,9 +133,12 @@ pub struct BackendConnectOptions<'a> {
     pub tls: Option<&'a BackendTlsConfig>,
 }
 
-/// 一组可复用的 RESP TLS 客户端参数。CA 和客户端身份只在首次使用该组合时解析。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// 一组可复用的 RESP TLS 客户端参数。CA 和客户端身份随配置候选准备，连接只借用同代句柄。
+#[derive(Debug, Clone)]
 pub struct BackendTlsConfig {
+    /// 同代准备完成的传输配置，连接时不再访问全局缓存。
+    prepared: Option<Arc<ClientConfig>>,
+    materials: Arc<crate::infrastructure::credentials::Materials>,
     /// 用于验证服务端证书链的 PEM CA 文件路径。
     pub ca_path: String,
     /// 显式 SNI/证书身份；空值时从当前连接地址提取主机名或 IP。
@@ -144,6 +158,8 @@ impl BackendTlsConfig {
     /// 返回：启用 `backend_tls_enabled` 时返回独立配置，否则返回 `None`。
     pub fn for_backend(item: &ProxyItem) -> Option<Self> {
         item.backend_tls_enabled.then(|| Self {
+            prepared: item.backend_tls_prepared.clone(),
+            materials: item.materials.clone(),
             ca_path: item.backend_tls_ca_path.clone().unwrap_or_default(),
             server_name: item.backend_tls_server_name.clone(),
             certificate_path: item.backend_tls_certificate_path.clone(),
@@ -159,6 +175,8 @@ impl BackendTlsConfig {
     /// 返回：启用 `sentinel_tls_enabled` 时返回独立配置，否则返回 `None`。
     pub fn for_sentinel(item: &ProxyItem) -> Option<Self> {
         item.sentinel_tls_enabled.then(|| Self {
+            prepared: item.sentinel_tls_prepared.clone(),
+            materials: item.materials.clone(),
             ca_path: item.sentinel_tls_ca_path.clone().unwrap_or_default(),
             server_name: item.sentinel_tls_server_name.clone(),
             certificate_path: item.sentinel_tls_certificate_path.clone(),
@@ -310,7 +328,7 @@ impl BackendConnection {
     /// 参数说明:
     /// - `addr`: 目标网络地址，通常为 `host:port`，用于连接、监听或状态查询。
     /// - `username`: 认证用户名，用于 Redis ACL 场景；未启用 ACL 时通常为空。
-    /// - `password`: 认证密码，用于连接后端、协调器或测试代理，调用方负责从安全配置注入。
+    /// - `password`: 后端认证密码，调用方负责从安全配置提供。
     /// - `timeout_ms`: 本次连接、认证、请求或外部命令等待的超时毫秒数。
     ///
     /// 返回: 建连、认证、协议协商和资源初始化全部成功时返回可用实例；任一步失败时返回错误。
@@ -327,7 +345,7 @@ impl BackendConnection {
     /// 参数说明:
     /// - `addr`: 目标网络地址，通常为 `host:port`，用于连接、监听或状态查询。
     /// - `username`: 认证用户名，用于 Redis ACL 场景；未启用 ACL 时通常为空。
-    /// - `password`: 认证密码，用于连接后端、协调器或测试代理，调用方负责从安全配置注入。
+    /// - `password`: 后端认证密码，调用方负责从安全配置提供。
     /// - `timeout_ms`: 本次连接、认证、请求或外部命令等待的超时毫秒数。
     /// - `response_bytes_limit`: 单会话允许排队的响应字节上限，用于阻止慢读客户端耗尽内存。
     ///
@@ -354,7 +372,7 @@ impl BackendConnection {
     /// 参数说明:
     /// - `addr`: 目标网络地址，通常为 `host:port`，用于连接、监听或状态查询。
     /// - `username`: 认证用户名，用于 Redis ACL 场景；未启用 ACL 时通常为空。
-    /// - `password`: 认证密码，用于连接后端、协调器或测试代理，调用方负责从安全配置注入。
+    /// - `password`: 后端认证密码，调用方负责从安全配置提供。
     /// - `timeout_ms`: 本次连接、认证、请求或外部命令等待的超时毫秒数。
     /// - `response_bytes_limit`: 单会话允许排队的响应字节上限，用于阻止慢读客户端耗尽内存。
     /// - `metrics`: 指标采集对象，用于记录连接、请求、错误和资源占用。
@@ -411,7 +429,7 @@ impl BackendConnection {
                 let tcp = TcpStream::connect(addr).await?;
                 configure_backend_tcp(&tcp, tcp_keepalive_ms, addr);
                 if let Some(tls) = tls {
-                    connect_tls(tcp, addr, tls).await
+                    connect_tls(tcp, addr, tls, tcp_keepalive_ms).await
                 } else {
                     Ok(BackendStream::Plain(tcp))
                 }
@@ -450,8 +468,102 @@ impl BackendConnection {
             read_tmp: vec![0; BACKEND_READ_BUF_SIZE],
             request_timeout_ms,
             response_bytes_limit,
+            legacy_garnet_etag: false,
+            garnet_single_key_migrate: false,
             _backend_connection: backend_connection,
         })
+    }
+
+    /// 业务作用: 在新建数据连接上确认 Garnet 的 ETag 与迁移入口，普通后端不额外发送探测请求。
+    /// 参数说明:
+    /// - `profile`: 当前连接绑定的后端产品档案。
+    ///
+    /// 返回: 缺少 SETWITHETAG 且具有 GETWITHETAG 时启用 ETag 别名；MIGRATE 可见时为专用连接启用 KEYS 形态。元数据被拒绝时保留原生语义，传输失败时拒绝连接。
+    pub(crate) async fn prepare_command_compatibility(
+        &mut self,
+        profile: BackendProfile,
+    ) -> anyhow::Result<()> {
+        if profile != BackendProfile::Garnet {
+            return Ok(());
+        }
+        let request = resp::array(&[
+            b"COMMAND",
+            b"INFO",
+            b"SETWITHETAG",
+            b"GETWITHETAG",
+            b"MIGRATE",
+        ]);
+        let replies = self.send_pipeline(&[request]).await?;
+        let Some((resp::RespValue::Array(Some(entries)), _)) = resp::parse_value(&replies[0])?
+        else {
+            // 无 COMMAND 权限或尚未完成透传认证时，不能凭猜测替换后端命令及权限检查。
+            return Ok(());
+        };
+        if entries.len() >= 2 {
+            self.legacy_garnet_etag = matches!(
+                &entries[0],
+                resp::RespValue::Null | resp::RespValue::Bulk(None) | resp::RespValue::Array(None)
+            ) && matches!(&entries[1], resp::RespValue::Array(Some(fields)) if !fields.is_empty());
+        }
+        self.garnet_single_key_migrate = entries.get(2).is_some_and(
+            |entry| matches!(entry, resp::RespValue::Array(Some(fields)) if !fields.is_empty()),
+        );
+        Ok(())
+    }
+
+    /// 业务作用: 在后端写入前处理已确认的原子别名，普通请求继续借用原始连续字节。
+    /// 参数说明:
+    /// - `bytes`: 已完成前端边界校验的连续请求。
+    ///
+    /// 返回: 全部请求按原顺序发送；转换或传输失败时不重试写请求。
+    async fn write_compatible_raw(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let translated = if self.legacy_garnet_etag {
+            rewrite_garnet_pipeline(bytes)?
+        } else {
+            None
+        };
+        self.stream
+            .write_all(translated.as_deref().unwrap_or(bytes))
+            .await?;
+        Ok(())
+    }
+
+    /// 业务作用: 保留普通流水线的 vectored write，仅在确有旧版别名时装配替换片段。
+    /// 参数说明:
+    /// - `commands`: 按客户端顺序排列的完整请求片段。
+    ///
+    /// 返回: 全部片段写入后端；无别名时不分配替换集合；失败不重放已发送片段。
+    async fn write_compatible_commands<C: AsRef<[u8]>>(
+        &mut self,
+        commands: &[C],
+    ) -> anyhow::Result<()> {
+        let mut translated: Option<Vec<Cow<'_, [u8]>>> = None;
+        if self.legacy_garnet_etag {
+            for (index, command) in commands.iter().enumerate() {
+                let replacement = rewrite_garnet_pipeline(command.as_ref())?;
+                if replacement.is_some() && translated.is_none() {
+                    translated = Some(
+                        commands[..index]
+                            .iter()
+                            .map(|item| Cow::Borrowed(item.as_ref()))
+                            .collect(),
+                    );
+                }
+                if let Some(items) = translated.as_mut() {
+                    items.push(
+                        replacement
+                            .map(Cow::Owned)
+                            .unwrap_or_else(|| Cow::Borrowed(command.as_ref())),
+                    );
+                }
+            }
+        }
+        if let Some(commands) = translated {
+            write_all_vectored_chunks(&mut self.stream, &commands).await?;
+        } else {
+            write_all_vectored_chunks(&mut self.stream, commands).await?;
+        }
+        Ok(())
     }
 
     /// 业务作用: 向后端发送 Redis Cluster 后端连接、认证、批量写入和响应读取 相关命令，并按 RESP 协议读取可用于继续决策的响应。
@@ -465,7 +577,7 @@ impl BackendConnection {
     {
         let timeout = Duration::from_millis(self.request_timeout_ms);
         tokio::time::timeout(timeout, async {
-            write_all_vectored_chunks(&mut self.stream, commands).await?;
+            self.write_compatible_commands(commands).await?;
             self.read_n_frames(commands.len()).await
         })
         .await
@@ -487,7 +599,7 @@ impl BackendConnection {
     {
         let timeout = Duration::from_millis(self.request_timeout_ms);
         tokio::time::timeout(timeout, async {
-            write_all_vectored_chunks(&mut self.stream, commands).await?;
+            self.write_compatible_commands(commands).await?;
             self.read_n_frames_joined(commands.len()).await
         })
         .await
@@ -511,7 +623,7 @@ impl BackendConnection {
     {
         let timeout = Duration::from_millis(self.request_timeout_ms);
         tokio::time::timeout(timeout, async {
-            self.stream.write_all(raw_pipeline.as_ref()).await?;
+            self.write_compatible_raw(raw_pipeline.as_ref()).await?;
             self.read_n_frames(response_count).await
         })
         .await
@@ -535,7 +647,7 @@ impl BackendConnection {
     {
         let timeout = Duration::from_millis(self.request_timeout_ms);
         tokio::time::timeout(timeout, async {
-            self.stream.write_all(raw_pipeline.as_ref()).await?;
+            self.write_compatible_raw(raw_pipeline.as_ref()).await?;
             self.read_n_frames_joined(response_count).await
         })
         .await
@@ -560,7 +672,7 @@ impl BackendConnection {
         let timeout = Duration::from_millis(self.request_timeout_ms);
         tokio::time::timeout(timeout, async {
             let write_started = Instant::now();
-            self.stream.write_all(raw_pipeline.as_ref()).await?;
+            self.write_compatible_raw(raw_pipeline.as_ref()).await?;
             let write_micros = duration_micros_u64(write_started.elapsed());
             let read_started = Instant::now();
             let responses = self.read_n_frames_joined(response_count).await?;
@@ -577,20 +689,35 @@ impl BackendConnection {
         .context("cluster backend profiled joined raw pipeline timeout")?
     }
 
-    /// 业务作用: 以单次连续写把原始 pipeline 发往后端，并记录发送阶段耗时。
+    /// 业务作用: 在切入专用隧道前发送初始 pipeline，使首批命令与后续转发遵守同一兼容规则。
     /// 参数说明:
     /// - `raw_pipeline`: 包含多个连续 RESP 命令的原始 pipeline 字节，发送时不得逐命令重排。
     ///
-    /// 返回: 全部 pipeline 字节写入后端时返回成功；超时或 I/O 失败时返回错误。
-    // 只写入连续 pipeline 不读取响应，用于订阅、监控、阻塞命令切换到透明隧道前的最后一次写入。
+    /// 返回: 全部命令按原顺序写入时成功，不读取响应；转换、超时或 I/O 失败时返回错误且不重放。
     pub async fn write_raw_pipeline<C>(&mut self, raw_pipeline: C) -> anyhow::Result<()>
     where
         C: AsRef<[u8]>,
     {
         let timeout = Duration::from_millis(self.request_timeout_ms);
-        tokio::time::timeout(timeout, self.stream.write_all(raw_pipeline.as_ref()))
-            .await
-            .context("cluster backend raw pipeline write timeout")??;
+        tokio::time::timeout(timeout, async {
+            let bytes = raw_pipeline.as_ref();
+            // 首批写入发生在隧道转发启动前，必须在此应用已确认的兼容规则，避免首条迁移绕过规范化。
+            let translated = if self.legacy_garnet_etag || self.garnet_single_key_migrate {
+                rewrite_garnet_relay_pipeline(
+                    bytes,
+                    self.legacy_garnet_etag,
+                    self.garnet_single_key_migrate,
+                )?
+            } else {
+                None
+            };
+            self.stream
+                .write_all(translated.as_deref().unwrap_or(bytes))
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("cluster backend raw pipeline write timeout")??;
         Ok(())
     }
 
@@ -662,27 +789,31 @@ impl BackendConnection {
         Ok(())
     }
 
-    /// 业务作用: 拆出可用于透明双向转发的底层流与连接指标守卫，保持生命周期计数有效。
-    /// 把请求/响应连接拆成透明 relay 所需的流、预读响应和连接指标守卫。
+    /// 业务作用: 把已认证连接交给专用转发，保留已确认的命令别名和连接存活计数。
+    /// 参数说明: 无。
     ///
-    /// `pending_response` 必须先于后端后续字节写回客户端，否则切换隧道时会打乱响应顺序。
+    /// 返回: 底层流、预读响应、别名能力和指标守卫；预读响应必须先于后续字节写回，避免响应乱序。
     pub fn into_relay_parts(self) -> BackendRelayParts {
         let Self {
             stream,
             buf,
             _backend_connection,
+            legacy_garnet_etag,
+            garnet_single_key_migrate,
             ..
         } = self;
         BackendRelayParts {
             stream,
             pending_response: buf,
             backend_connection_guard: _backend_connection,
+            legacy_garnet_etag,
+            garnet_single_key_migrate,
         }
     }
 
     /// 业务作用: 从后端缓冲中读取并切分指定数量的完整 RESP 帧，保留多读字节供下一批复用。
     /// 参数说明:
-    /// - `n`: 本次底层读取实际得到的字节数；为零表示对端已经关闭连接。
+    /// - `n`: 本批需要按顺序接收的完整 RESP 响应数量；为零时立即返回空响应。
     ///
     /// 返回: 返回与输入顺序一致的完整 RESP 帧集合；I/O、协议、容量或大小限制失败时返回错误。
     async fn read_n_frames(&mut self, n: usize) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -725,9 +856,9 @@ impl BackendConnection {
 
     /// 业务作用: 读取指定数量响应并保留为单个连续 buffer 与帧索引，减少 pipeline 热路径分配。
     /// 参数说明:
-    /// - `n`: 本次底层读取实际得到的字节数；为零表示对端已经关闭连接。
+    /// - `n`: 本批需要按顺序接收的完整 RESP 响应数量；为零时立即返回空响应。
     ///
-    /// 返回: 返回连续 RESP 响应缓冲与帧索引；容量、连接、协议或响应大小异常时返回错误。
+    /// 返回: 收齐后返回连续响应字节、帧索引和错误计数；协议、大小或 I/O 失败时返回错误。
     // 读取指定数量响应并追加到单个连续 buffer，用于 standalone/node-proxy pipeline 快路径直接写回前端。
     async fn read_n_frames_joined(&mut self, n: usize) -> anyhow::Result<BackendRawResponses> {
         if n == 0 {
@@ -897,48 +1028,87 @@ fn configure_backend_tcp(stream: &TcpStream, keepalive_ms: u64, addr: &str) {
 /// - `tcp`：已经完成连接、TCP_NODELAY 和 keepalive 配置的底层 socket。
 /// - `addr`：真实连接目标 `host:port`，未显式配置 SNI 时从此提取身份。
 /// - `tls`：当前控制面或数据面的 CA、SNI 和可选 mTLS 参数。
+/// - `tcp_keepalive_ms`：握手兼容重试新建 socket 时保持的 TCP keepalive 设置。
 ///
-/// 返回：握手成功时返回统一 TLS 后端流；证书、身份或握手失败时返回上下文错误。
+/// 返回：握手成功时返回统一 TLS 后端流；对端内部 TLS 警报仅允许一次完整握手重试，
+/// 两次尝试共用调用方的建连预算，证书或身份校验失败不重试。
 async fn connect_tls(
     tcp: TcpStream,
     addr: &str,
     tls: &BackendTlsConfig,
+    tcp_keepalive_ms: u64,
 ) -> anyhow::Result<BackendStream> {
-    let client_config = cached_tls_client_config(tls)?;
+    let client_config = tls
+        .prepared
+        .clone()
+        .context("RESP TLS configuration was not prepared")?;
     let server_name = tls
         .server_name
         .clone()
         .unwrap_or_else(|| tls_server_name_from_addr(addr));
     let server_name = ServerName::try_from(server_name.clone())
         .with_context(|| format!("invalid RESP TLS server name `{server_name}`"))?;
-    let stream = TlsConnector::from(client_config)
-        .connect(server_name, tcp)
+    let stream = match TlsConnector::from(client_config.clone())
+        .connect(server_name.clone(), tcp)
         .await
-        .with_context(|| format!("RESP TLS handshake with `{addr}`"))?;
+    {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+                Some(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::InternalError
+                ))
+            ) =>
+        {
+            // 部分服务端不能恢复已签发的 TLS 会话；只在 AUTH 和业务请求尚未发送时重连一次。
+            // 完整握手保留同一 CA、服务端名称及客户端身份，不把证书失败降级为可接受连接。
+            let mut full_handshake = (*client_config).clone();
+            full_handshake.resumption = rustls::client::Resumption::disabled();
+            let tcp = TcpStream::connect(addr)
+                .await
+                .with_context(|| format!("RESP TLS full-handshake reconnect `{addr}`"))?;
+            configure_backend_tcp(&tcp, tcp_keepalive_ms, addr);
+            TlsConnector::from(Arc::new(full_handshake))
+                .connect(server_name, tcp)
+                .await
+                .with_context(|| {
+                    format!("RESP TLS full handshake with `{addr}` after peer internal alert")
+                })?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("RESP TLS handshake with `{addr}`"))
+        }
+    };
     Ok(BackendStream::Tls(Box::new(stream)))
 }
 
-/// 业务作用: 对相同证书材料复用 rustls ClientConfig，避免连接池扩容时重复读取和解析 PEM 文件。
+/// 业务作用: 在候选发布前完成后端和 Sentinel 的证书解析，拒绝半完成的材料轮换。
+/// 参数说明:
+/// - `item`: 尚未开放路由的代理配置候选。
 ///
-/// 参数说明：
-/// - `tls`：作为缓存键和证书加载来源的完整 TLS 参数。
-///
-/// 返回：返回可复用 rustls 客户端配置；文件、PEM 或密钥不合法时拒绝连接。
-fn cached_tls_client_config(tls: &BackendTlsConfig) -> anyhow::Result<Arc<ClientConfig>> {
-    static CACHE: OnceLock<Mutex<HashMap<BackendTlsConfig, Arc<ClientConfig>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(config) = cache
-        .lock()
-        .expect("RESP TLS client config cache mutex poisoned")
-        .get(tls)
-        .cloned()
-    {
-        return Ok(config);
-    }
+/// 返回: 所有已启用 TLS 身份均可用时安装句柄；失败保留活动运行代。
+pub(crate) fn prepare_tls(item: &mut ProxyItem) -> anyhow::Result<()> {
+    item.backend_tls_prepared = BackendTlsConfig::for_backend(item)
+        .as_ref()
+        .map(prepare_tls_client_config)
+        .transpose()?;
+    item.sentinel_tls_prepared = BackendTlsConfig::for_sentinel(item)
+        .as_ref()
+        .map(prepare_tls_client_config)
+        .transpose()?;
+    Ok(())
+}
 
-    let ca_bytes = std::fs::read(&tls.ca_path)
-        .with_context(|| format!("read RESP TLS CA `{}`", tls.ca_path))?;
-    let mut ca_reader = ca_bytes.as_slice();
+/// 业务作用: 从同代安全快照构造可直接共享的 TLS 客户端身份和信任根。
+/// 参数说明:
+/// - `tls`: 同一配置候选中的路径和已固定材料。
+///
+/// 返回: 可复用的配置；材料不完整、证书或密钥无效时拒绝候选。
+fn prepare_tls_client_config(tls: &BackendTlsConfig) -> anyhow::Result<Arc<ClientConfig>> {
+    let mut ca_reader = tls.materials.file(&tls.ca_path)?;
     let certificates = rustls_pemfile::certs(&mut ca_reader)
         .collect::<Result<Vec<_>, _>>()
         .context("parse RESP TLS CA certificates")?;
@@ -959,19 +1129,14 @@ fn cached_tls_client_config(tls: &BackendTlsConfig) -> anyhow::Result<Arc<Client
             .with_root_certificates(roots);
     let config = match (&tls.certificate_path, &tls.private_key_path) {
         (Some(certificate_path), Some(private_key_path)) => {
-            let certificate_bytes = std::fs::read(certificate_path).with_context(|| {
-                format!("read RESP TLS client certificate `{certificate_path}`")
-            })?;
-            let mut certificate_reader = certificate_bytes.as_slice();
+            let mut certificate_reader = tls.materials.file(certificate_path)?;
             let certificates = rustls_pemfile::certs(&mut certificate_reader)
                 .collect::<Result<Vec<_>, _>>()
                 .context("parse RESP TLS client certificate")?;
             if certificates.is_empty() {
                 bail!("RESP TLS client certificate file contains no certificate");
             }
-            let private_key_bytes = std::fs::read(private_key_path)
-                .with_context(|| format!("read RESP TLS private key `{private_key_path}`"))?;
-            let mut private_key_reader = private_key_bytes.as_slice();
+            let mut private_key_reader = tls.materials.file(private_key_path)?;
             let private_key = rustls_pemfile::private_key(&mut private_key_reader)
                 .context("parse RESP TLS private key")?
                 .context("RESP TLS private key file contains no supported key")?;
@@ -982,12 +1147,7 @@ fn cached_tls_client_config(tls: &BackendTlsConfig) -> anyhow::Result<Arc<Client
         (None, None) => builder.with_no_client_auth(),
         _ => bail!("RESP TLS client certificate and private key must be configured together"),
     };
-    let config = Arc::new(config);
-    cache
-        .lock()
-        .expect("RESP TLS client config cache mutex poisoned")
-        .insert(tls.clone(), config.clone());
-    Ok(config)
+    Ok(Arc::new(config))
 }
 
 /// 业务作用: 从 `host:port` 或 `[ipv6]:port` 地址中提取默认 SNI/IP 身份。
@@ -1012,7 +1172,7 @@ fn tls_server_name_from_addr(addr: &str) -> String {
 /// 参数说明:
 /// - `conn`: 当前已建立的 Redis 协议连接，函数在其上完成认证、收发或状态校验。
 /// - `username`: 认证用户名，用于 Redis ACL 场景；未启用 ACL 时通常为空。
-/// - `password`: 认证密码，用于连接后端、协调器或测试代理，调用方负责从安全配置注入。
+/// - `password`: 后端认证密码，调用方负责从安全配置提供。
 /// - `timeout_ms`: 本次连接、认证、请求或外部命令等待的超时毫秒数。
 ///
 /// 返回: 后端确认 AUTH 时返回成功；拒绝、超时或协议异常时返回错误。
@@ -1110,13 +1270,4 @@ fn take_consumed_response_bytes(buf: &mut Vec<u8>, consumed: usize) -> Vec<u8> {
     }
     let remainder = buf.split_off(consumed);
     std::mem::replace(buf, remainder)
-}
-
-/// 业务作用: 把后端 I/O profiling 阶段耗时饱和转换为 u64 微秒指标，避免极端时长截断。
-/// 参数说明:
-/// - `duration`: 时间跨度，用于统计窗口、等待上限或吞吐计算。
-///
-// Duration 使用 u128 微秒，写入公开 u64 指标前饱和截断，不能在极端时长下回绕。
-fn duration_micros_u64(duration: Duration) -> u64 {
-    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }

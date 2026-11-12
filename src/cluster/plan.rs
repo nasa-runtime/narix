@@ -45,7 +45,7 @@ pub enum PlannedRoute {
 /// - `commands`: Redis 命令或外部命令参数，调用方按 RESP 或系统命令语义传入。
 ///
 /// 返回: 参数满足命令规格时返回保序路由计划；缺参、跨槽违规或命令不受支持时返回错误。
-/// 构建完整的诊断计划，同时保留测试和排查用的 slot 到命令索引。
+/// 构建完整的诊断计划，同时保留排查路由所需的 slot 到命令索引。
 pub fn plan_pipeline<S: AsRef<[u8]>>(commands: &[Vec<S>]) -> anyhow::Result<PipelinePlan> {
     plan_pipeline_inner(commands, true)
 }

@@ -22,6 +22,8 @@ pub struct ConfigDiff {
     pub coordination_changed: bool,
     /// 日志、热更新策略等其他进程级配置是否发生变化。
     pub process_changed: bool,
+    /// 本机日志设置是否发生变化。
+    pub log_changed: bool,
     /// 配置来源轮询、防抖和事务时限是否发生变化。
     pub reload_changed: bool,
 }
@@ -64,6 +66,7 @@ impl ConfigDiff {
             admin_changed: current.admin_digest() != candidate.admin_digest(),
             coordination_changed: current.coordination_digest() != candidate.coordination_digest(),
             process_changed: current.process_digest() != candidate.process_digest(),
+            log_changed: current.log_digest() != candidate.log_digest(),
             reload_changed: current.reload_digest() != candidate.reload_digest(),
         }
     }
@@ -78,6 +81,7 @@ impl ConfigDiff {
             && !self.admin_changed
             && !self.coordination_changed
             && !self.process_changed
+            && !self.log_changed
             && !self.reload_changed
     }
 }

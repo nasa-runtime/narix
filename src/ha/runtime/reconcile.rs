@@ -1,7 +1,7 @@
 impl ReplicationHaRuntime {
-/// 业务作用: 周期驱动 replication-ha 探测与收敛，并在关闭或运行代退休时立即停止控制任务。
+    /// 业务作用: 周期驱动 replication-ha 探测与收敛，并在关闭或运行代退休时立即停止控制任务。
     /// 参数说明:
-    /// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+    /// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
     ///
     // 路由权威监视必须与可能阻塞的后端收敛并行，避免慢探测延后失权断路。
     pub async fn watch(self: Arc<Self>, shutdown: watch::Receiver<bool>) {
@@ -138,15 +138,25 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 执行 replication HA 控制面的单轮收敛，先发现当前拓扑，再按安全约束决定服务、保护或切换。
+    /// 参数说明: 无。
+    ///
     /// 返回: 权威全程有效且后端状态完成复验时返回成功；失权、证据不足或外部动作失败时返回错误。
     // failover_lock 覆盖整轮外部副作用，防止管理操作与后台收敛在同一运行代内并发改写拓扑。
     async fn reconcile(&self) -> anyhow::Result<()> {
-        let _operation = self.failover_lock.lock().await;
+        // 先取得配置事务之外的控制许可，再取本代理动作锁，保证事务排空与预提交不发生反向锁等待。
+        let _control = self.acquire_regular_control().await?;
+        let _operation = self.acquire_operation().await?;
         // 数据面是否继续开放先取决于协调权威，而不是后端恰好仍可连接。
         // 这样网络分区中的旧代理会在保护窗口到期后主动断路，不能长期发布旧主节点。
         self.ensure_cluster_route_authority().await?;
-        let current = self.current_master.read().await.clone();
+        let mut current = self.current_master.read().await.clone();
         let (masters, replicas) = self.discover_roles_with_replica_lag().await;
+        if masters.is_empty() {
+            // 已提交的新主可能在本节点完成路由跟随前立即失联。没有可探测主节点时，
+            // 故障票仍须指向共识确认的主节点，否则不同成员会永久报告不同故障对象。
+            // 同步只改变受保护的控制目标，不以共识记录代替后端健康和持久化验证。
+            current = self.sync_unavailable_committed_master(current).await?;
+        }
         if masters.len() == 1 {
             if let Some(cluster) = &self.cluster_coordinator {
                 let committed_master = cluster
@@ -154,9 +164,7 @@ impl ReplicationHaRuntime {
                     .group_state(&cluster.group_id)?
                     .and_then(|group| group.current_master);
                 if committed_master.as_deref() != Some(masters[0].client_addr.as_str()) {
-                    if committed_master.is_none()
-                        && masters[0].client_addr == current.client_addr
-                    {
+                    if committed_master.is_none() && masters[0].client_addr == current.client_addr {
                         // 冷启动待恢复收尾:状态机从未提交过主节点,而本代恢复目标已经
                         // 自行回归为唯一主。没有提交通道时该检查会每轮保护并提前返回,
                         // 失败计数与观察票都无法推进,形成永久保护死锁。由协调领导者当
@@ -190,7 +198,7 @@ impl ReplicationHaRuntime {
         if masters.len() > 1 {
             // 多主意味着不存在"唯一稳定接管者",受限跟随的连续观测被打断。
             self.reset_observed_takeover().await;
-            // 所有运行档先记录多主事实再决定是否有权修复。observer 虽然绝不
+            // 所有运行档先记录多主事实再决定是否有权收敛。observer 虽然绝不
             // 写后端，也必须保留这份纯本地证据，防止额外 master 随后只对本代理失联。
             let observed_extra_masters = self
                 .remember_unconfirmed_extra_masters(&current, &masters)
@@ -250,8 +258,7 @@ impl ReplicationHaRuntime {
                         )
                     } else {
                         (
-                            self.acquire_failover_lease("multi-master repair")
-                                .await?,
+                            self.acquire_failover_lease("multi-master repair").await?,
                             None,
                         )
                     };
@@ -287,10 +294,8 @@ impl ReplicationHaRuntime {
                         .coordinator
                         .lease_ttl_ms
                         .max(self.probe_interval_ms.saturating_mul(10));
-                    self.repair_retry_not_before_ms.store(
-                        now_ms().saturating_add(retry_delay_ms),
-                        Ordering::Relaxed,
-                    );
+                    self.repair_retry_not_before_ms
+                        .store(now_ms().saturating_add(retry_delay_ms), Ordering::Relaxed);
                     self.repair_failure_count.fetch_add(1, Ordering::Relaxed);
                 }
                 if demote_result.is_ok() {
@@ -443,10 +448,7 @@ impl ReplicationHaRuntime {
         }
         // 达到故障阈值后先关闭数据面，再等待协调租约、fencing 和 promotion。
         // 租约争用、候选不足或退避都不能让旧 Serving 状态在控制面等待期间残留。
-        if matches!(
-            &*self.routing_tx.borrow(),
-            HaRoutingState::Serving { .. }
-        ) {
+        if matches!(&*self.routing_tx.borrow(), HaRoutingState::Serving { .. }) {
             self.enter_protection(format!(
                 "replication HA master `{}` is confirmed down; automatic failover is pending",
                 current.client_addr
@@ -468,11 +470,7 @@ impl ReplicationHaRuntime {
                 .iter()
                 .find(|master| master.client_addr != current.client_addr);
             match self
-                .acquire_cluster_failover_action(
-                    &current,
-                    replicas.clone(),
-                    observed_master,
-                )
+                .acquire_cluster_failover_action(&current, replicas.clone(), observed_master)
                 .await
             {
                 Ok(action) => (None, Some(action)),
@@ -556,11 +554,8 @@ impl ReplicationHaRuntime {
                             cluster_action.as_ref(),
                         )
                         .await;
-                    self.protect_ha_control_step(
-                        result,
-                        "while fencing an already changed master",
-                    )
-                    .await?;
+                    self.protect_ha_control_step(result, "while fencing an already changed master")
+                        .await?;
                 }
                 // 复验发生在可能较慢的一整轮后端探测之后；无论是否因降级证词
                 // 跳过 fencing，都必须确认 local-file/Redis 租约或集群动作仍有效，
@@ -585,11 +580,8 @@ impl ReplicationHaRuntime {
                     // 调用同一 external fencing 云 API。
                     self.defer_automatic_retry();
                 }
-                self.protect_ha_control_step(
-                    result,
-                    "while converging an already changed master",
-                )
-                .await?;
+                self.protect_ha_control_step(result, "while converging an already changed master")
+                    .await?;
                 self.ensure_automatic_authority_or_protect(
                     lease_guard.as_ref(),
                     cluster_action.as_ref(),
@@ -671,7 +663,7 @@ impl ReplicationHaRuntime {
         let master = {
             // 主节点已确认宕机却选不出候选时必须关闭数据面：继续 Serving 会把业务
             // 流量黑洞在死主上,状态接口还呈现为正常服务。保护态让运维立即看到
-            // 自动切主关闭时只做保护；运维可修复副本，或通过节点级 promote 接口显式选择目标。
+            // 自动切主关闭时只做保护；运维可收敛副本，或通过节点级 promote 接口显式选择目标。
             // proxy-cluster 动作已经把目标写入共识令牌；复验后目标不再是 master
             // 时只能继续评估同一节点，不能先提升另一个本地最优副本、再在事后
             // 发现与令牌不一致。目标缺席或不合格直接保护。
@@ -684,11 +676,7 @@ impl ReplicationHaRuntime {
                 replicas
             };
             let candidate = match self
-                .select_failover_candidate(
-                    eligible_replicas,
-                    Some(&current),
-                    "automatic failover",
-                )
+                .select_failover_candidate(eligible_replicas, Some(&current), "automatic failover")
                 .await
             {
                 Ok(candidate) => candidate,
@@ -717,11 +705,7 @@ impl ReplicationHaRuntime {
                 return Ok(());
             }
             if let Err(error) = self
-                .promote(
-                    &candidate,
-                    lease_guard.as_ref(),
-                    cluster_action.as_ref(),
-                )
+                .promote(&candidate, lease_guard.as_ref(), cluster_action.as_ref())
                 .await
             {
                 let reason = format!(

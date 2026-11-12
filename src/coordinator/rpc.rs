@@ -4,15 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use nasa::grpc::{GrpcServerState, GrpcTlsIdentity, PeerIdentity, ServerPlan};
+use nasa::grpc::{Request, Response, Status};
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use openraft::Vote;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
-use tonic::{Request, Response, Status};
 
 use super::pair::PairCoordinator;
 use super::runtime::{CoordinatorHandle, CLUSTER_CONFIG_SCHEMA_VERSION};
@@ -23,9 +22,7 @@ use super::wire::{
     PairCommitRequest, PairCommitResponse, PairHeartbeatRequest, PairHeartbeatResponse,
     PairReplicateRequest, PairReplicateResponse, RpcEnvelope,
 };
-use super::{
-    wire_cluster_id, CoordinatorRaft, CoordinatorTypeConfig, MAX_COORDINATION_GRPC_MESSAGE_BYTES,
-};
+use super::{wire_cluster_id, CoordinatorRaft, CoordinatorTypeConfig};
 use crate::config::ProxyClusterCoordinationConfig;
 use crate::reload::MAX_CLUSTER_CONFIG_BYTES;
 
@@ -253,14 +250,14 @@ impl CoordinatorRpcService {
             .ok_or_else(|| {
                 Status::permission_denied("coordination sender has no certificate binding")
             })?;
-        let certificates = request.peer_certs().ok_or_else(|| {
-            Status::unauthenticated("coordination request has no client certificate")
+        // 身份仅采信 TLS 验证后的扩展，不能由请求正文或 metadata 自报。
+        let peer = request.extensions().get::<PeerIdentity>().ok_or_else(|| {
+            Status::unauthenticated("coordination request has no verified client identity")
         })?;
-        let certificate = certificates.first().ok_or_else(|| {
-            Status::unauthenticated("coordination request has an empty client certificate chain")
+        let actual = peer.principal().strip_prefix("sha256:").ok_or_else(|| {
+            Status::unauthenticated("coordination client identity has unsupported format")
         })?;
-        let actual = sha256_hex(certificate.as_ref());
-        if actual != *expected {
+        if actual != expected {
             return Err(Status::permission_denied(
                 "coordination client certificate does not match sender node id",
             ));
@@ -269,6 +266,7 @@ impl CoordinatorRpcService {
     }
 
     /// 业务作用: 取得多数派共识运行时；双节点模式收到共识 RPC 时明确拒绝而不是尝试协议降级。
+    ///
     /// 返回: 多数派运行时引用，或协议类型不匹配错误。
     fn raft(&self) -> Result<&CoordinatorRaft, Status> {
         self.raft.as_ref().ok_or_else(|| {
@@ -277,6 +275,7 @@ impl CoordinatorRpcService {
     }
 
     /// 业务作用: 取得双节点运行时；多数派模式收到双节点 RPC 时明确拒绝，防止存活节点数变化触发退化。
+    ///
     /// 返回: 双节点运行时引用，或协议类型不匹配错误。
     fn pair(&self) -> Result<&Arc<PairCoordinator>, Status> {
         self.pair.as_ref().ok_or_else(|| {
@@ -285,7 +284,7 @@ impl CoordinatorRpcService {
     }
 }
 
-#[tonic::async_trait]
+#[nasa::grpc::async_trait]
 impl CoordinatorRpc for CoordinatorRpcService {
     /// 业务作用: 接收多数派日志复制与心跳请求，并在共识核心处理完成后刷新跟随者路由权威时间。
     /// 参数说明:
@@ -626,69 +625,86 @@ impl CoordinatorRpc for CoordinatorRpcService {
 /// - `config`: 提供监听地址和服务端证书路径的协调配置。
 /// - `service`: 已绑定具体协议运行时的 gRPC 服务。
 /// - `shutdown`: 进程关闭信号，用于停止接受新连接并优雅退出。
+/// - `ready`: 真实监听与连接驱动启动完成后向装配方发送的确认。
 ///
 /// 返回: 监听、证书加载或服务运行失败时返回错误。
 pub async fn serve(
     config: ProxyClusterCoordinationConfig,
     service: CoordinatorRpcService,
     mut shutdown: watch::Receiver<bool>,
+    ready: tokio::sync::oneshot::Sender<()>,
 ) -> anyhow::Result<()> {
     let address: SocketAddr = config
         .listen
         .parse()
         .with_context(|| format!("parse coordination listen `{}`", config.listen))?;
-    let mut builder = Server::builder();
+    let transport = config.grpc.transport_config()?;
+    let mut plan = ServerPlan::with_config(transport)
+        .ceilings(config.grpc.transport_ceilings())
+        .add_service(CoordinatorRpcServer::new(service))?;
     if config.tls.enabled {
-        let certificate_path = config
-            .tls
-            .certificate_path
-            .as_deref()
-            .context("coordination TLS certificate path is missing")?;
-        let private_key_path = config
-            .tls
-            .private_key_path
-            .as_deref()
-            .context("coordination TLS private key path is missing")?;
-        let client_ca_path = config
-            .tls
-            .client_ca_path
-            .as_deref()
-            .context("coordination TLS client CA path is missing")?;
-        let identity = Identity::from_pem(
-            std::fs::read(certificate_path).with_context(|| {
-                format!("read coordination TLS certificate `{certificate_path}`")
-            })?,
-            std::fs::read(private_key_path).with_context(|| {
-                format!("read coordination TLS private key `{private_key_path}`")
-            })?,
-        );
-        let client_ca = Certificate::from_pem(
-            std::fs::read(client_ca_path)
-                .with_context(|| format!("read coordination TLS client CA `{client_ca_path}`"))?,
-        );
-        builder = builder
-            .tls_config(
-                ServerTlsConfig::new()
-                    .identity(identity)
-                    .client_ca_root(client_ca),
-            )
-            .context("configure coordination server TLS")?;
+        let materials = &config.tls.materials;
+        let certificate = materials.file(
+            config
+                .tls
+                .certificate_path
+                .as_deref()
+                .context("coordination certificate path is missing")?,
+        )?;
+        let private_key = materials.file(
+            config
+                .tls
+                .private_key_path
+                .as_deref()
+                .context("coordination key path is missing")?,
+        )?;
+        let ca = materials.file(
+            config
+                .tls
+                .client_ca_path
+                .as_deref()
+                .context("coordination CA path is missing")?,
+        )?;
+        // 协调成员允许短期签发的有效身份，不能继承通用服务默认的整日剩余期要求。
+        // 启动至少保留一秒有效期且不容忍尚未生效的证书，握手仍执行完整链与成员身份校验。
+        let identity =
+            GrpcTlsIdentity::mutual(certificate.to_vec(), private_key.to_vec(), ca.to_vec())?
+                .certificate_lifetime_policy(Duration::from_secs(1), Duration::ZERO)?;
+        plan = plan.tls(identity);
     }
-    builder
-        .add_service(
-            CoordinatorRpcServer::new(service)
-                .max_decoding_message_size(MAX_COORDINATION_GRPC_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_COORDINATION_GRPC_MESSAGE_BYTES),
-        )
-        .serve_with_shutdown(address, async move {
-            loop {
-                if *shutdown.borrow() || shutdown.changed().await.is_err() {
-                    return;
+    // 协调 RPC 必须先于业务 Ready 提供成员同步；服务内部仍逐请求验证成员和领导权。
+    let server = plan
+        .start(address)
+        .await
+        .context("start coordination gRPC endpoint")?;
+    let _ = ready.send(());
+    let observer = server.observer();
+    let mut health = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
                 }
             }
-        })
+            _ = health.tick() => {
+                let snapshot = observer.snapshot();
+                if snapshot.state != GrpcServerState::Running
+                    || snapshot.accept_stall_millis > config.route_guard_timeout_ms {
+                    // 失去协调接流能力时立即交还关键任务，让监督器先撤销业务准入；不能等待排空再报告失权。
+                    // server 的析构同时取消监听和连接驱动，正常停机仍走下方有界排空。
+                    anyhow::bail!("coordination gRPC listener lost serving capability");
+                }
+            }
+        }
+    }
+    server
+        .shutdown()
         .await
-        .context("serve coordination gRPC endpoint")
+        .context("drain coordination gRPC endpoint")
 }
 
 /// 业务作用: 从 gRPC 信封严格反序列化具体请求，空载荷或字段不兼容会作为无效参数拒绝。
@@ -788,16 +804,4 @@ fn cluster_config_error(
 /// 返回: gRPC internal 状态。
 fn internal_status(error: anyhow::Error) -> Status {
     Status::internal(error.to_string())
-}
-
-/// 业务作用: 计算客户端证书 DER 内容的规范 SHA-256 指纹，供传输层身份与静态节点编号做常量格式比较。
-/// 参数说明:
-/// - `certificate_der`: TLS 会话提供的叶子证书 DER 字节。
-///
-/// 返回: 返回六十四位小写十六进制摘要，不包含分隔符。
-fn sha256_hex(certificate_der: &[u8]) -> String {
-    Sha256::digest(certificate_der)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

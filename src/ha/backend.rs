@@ -14,20 +14,6 @@ pub(crate) trait HaActionAuthority: Send + Sync {
     fn ensure_active<'a>(&'a self, step: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
 }
 
-/// 测试直接认证产品适配器时使用的恒有效动作门禁。
-#[cfg(test)]
-#[allow(dead_code)]
-#[derive(Debug, Default)]
-pub(crate) struct AlwaysActiveHaAuthority;
-
-#[cfg(test)]
-impl HaActionAuthority for AlwaysActiveHaAuthority {
-    /// 业务作用: 为产品适配器单元测试提供恒有效权威，使测试只验证后端协议而不引入租约依赖。
-    fn ensure_active<'a>(&'a self, _step: &'a str) -> BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 /// 托管复制 HA 的产品适配契约。
 ///
 /// trait 只运行在探测、切换和拓扑收敛控制面，不参与每条业务命令的数据面转发。

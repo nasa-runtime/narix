@@ -83,6 +83,8 @@ pub fn route_plan<S: AsRef<[u8]>>(args: &[S]) -> anyhow::Result<RoutePlan> {
         "AUTH" | "HELLO" => Ok(RoutePlan::Keyless(KeylessPolicy::Local)),
         "SELECT" => select_plan(args),
         "DBSIZE" | "KEYS" | "SCAN" => Ok(RoutePlan::Keyless(KeylessPolicy::AllNodes)),
+        // 原生游标自身承担路由键，包括初始字符串 0；保留哈希标签及尾部参数，让后端校验扫描范围和游标归属。
+        "CLUSTERSCAN" => single_key_at(args, 1, "CLUSTERSCAN requires a cursor"),
         "SCRIPT" => script_plan(args),
         "STRALGO" => stralgo_plan(args),
         "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" | "FCALL_RO" => {
@@ -326,6 +328,9 @@ fn stralgo_plan<S: AsRef<[u8]>>(args: &[S]) -> anyhow::Result<RoutePlan> {
 // 计算 registered_command_plan 路由规则，用于决定根据 Redis 命令语义生成 Cluster 路由策略的执行路径。
 fn registered_command_plan<S: AsRef<[u8]>>(name: &str, args: &[S]) -> anyhow::Result<RoutePlan> {
     match name {
+        // Garnet ETag 操作只作用于第一个 key，比较值和过期参数不能参与槽位计算。
+        "GETWITHETAG" | "GETIFNOTMATCH" | "SETWITHETAG" | "SETIFMATCH" | "SETIFGREATER"
+        | "DELIFGREATER" => single_key_plan(args),
         // String / generic key commands.
         "GET" | "GETDEL" | "GETEX" | "GETRANGE" | "GETSET" | "SET" | "SETEX" | "PSETEX"
         | "SETNX" | "SETRANGE" | "STRLEN" | "APPEND" | "INCR" | "INCRBY" | "INCRBYFLOAT"
@@ -558,7 +563,7 @@ fn xinfo_plan<S: AsRef<[u8]>>(args: &[S]) -> anyhow::Result<RoutePlan> {
 fn xread_plan<S: AsRef<[u8]>>(args: &[S]) -> anyhow::Result<RoutePlan> {
     let name = resp::command_name(args);
     // 只在 options 区（STREAMS 关键字之前）按位置解析 BLOCK/STREAMS，
-    // 否则会把名为 "BLOCK"/"STREAMS" 的 key / group / consumer 误判为选项（见回归测试）。
+    // 否则会把名为 "BLOCK"/"STREAMS" 的 key / group / consumer 误判为选项。
     // XREADGROUP 语法: XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] [NOACK] STREAMS key... id...
     // XREAD 语法:      XREAD [COUNT n] [BLOCK ms] STREAMS key... id...
     let is_group = name == "XREADGROUP";
@@ -727,7 +732,7 @@ fn mset_plan<S: AsRef<[u8]>>(args: &[S]) -> anyhow::Result<RoutePlan> {
 
 /// 业务作用: 计算键集合 slot 并返回单节点计划，空集合或跨槽时拒绝。
 /// 参数说明:
-/// - `keys`: 命令涉及的 key 集合，用于槽位校验、路由或测试数据清理。
+/// - `keys`: 本条命令提取出的 key，供槽位一致性校验使用。
 ///
 /// 返回: 参数满足命令规格时返回保序路由计划；缺参、跨槽违规或命令不受支持时返回错误。
 // 计算 same_slot_keys 路由规则，用于决定根据 Redis 命令语义生成 Cluster 路由策略的执行路径。

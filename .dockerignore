@@ -1,0 +1,13 @@
+**
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src
+!src/**
+!proto
+!proto/**
+!zcf
+!zcf/application.yml
+!LICENSE
+!docker
+!docker/Dockerfile

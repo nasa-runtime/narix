@@ -1,5 +1,5 @@
 impl ReplicationHaRuntime {
-/// 业务作用: 完成 replication HA master 切换的本地路由收尾；拓扑写入必须由调用方在协调权威内先行完成，或交给下一轮受权修复。
+    /// 业务作用: 完成 replication HA master 切换的本地路由收尾；拓扑写入必须由调用方在协调权威内先行完成，或交给下一轮受权收敛。
     /// 参数说明:
     /// - `old_master`: 切换前本 proxy 认为正在服务的 master 地址。
     /// - `master`: 新确认可服务的 master 节点。
@@ -38,10 +38,7 @@ impl ReplicationHaRuntime {
         }
         // 独立权威监视器可能在本次慢控制动作期间先进入保护态。只有路由最终确实
         // 发布成功时才清除错误，避免管理状态把“仍受保护”误报成无异常。
-        let serving = matches!(
-            &*self.routing_tx.borrow(),
-            HaRoutingState::Serving { .. }
-        );
+        let serving = matches!(&*self.routing_tx.borrow(), HaRoutingState::Serving { .. });
         if serving {
             self.set_last_error(None).await;
         }
@@ -49,11 +46,14 @@ impl ReplicationHaRuntime {
     }
 
     /// 业务作用: 并发探测全部 HA 节点，归一化角色、上游、延迟和探测失败证据。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 已确认的主节点和副本候选；失败与未知角色不进入候选集合。
     async fn discover_roles_with_replica_lag(&self) -> (Vec<HaNode>, Vec<ReplicaCandidate>) {
         let mut masters = Vec::new();
         let mut replicas = Vec::new();
-        let probes = self.ha.nodes().iter().cloned().map(|node| async move {
-            let result = self.ha.backend().inspect_node(&node).await;
+        let probes = self.ha.nodes().iter().map(|node| async move {
+            let result = self.ha.backend().inspect_node(node).await;
             (node, result)
         });
         for (node, result) in join_all(probes).await {
@@ -69,7 +69,7 @@ impl ReplicationHaRuntime {
                     HaRole::Unknown => {}
                 },
                 Err(err) => {
-                    self.warn_probe_failure(&node, &err).await;
+                    self.warn_probe_failure(node, &err).await;
                 }
             }
         }
@@ -131,11 +131,11 @@ impl ReplicationHaRuntime {
         self.publish_serving_if_authoritative(addr).await;
     }
 
-    /// 业务作用: 进入保护状态：关闭旧业务连接，新业务连接拿到明确错误，等待 admin 介入恢复。
+    /// 业务作用: 关闭不再安全的业务路由，保留保护原因并记录状态变化，等待控制面确认恢复条件。
     /// 参数说明:
     /// - `reason`: 错误或原因文本，用于保护态、日志和失败上下文。
     ///
-    // 进入保护状态：关闭旧业务连接，新业务连接拿到明确错误，等待 admin 介入恢复。
+    /// 返回: 旧连接被通知停止，新连接被拒绝；相同保护原因不重复输出日志。
     async fn enter_protection(&self, reason: String) {
         if matches!(
             &*self.routing_tx.borrow(),
@@ -146,8 +146,17 @@ impl ReplicationHaRuntime {
         }
         self.protection_count.fetch_add(1, Ordering::Relaxed);
         self.set_last_error(Some(reason.clone())).await;
-        self.routing_tx
-            .send_replace(HaRoutingState::Protected { reason });
+        // 先撤销数据面路由，再记录已发布的保护原因，日志不能延后关闭旧主连接。
+        let previous = self.routing_tx.send_replace(HaRoutingState::Protected {
+            reason: reason.clone(),
+        });
+        if !matches!(previous, HaRoutingState::Protected { reason: current } if current == reason) {
+            info!(
+                proxy = %self.name,
+                reason = %reason,
+                "replication-ha routing protected"
+            );
+        }
     }
 
     /// 业务作用: 只有当前动作权威和持久化发布门禁同时满足时才开放主节点业务路由。
@@ -182,23 +191,18 @@ impl ReplicationHaRuntime {
             return;
         }
         if let Some(reason) = self.persistence_protected_reason.read().await.clone() {
-            // 所有 Serving 发布入口共享同一持久化 fail-closed 门禁。多主修复、主节点
+            // 所有 Serving 发布入口共享同一持久化 fail-closed 门禁。多主收敛、主节点
             // 恢复或切换收尾不能绕过上一轮已经建立的严格持久化保护；只有一次成功的
             // reconcile_persistence 清除该原因后，后续发布才可重新开放数据面。
             if matches!(&*self.routing_tx.borrow(), HaRoutingState::Serving { .. }) {
-                self.enter_protection(format!(
-                    "replication HA persistence protected: {reason}"
-                ))
-                .await;
+                self.enter_protection(format!("replication HA persistence protected: {reason}"))
+                    .await;
             }
             return;
         }
         if let Some(cluster) = &self.cluster_coordinator {
             if !cluster.handle.route_authoritative().await {
-                let serving = matches!(
-                    &*self.routing_tx.borrow(),
-                    HaRoutingState::Serving { .. }
-                );
+                let serving = matches!(&*self.routing_tx.borrow(), HaRoutingState::Serving { .. });
                 if serving {
                     self.enter_protection(
                         "replication HA routing protected because proxy-cluster coordinator authority expired"
@@ -213,10 +217,17 @@ impl ReplicationHaRuntime {
             &*self.routing_tx.borrow(),
             HaRoutingState::Serving { master } if master == &master_addr
         ) {
-            self.routing_tx
-                .send_replace(HaRoutingState::Serving {
-                    master: master_addr,
-                });
+            // 拓扑、持久化和协调权威全部通过后才发布路由，诊断只记录实际发生的切换。
+            let previous = self.routing_tx.send_replace(HaRoutingState::Serving {
+                master: master_addr.clone(),
+            });
+            if !matches!(previous, HaRoutingState::Serving { master } if master == master_addr) {
+                info!(
+                    proxy = %self.name,
+                    master = %master_addr,
+                    "replication-ha routing serving"
+                );
+            }
         }
     }
 
@@ -234,6 +245,7 @@ impl ReplicationHaRuntime {
     /// `coordinator.mode=none` 下两代各持独立 `failover_lock`，构造期改写拓扑会与旧代
     /// 自动切主并发形成双主。因此无主时只推导恢复目标并交给激活后的 reconcile 循环，
     /// 由标准机制（连败宽限、断链候选门禁、租约或集群动作令牌）串行完成恢复。
+    ///
     /// 返回: 观测到唯一主节点时返回确认结果；无主但能定位恢复目标时返回待恢复结果；
     /// 多主或无法定位旧主时返回错误并阻止构造。
     async fn discover_startup_master(&self) -> anyhow::Result<StartupMasterDiscovery> {
@@ -338,13 +350,13 @@ impl ReplicationHaRuntime {
     /// - `master`: 当前已经确认且与数据面路由一致的唯一主节点。
     /// - `replicas`: 本轮真实探测到的副本观测，用于避免无拓扑漂移时申请控制权。
     ///
-    /// 返回: 执行过拓扑修复时返回 `true`，调用方必须等待下一轮新观测后再开放路由或分配持久化角色。
+    /// 返回: 执行过拓扑收敛时返回 `true`，调用方必须等待下一轮新观测后再开放路由或分配持久化角色。
     async fn repair_replica_upstream_drift(
         &self,
         master: &HaNode,
         replicas: &[ReplicaCandidate],
     ) -> anyhow::Result<bool> {
-        // 观察者不修复拓扑:副本漂移由管理这组后端的控制面收敛,这里照常开放路由。
+        // 观察者不收敛拓扑:副本漂移由管理这组后端的控制面收敛,这里照常开放路由。
         if self.observer {
             return Ok(false);
         }
@@ -355,7 +367,7 @@ impl ReplicationHaRuntime {
             self.repair_retry_not_before_ms.store(0, Ordering::Relaxed);
             return Ok(false);
         }
-        // 修复失败后按退避窗口保持保护，不重复对坏副本执行复制控制命令；
+        // 收敛失败后按退避窗口保持保护，不重复对坏副本执行复制控制命令；
         // 与持久化和 fencing 的失败退避同一口径。
         if now_ms() < self.repair_retry_not_before_ms.load(Ordering::Relaxed) {
             let reason = format!(
@@ -367,7 +379,7 @@ impl ReplicationHaRuntime {
         }
         let started = Instant::now();
         // 权威获取失败(非领导者、租约争用等瞬断)只做一个探测周期的短退避,
-        // 不惩罚随后的合法修复;控制命令真实失败才用全额退避。
+        // 不惩罚随后的合法收敛;控制命令真实失败才用全额退避。
         let authority = match self.acquire_repair_authority(master).await {
             Ok(authority) => authority,
             Err(error) => {
@@ -403,36 +415,35 @@ impl ReplicationHaRuntime {
         }
     }
 
-    /// 业务作用: 为一次副本上游修复取得协调权威，先进保护再申请，失败视为权威瞬断。
+    /// 业务作用: 为一次副本上游收敛取得协调权威，先进保护再申请，失败视为权威瞬断。
     ///
     /// 参数说明:
-    /// - `master`: 修复目标主节点，用于保护原因与协调动作绑定。
+    /// - `master`: 收敛目标主节点，用于保护原因与协调动作绑定。
     ///
-    /// 返回: 持有旧租约或集群动作令牌的修复权威。
+    /// 返回: 持有旧租约或集群动作令牌的收敛权威。
     async fn acquire_repair_authority(&self, master: &HaNode) -> anyhow::Result<RepairAuthority> {
         self.enter_protection(format!(
             "replication HA is repairing replicas that do not directly follow `{}`",
             master.client_addr
         ))
         .await;
-        let (lease, cluster_action) =
-            if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
-                let action = self
-                    .acquire_cluster_manual_action(
-                        CoordinationActionKind::TopologyRepair,
-                        "replica-upstream-repair",
-                        master.client_addr.clone(),
-                        master.client_addr.clone(),
-                    )
-                    .await?;
-                (None, Some(action))
-            } else {
-                (
-                    self.acquire_failover_lease("replica upstream repair")
-                        .await?,
-                    None,
+        let (lease, cluster_action) = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
+            let action = self
+                .acquire_cluster_manual_action(
+                    CoordinationActionKind::TopologyRepair,
+                    "replica-upstream-repair",
+                    master.client_addr.clone(),
+                    master.client_addr.clone(),
                 )
-            };
+                .await?;
+            (None, Some(action))
+        } else {
+            (
+                self.acquire_failover_lease("replica upstream repair")
+                    .await?,
+                None,
+            )
+        };
         if let Some(action) = cluster_action.as_ref() {
             self.ensure_cluster_action_or_protect(action, "before replica upstream repair")
                 .await?;
@@ -469,19 +480,17 @@ impl ReplicationHaRuntime {
             mut cluster_action,
         } = authority;
         let result = self
-            .demote_extra_masters_checked(
-                master,
-                lease.as_ref(),
-                cluster_action.as_ref(),
-                None,
-            )
+            .demote_extra_masters_checked(master, lease.as_ref(), cluster_action.as_ref(), None)
             .await;
         self.protect_ha_control_step(result, "during replica upstream repair")
             .await?;
 
         if let Some(action) = cluster_action.as_mut() {
-            self.ensure_cluster_action_or_protect(action, "before committing replica upstream repair")
-                .await?;
+            self.ensure_cluster_action_or_protect(
+                action,
+                "before committing replica upstream repair",
+            )
+            .await?;
             self.complete_cluster_action_or_protect(
                 action,
                 &master.client_addr,
@@ -674,7 +683,7 @@ impl ReplicationHaRuntime {
     /// - `authoritative_master`: 已由调用路径完成证据门禁、即将或已经成为 current 的主节点。
     /// - `replicas`: 本轮明确探测为 replica 的节点；发布总门禁没有角色快照时传空集合。
     ///
-    /// 返回: 排序后的未确认风险地址，便于保护原因稳定展示和测试断言。
+    /// 返回: 排序后的未确认风险地址，便于保护原因稳定展示。
     async fn resolve_unconfirmed_extra_masters(
         &self,
         authoritative_master: &str,
@@ -771,7 +780,7 @@ impl ReplicationHaRuntime {
     }
 }
 
-/// 一次副本上游修复动作持有的协调权威。
+/// 一次副本上游收敛动作持有的协调权威。
 ///
 /// 字段说明: `lease` 为旧协调模式租约,`cluster_action` 为进程级动作令牌;二者按协调模式二选一。
 struct RepairAuthority {

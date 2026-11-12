@@ -1,8 +1,10 @@
-use std::fmt::Write as _;
+use crate::infrastructure::metrics::{NarixMetricsSource, PreparedMetricsSnapshot};
+use crate::infrastructure::time::display_seconds as current_unix_second;
+use nametrics_core::{MetricSample, MetricValue};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::header;
@@ -28,6 +30,9 @@ use crate::sentinel::{SentinelRuntime, SentinelStatus};
 #[derive(Clone)]
 // 表示 AdminState 的数据结构，用于管理健康检查、状态查询、指标和 replication HA 运维接口。
 pub struct AdminState {
+    logging: Arc<std::sync::OnceLock<Arc<crate::infrastructure::logging::LogRuntime>>>,
+    metrics_source: Arc<crate::infrastructure::metrics::NarixMetricsSource>,
+    metrics_refresh: Arc<tokio::sync::Mutex<()>>,
     ready: Arc<AtomicBool>,
     registry: RuntimeRegistry,
     auth: Arc<std::sync::RwLock<AdminAuth>>,
@@ -36,7 +41,77 @@ pub struct AdminState {
 }
 
 impl AdminState {
-    /// 业务作用: 构造默认已就绪且显式免认证的管理状态，供测试或已确认可信边界的调用方使用。
+    /// 业务作用: 装配日志所有者，让配置事务使用同一个管理器准备和发布。
+    /// 参数说明:
+    /// - `logging`: 生命周期管理的进程唯一日志对象。
+    ///
+    /// 返回: 首次绑定成功，重复绑定拒绝。
+    pub fn set_logging(
+        &self,
+        logging: Arc<crate::infrastructure::logging::LogRuntime>,
+    ) -> anyhow::Result<()> {
+        self.logging
+            .set(logging)
+            .map_err(|_| anyhow::anyhow!("logging owner already installed"))
+    }
+
+    /// 业务作用: 在配置事务中借用已经装配的日志对象。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 已安装对象的共享句柄，缺失时拒绝日志变更。
+    pub(crate) fn logging(
+        &self,
+    ) -> anyhow::Result<Arc<crate::infrastructure::logging::LogRuntime>> {
+        self.logging
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("logging owner is not installed"))
+    }
+
+    /// 业务作用: 在应用装配时登记唯一指标源，不让命令路径访问通用指标目录。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 与管理端出口共享的结构化指标来源。
+    pub fn metrics_source(&self) -> Arc<crate::infrastructure::metrics::NarixMetricsSource> {
+        self.metrics_source.clone()
+    }
+
+    /// 业务作用: 串行采集管理状态及进程指标，避免较旧抓取覆盖较新快照。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 预算允许时发布完整结果；超限或采集任务异常返回固定错误。
+    /// 阻塞池只构造样本，取消后不能独立发布；串行门禁持续到调用方完成发布。
+    pub async fn refresh_metrics(&self) -> Result<(), &'static str> {
+        self.refresh_metrics_with(|_| Ok(())).await
+    }
+
+    /// 业务作用: 将预算校验和可选导出准备合并到受串行门禁限制的采集任务，避免占用数据面工作线程。
+    /// 参数说明:
+    /// - `prepare_output`: 使用本轮不可变快照准备出口结果，不得发布共享状态。
+    ///
+    /// 返回: 当前调用仍在等待时发布本轮快照并返回出口结果；采集异常或超限返回固定错误。
+    async fn refresh_metrics_with<T, F>(&self, prepare_output: F) -> Result<T, &'static str>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PreparedMetricsSnapshot) -> Result<T, &'static str> + Send + 'static,
+    {
+        let guard = self.metrics_refresh.clone().lock_owned().await;
+        let snapshot = self.snapshot().await;
+        // 进程读取、预算校验和文本编码在一次阻塞任务内完成，避免编码时间挤占 RESP 调度。
+        // 门禁持续覆盖编码，取消等待也不能排入更多并发工作；闭包不持有指标源的发布权限。
+        let (_guard, samples, output) = tokio::task::spawn_blocking(move || {
+            let samples = NarixMetricsSource::prepare(collect_metrics(&snapshot));
+            let output = prepare_output(&samples);
+            (guard, samples, output)
+        })
+        .await
+        .map_err(|_| "metrics collection task failed")?;
+        // 只有当前 future 接回结果和门禁后才发布，旧采集不能越过后续刷新。
+        self.metrics_source.publish(samples)?;
+        output
+    }
+
+    /// 业务作用: 构造默认已就绪且显式免认证的管理状态，仅供已确认可信边界的调用方使用。
     /// 参数说明: 无。
     pub fn ready() -> Self {
         Self::ready_with_auth(AdminAuth::disabled())
@@ -48,6 +123,9 @@ impl AdminState {
     ///
     pub fn ready_with_auth(auth: AdminAuth) -> Self {
         Self {
+            logging: Arc::default(),
+            metrics_source: Arc::default(),
+            metrics_refresh: Arc::default(),
             ready: Arc::new(AtomicBool::new(true)),
             registry: RuntimeRegistry::default(),
             auth: Arc::new(std::sync::RwLock::new(auth)),
@@ -65,6 +143,9 @@ impl AdminState {
     /// 返回: 已启用配置管理端点的共享管理状态。
     pub fn ready_with_auth_and_reload(auth: AdminAuth, reload: ReloadHandle) -> Self {
         Self {
+            logging: Arc::default(),
+            metrics_source: Arc::default(),
+            metrics_refresh: Arc::default(),
             ready: Arc::new(AtomicBool::new(true)),
             registry: RuntimeRegistry::default(),
             auth: Arc::new(std::sync::RwLock::new(auth)),
@@ -200,7 +281,7 @@ impl AdminState {
 #[derive(Clone)]
 // 表示 AdminAuth 的数据结构，用于管理健康检查、状态查询、指标和 replication HA 运维接口。
 pub struct AdminAuth {
-    token: Option<Arc<str>>,
+    token: Option<crate::infrastructure::credentials::SecretText>,
 }
 
 impl AdminAuth {
@@ -212,12 +293,11 @@ impl AdminAuth {
 
     /// 业务作用: 构造持有指定令牌的管理认证策略。
     /// 参数说明:
-    /// - `token`: 鉴权令牌或配置片段，用于识别管理端请求或解析节点输入。
+    /// - `token`: 与已提交配置同代的受管鉴权令牌。
     ///
-    pub fn token(token: impl Into<String>) -> Self {
-        Self {
-            token: Some(Arc::from(token.into())),
-        }
+    /// 返回: 持有安全快照引用的认证策略，不复制令牌正文。
+    pub fn token(token: crate::infrastructure::credentials::SecretText) -> Self {
+        Self { token: Some(token) }
     }
 
     /// 业务作用: 同时支持专用请求头和 Bearer 令牌，并以固定轮数比较避免时序泄漏。
@@ -1579,7 +1659,7 @@ impl Drop for ClusterAggregateGuard {
             .inner
             .cluster_aggregate_operations
             .fetch_add(1, Ordering::Relaxed);
-        let elapsed = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let elapsed = crate::infrastructure::time::elapsed_micros(self.started);
         self.metrics
             .inner
             .cluster_aggregate_elapsed_micros
@@ -1831,7 +1911,7 @@ struct ReplicationHaProxyQuery {
 /// 参数说明:
 /// - `addr`: 目标网络地址，通常为 `host:port`，用于连接、监听或状态查询。
 /// - `state`: 共享运行时状态快照或状态容器，用于跨任务读取和更新业务状态。
-/// - `shutdown`: 关闭信号通道，用于让后台任务在进程退出或测试结束时有序停止。
+/// - `shutdown`: 关闭信号通道，用于停止监听并通知所属任务收尾。
 ///
 /// 返回: 管理监听完成绑定并在关闭信号后正常退出时返回成功；绑定或 HTTP 服务失败时返回错误。
 // `/health` 与 `/ready` 必须供探针匿名访问；其余处理器在读取或修改敏感状态前
@@ -1839,8 +1919,25 @@ struct ReplicationHaProxyQuery {
 pub async fn serve(
     addr: SocketAddr,
     state: AdminState,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    serve_listener(listener, state, shutdown).await
+}
+
+/// 业务作用: 接收启动阶段已经绑定的管理端口，仅在 Application Ready 后开始处理请求。
+/// 参数说明:
+/// - `listener`: 已验证绑定成功且由当前任务独占的监听器。
+/// - `state`: 同一进程的认证、配置和状态对象。
+/// - `shutdown`: Application 取消转换得到的领域关闭通知。
+///
+/// 返回: 端口优雅排空时成功，服务错误向进程监督器传播。
+pub async fn serve_listener(
+    listener: TcpListener,
+    state: AdminState,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
     let app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -1864,7 +1961,6 @@ pub async fn serve(
         .route("/ha/node/{node}/fence", post(replication_ha_node_fence))
         .with_state(state);
 
-    let listener = TcpListener::bind(addr).await?;
     info!(listen = %addr, "admin server listening");
 
     axum::serve(listener, app)
@@ -1920,15 +2016,22 @@ async fn status(State(state): State<AdminState>, headers: HeaderMap) -> Response
 /// - `state`: 共享运行时状态快照或状态容器，用于跨任务读取和更新业务状态。
 /// - `headers`: HTTP 请求头集合，用于管理端鉴权和请求上下文判断。
 ///
+/// 返回: 认证通过且采集、编码成功时返回完整文本，否则返回认证失败或服务不可用。
 // 先鉴权再构造完整快照，避免未授权请求利用指标标签枚举后端和代理拓扑。
 async fn metrics(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     if let Some(response) = unauthorized_if_needed(&state, &headers) {
         return response;
     }
-    let snapshot = state.snapshot().await;
+    let output = match state
+        .refresh_metrics_with(NarixMetricsSource::render_prepared)
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    };
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        render_metrics(&snapshot),
+        output,
     )
         .into_response()
 }
@@ -2400,683 +2503,679 @@ fn replication_ha_operation_failed(
     bad_request(message)
 }
 
-/// 业务作用: 把管理端状态快照渲染成指标文本，供监控系统按标签采集代理和 HA 状态。
+/// 业务作用: 将同一次管理快照转为结构化指标，标签分配仅发生在导出侧。
 /// 参数说明:
 /// - `snapshot`: 当前运行时状态快照，用于生成管理响应和指标而不长期持锁。
 ///
-// 格式化 render_metrics 输出，用于对外呈现管理健康检查、状态查询、指标和 replication HA 运维接口结果。
-fn render_metrics(snapshot: &AdminStatus) -> String {
-    let mut out = String::new();
+/// 返回: 保留既有名称、单位和标签的完整样本，不更改业务计数。
+fn collect_metrics(snapshot: &AdminStatus) -> Vec<MetricSample> {
+    let mut out = Vec::with_capacity(snapshot.proxies.len() * 96 + 24);
     append_process_metrics(&mut out, &process_metrics_snapshot());
-    out.push_str("# HELP narix_ready Whether the narix process is ready.\n");
-    out.push_str("# TYPE narix_ready gauge\n");
-    out.push_str(&format!(
-        "narix_ready {}\n",
-        if snapshot.ready { 1 } else { 0 }
-    ));
-    out.push_str("# HELP narix_proxies Number of configured proxy listeners.\n");
-    out.push_str("# TYPE narix_proxies gauge\n");
-    out.push_str(&format!("narix_proxies {}\n", snapshot.proxy_count));
+
+    out.push(MetricSample {
+        name: "narix_ready",
+        labels: vec![],
+        value: MetricValue::Gauge((if snapshot.ready { 1 } else { 0 }) as f64),
+    });
+
+    out.push(MetricSample {
+        name: "narix_proxies",
+        labels: vec![],
+        value: MetricValue::Gauge((snapshot.proxy_count) as f64),
+    });
     if let Some(reload) = &snapshot.config_reload {
-        out.push_str(
-            "# HELP narix_config_reload_total Configuration validation and reload requests.\n",
-        );
-        out.push_str("# TYPE narix_config_reload_total counter\n");
-        let _ = writeln!(out, "narix_config_reload_total {}", reload.reload_total);
-        out.push_str(
-            "# HELP narix_config_reload_failures_total Failed configuration validation and reload requests.\n",
-        );
-        out.push_str("# TYPE narix_config_reload_failures_total counter\n");
-        let _ = writeln!(
-            out,
-            "narix_config_reload_failures_total {}",
-            reload.reload_failures_total
-        );
+        out.push(MetricSample {
+            name: "narix_config_reload_total",
+            labels: vec![],
+            value: MetricValue::Counter(reload.reload_total),
+        });
+
+        out.push(MetricSample {
+            name: "narix_config_reload_failures_total",
+            labels: vec![],
+            value: MetricValue::Counter(reload.reload_failures_total),
+        });
         if !reload.reload_failures_by_trigger.is_empty() {
-            out.push_str(
-                "# HELP narix_config_reload_failures_by_trigger_total Failed configuration requests split by trigger source.\n",
-            );
-            out.push_str("# TYPE narix_config_reload_failures_by_trigger_total counter\n");
             for (trigger, count) in &reload.reload_failures_by_trigger {
-                let _ = writeln!(
-                    out,
-                    "narix_config_reload_failures_by_trigger_total{{trigger=\"{trigger}\"}} {count}"
-                );
+                out.push(MetricSample {
+                    name: "narix_config_reload_failures_by_trigger_total",
+                    labels: vec![("trigger", (trigger).to_string())],
+                    value: MetricValue::Counter(*count),
+                });
             }
         }
-        out.push_str(
-            "# HELP narix_config_reload_duration_seconds Duration of the most recent configuration request.\n",
-        );
-        out.push_str("# TYPE narix_config_reload_duration_seconds gauge\n");
-        let _ = writeln!(
-            out,
-            "narix_config_reload_duration_seconds {}",
-            reload.last_duration_seconds
-        );
-        out.push_str("# HELP narix_config_revision Current committed configuration revision.\n");
-        out.push_str("# TYPE narix_config_revision gauge\n");
-        let _ = writeln!(out, "narix_config_revision {}", reload.config_revision);
-        out.push_str(
-            "# HELP narix_config_pending_members Static members not yet running the committed revision when the latest configuration transaction responded.\n",
-        );
-        out.push_str("# TYPE narix_config_pending_members gauge\n");
-        let _ = writeln!(
-            out,
-            "narix_config_pending_members {}",
-            reload.pending_members
-        );
+
+        out.push(MetricSample {
+            name: "narix_config_reload_duration_seconds",
+            labels: vec![],
+            value: MetricValue::Gauge(reload.last_duration_seconds),
+        });
+
+        out.push(MetricSample {
+            name: "narix_config_revision",
+            labels: vec![],
+            value: MetricValue::Gauge((reload.config_revision) as f64),
+        });
+
+        out.push(MetricSample {
+            name: "narix_config_pending_members",
+            labels: vec![],
+            value: MetricValue::Gauge((reload.pending_members) as f64),
+        });
     }
-    out.push_str(
-        "# HELP narix_parsed_commands_total Parsed frontend Redis commands processed by Narix; later opaque tunnel bytes are excluded.\n",
-    );
-    out.push_str("# TYPE narix_parsed_commands_total counter\n");
-    out.push_str(
-        "# HELP narix_local_handshake_commands_total Compatibility handshake commands answered locally by Narix.\n",
-    );
-    out.push_str("# TYPE narix_local_handshake_commands_total counter\n");
-    out.push_str(
-        "# HELP narix_tunnel_pool_hits_total Clean idle backend tunnel leases acquired from a backend-specific pool.\n",
-    );
-    out.push_str("# TYPE narix_tunnel_pool_hits_total counter\n");
-    out.push_str(
-        "# HELP narix_tunnel_pool_misses_total Backend-specific tunnel pool misses that require a new backend connection.\n",
-    );
-    out.push_str("# TYPE narix_tunnel_pool_misses_total counter\n");
-    out.push_str(
-        "# HELP narix_tunnel_pool_returns_total Clean exclusive tunnel connections returned to their original backend pool.\n",
-    );
-    out.push_str("# TYPE narix_tunnel_pool_returns_total counter\n");
-    out.push_str(
-        "# HELP narix_tunnel_pool_discards_total Tainted, expired, disabled or over-capacity tunnel connections not reused.\n",
-    );
-    out.push_str("# TYPE narix_tunnel_pool_discards_total counter\n");
-    out.push_str(
-        "# HELP narix_tunnel_pool_idle Current clean idle tunnel connections aggregated across this proxy's backend-specific pools.\n",
-    );
-    out.push_str("# TYPE narix_tunnel_pool_idle gauge\n");
-    out.push_str(
-        "# HELP narix_tunnel_pool_max_idle Configured idle capacity summed across this proxy's backend-specific pools.\n",
-    );
-    out.push_str("# TYPE narix_tunnel_pool_max_idle gauge\n");
-    out.push_str(
-        "# HELP narix_sentinel_refresh_total Sentinel discovery and candidate-role verification attempts.\n",
-    );
-    out.push_str("# TYPE narix_sentinel_refresh_total counter\n");
-    out.push_str(
-        "# HELP narix_sentinel_master_change_total Committed Sentinel master address changes.\n",
-    );
-    out.push_str("# TYPE narix_sentinel_master_change_total counter\n");
-    out.push_str(
-        "# HELP narix_sentinel_route_generation Current committed Sentinel route generation.\n",
-    );
-    out.push_str("# TYPE narix_sentinel_route_generation gauge\n");
-    out.push_str(
-        "# HELP narix_sentinel_last_success_unixtime Unix time of the last successful Sentinel refresh.\n",
-    );
-    out.push_str("# TYPE narix_sentinel_last_success_unixtime gauge\n");
-    out.push_str(
-        "# HELP narix_sentinel_route_ready Whether a verified Sentinel master route is serving.\n",
-    );
-    out.push_str("# TYPE narix_sentinel_route_ready gauge\n");
-    out.push_str(
-        "# HELP narix_sentinel_current_master Current verified Sentinel master route identity.\n",
-    );
-    out.push_str("# TYPE narix_sentinel_current_master gauge\n");
-    out.push_str(
-        "# HELP narix_proxy_generation Current configuration generation serving new connections.\n",
-    );
-    out.push_str("# TYPE narix_proxy_generation gauge\n");
-    out.push_str(
-        "# HELP narix_proxy_draining_connections Frontend connections still attached to a retired configuration generation.\n",
-    );
-    out.push_str("# TYPE narix_proxy_draining_connections gauge\n");
 
     for proxy in &snapshot.proxies {
-        let _ = writeln!(
-            out,
-            "narix_proxy_generation{{proxy=\"{}\"}} {}",
-            escape_label(&proxy.name),
-            proxy.generation
-        );
-        out.push_str(&format!(
-            "narix_listener_info{{proxy=\"{}\",mode=\"{}\",listen=\"{}\"}} 1\n",
-            escape_label(&proxy.name),
-            escape_label(&proxy.mode),
-            escape_label(&proxy.listen)
-        ));
-        out.push_str(&format!(
-            "narix_active_connections{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.active_connections
-        ));
-        out.push_str(&format!(
-            "narix_accepted_connections_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.accepted_connections
-        ));
-        out.push_str(&format!(
-            "narix_rejected_connections_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.rejected_connections
-        ));
-        out.push_str(&format!(
-            "narix_closed_connections_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.closed_connections
-        ));
-        out.push_str(&format!(
-            "narix_connection_errors_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.connection_errors
-        ));
-        out.push_str(&format!(
-            "narix_pipeline_batches_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.pipeline_batches
-        ));
-        out.push_str(&format!(
-            "narix_commands_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.commands
-        ));
-        out.push_str(&format!(
-            "narix_parsed_commands_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.commands
-        ));
-        out.push_str(&format!(
-            "narix_local_handshake_commands_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.local_handshake_commands
-        ));
-        out.push_str(&format!(
-            "narix_command_errors_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.command_errors
-        ));
-        out.push_str(&format!(
-            "narix_response_bytes_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.response_bytes
-        ));
-        out.push_str(&format!(
-            "narix_max_pipeline_depth{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_pipeline_depth
-        ));
-        out.push_str(&format!(
-            "narix_pipeline_execution_errors_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.pipeline_execution_errors
-        ));
-        out.push_str(&format!(
-            "narix_pipeline_elapsed_micros_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.pipeline_elapsed_micros
-        ));
-        out.push_str(&format!(
-            "narix_max_pipeline_elapsed_micros{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_pipeline_elapsed_micros
-        ));
-        out.push_str(&format!(
-            "narix_recent_pipeline_batches_per_second{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.recent_pipeline_batches_per_second
-        ));
-        out.push_str(&format!(
-            "narix_recent_commands_per_second{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.recent_commands_per_second
-        ));
-        out.push_str(&format!(
-            "narix_pending_pipeline_batches{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.pending_pipeline_batches
-        ));
-        out.push_str(&format!(
-            "narix_max_pending_pipeline_batches{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_pending_pipeline_batches
-        ));
-        out.push_str(&format!(
-            "narix_pending_pipeline_commands{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.pending_pipeline_commands
-        ));
-        out.push_str(&format!(
-            "narix_max_pending_pipeline_commands{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_pending_pipeline_commands
-        ));
-        out.push_str(&format!(
-            "narix_pending_response_bytes{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.pending_response_bytes
-        ));
-        out.push_str(&format!(
-            "narix_max_pending_response_bytes{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_pending_response_bytes
-        ));
-        out.push_str(&format!(
-            "narix_pending_response_limit_hits_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.pending_response_limit_hits
-        ));
-        out.push_str(&format!(
-            "narix_relay_client_to_backend_bytes_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.relay_client_to_backend_bytes
-        ));
-        out.push_str(&format!(
-            "narix_relay_backend_to_client_bytes_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.relay_backend_to_client_bytes
-        ));
-        out.push_str(&format!(
-            "narix_max_relay_client_to_backend_bytes{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_relay_client_to_backend_bytes
-        ));
-        out.push_str(&format!(
-            "narix_max_relay_backend_to_client_bytes{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_relay_backend_to_client_bytes
-        ));
-        out.push_str(&format!(
-            "narix_relay_client_to_backend_backpressure_events_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.relay_client_to_backend_backpressure_events
-        ));
-        out.push_str(&format!(
-            "narix_relay_backend_to_client_backpressure_events_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.relay_backend_to_client_backpressure_events
-        ));
-        out.push_str(&format!(
-            "narix_backend_active_connections{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_active_connections
-        ));
-        out.push_str(&format!(
-            "narix_max_backend_active_connections{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_backend_active_connections
-        ));
-        out.push_str(&format!(
-            "narix_backend_connection_attempts_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_connection_attempts
-        ));
-        out.push_str(&format!(
-            "narix_backend_connection_successes_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_connection_successes
-        ));
-        out.push_str(&format!(
-            "narix_backend_connection_failures_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_connection_failures
-        ));
-        out.push_str(&format!(
-            "narix_backend_auth_failures_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_auth_failures
-        ));
-        out.push_str(&format!(
-            "narix_backend_forward_batches_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_forward_batches
-        ));
-        out.push_str(&format!(
-            "narix_backend_forward_commands_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_forward_commands
-        ));
-        out.push_str(&format!(
-            "narix_backend_forward_errors_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_forward_errors
-        ));
-        out.push_str(&format!(
-            "narix_backend_forward_elapsed_micros_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.backend_forward_elapsed_micros
-        ));
-        out.push_str(&format!(
-            "narix_max_backend_forward_elapsed_micros{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_backend_forward_elapsed_micros
-        ));
-        out.push_str(&format!(
-            "narix_dedicated_tunnel_active{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.dedicated_tunnel_active
-        ));
-        out.push_str(&format!(
-            "narix_max_dedicated_tunnel_active{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_dedicated_tunnel_active
-        ));
-        out.push_str(&format!(
-            "narix_dedicated_tunnel_queue_waiters{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.dedicated_tunnel_queue_waiters
-        ));
-        out.push_str(&format!(
-            "narix_max_dedicated_tunnel_queue_waiters{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_dedicated_tunnel_queue_waiters
-        ));
-        out.push_str(&format!(
-            "narix_dedicated_tunnel_acquire_attempts_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.dedicated_tunnel_acquire_attempts
-        ));
-        out.push_str(&format!(
-            "narix_dedicated_tunnel_acquire_successes_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.dedicated_tunnel_acquire_successes
-        ));
-        out.push_str(&format!(
-            "narix_dedicated_tunnel_rejections_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.dedicated_tunnel_rejections
-        ));
-        out.push_str(&format!(
-            "narix_dedicated_tunnel_acquire_timeouts_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.dedicated_tunnel_acquire_timeouts
-        ));
-        out.push_str(&format!(
-            "narix_tunnel_pool_hits_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.tunnel_pool_hits
-        ));
-        out.push_str(&format!(
-            "narix_tunnel_pool_misses_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.tunnel_pool_misses
-        ));
-        out.push_str(&format!(
-            "narix_tunnel_pool_returns_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.tunnel_pool_returns
-        ));
-        out.push_str(&format!(
-            "narix_tunnel_pool_discards_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.tunnel_pool_discards
-        ));
-        out.push_str(&format!(
-            "narix_tunnel_pool_idle{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.tunnel_pool_idle
-        ));
-        out.push_str(&format!(
-            "narix_tunnel_pool_max_idle{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.tunnel_pool_max_idle
-        ));
-        out.push_str(&format!(
-            "narix_cluster_aggregate_active{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.cluster_aggregate_active
-        ));
-        out.push_str(&format!(
-            "narix_max_cluster_aggregate_active{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_cluster_aggregate_active
-        ));
-        out.push_str(&format!(
-            "narix_cluster_aggregate_operations_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.cluster_aggregate_operations
-        ));
-        out.push_str(&format!(
-            "narix_cluster_aggregate_rejections_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.cluster_aggregate_rejections
-        ));
-        out.push_str(&format!(
-            "narix_cluster_aggregate_elapsed_micros_total{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.cluster_aggregate_elapsed_micros
-        ));
-        out.push_str(&format!(
-            "narix_max_cluster_aggregate_elapsed_micros{{proxy=\"{}\"}} {}\n",
-            escape_label(&proxy.name),
-            proxy.metrics.max_cluster_aggregate_elapsed_micros
-        ));
+        out.push(MetricSample {
+            name: "narix_proxy_generation",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.generation) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_listener_info",
+            labels: vec![
+                ("proxy", proxy.name.to_string()),
+                ("mode", proxy.mode.to_string()),
+                ("listen", proxy.listen.to_string()),
+            ],
+            value: MetricValue::Gauge((1) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_active_connections",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.active_connections) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_accepted_connections_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.accepted_connections),
+        });
+        out.push(MetricSample {
+            name: "narix_rejected_connections_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.rejected_connections),
+        });
+        out.push(MetricSample {
+            name: "narix_closed_connections_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.closed_connections),
+        });
+        out.push(MetricSample {
+            name: "narix_connection_errors_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.connection_errors),
+        });
+        out.push(MetricSample {
+            name: "narix_pipeline_batches_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.pipeline_batches),
+        });
+        out.push(MetricSample {
+            name: "narix_commands_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.commands),
+        });
+        out.push(MetricSample {
+            name: "narix_parsed_commands_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.commands),
+        });
+        out.push(MetricSample {
+            name: "narix_local_handshake_commands_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.local_handshake_commands),
+        });
+        out.push(MetricSample {
+            name: "narix_command_errors_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.command_errors),
+        });
+        out.push(MetricSample {
+            name: "narix_response_bytes_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.response_bytes),
+        });
+        out.push(MetricSample {
+            name: "narix_max_pipeline_depth",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_pipeline_depth) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_pipeline_execution_errors_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.pipeline_execution_errors),
+        });
+        out.push(MetricSample {
+            name: "narix_pipeline_elapsed_micros_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.pipeline_elapsed_micros),
+        });
+        out.push(MetricSample {
+            name: "narix_max_pipeline_elapsed_micros",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_pipeline_elapsed_micros) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_recent_pipeline_batches_per_second",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.recent_pipeline_batches_per_second) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_recent_commands_per_second",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.recent_commands_per_second) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_pending_pipeline_batches",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.pending_pipeline_batches) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_pending_pipeline_batches",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_pending_pipeline_batches) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_pending_pipeline_commands",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.pending_pipeline_commands) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_pending_pipeline_commands",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_pending_pipeline_commands) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_pending_response_bytes",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.pending_response_bytes) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_pending_response_bytes",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_pending_response_bytes) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_pending_response_limit_hits_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.pending_response_limit_hits),
+        });
+        out.push(MetricSample {
+            name: "narix_relay_client_to_backend_bytes_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.relay_client_to_backend_bytes),
+        });
+        out.push(MetricSample {
+            name: "narix_relay_backend_to_client_bytes_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.relay_backend_to_client_bytes),
+        });
+        out.push(MetricSample {
+            name: "narix_max_relay_client_to_backend_bytes",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_relay_client_to_backend_bytes) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_relay_backend_to_client_bytes",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_relay_backend_to_client_bytes) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_relay_client_to_backend_backpressure_events_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.relay_client_to_backend_backpressure_events),
+        });
+        out.push(MetricSample {
+            name: "narix_relay_backend_to_client_backpressure_events_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.relay_backend_to_client_backpressure_events),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_active_connections",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.backend_active_connections) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_backend_active_connections",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_backend_active_connections) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_connection_attempts_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_connection_attempts),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_connection_successes_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_connection_successes),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_connection_failures_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_connection_failures),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_auth_failures_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_auth_failures),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_forward_batches_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_forward_batches),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_forward_commands_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_forward_commands),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_forward_errors_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_forward_errors),
+        });
+        out.push(MetricSample {
+            name: "narix_backend_forward_elapsed_micros_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.backend_forward_elapsed_micros),
+        });
+        out.push(MetricSample {
+            name: "narix_max_backend_forward_elapsed_micros",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_backend_forward_elapsed_micros) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_dedicated_tunnel_active",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.dedicated_tunnel_active) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_dedicated_tunnel_active",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_dedicated_tunnel_active) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_dedicated_tunnel_queue_waiters",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.dedicated_tunnel_queue_waiters) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_dedicated_tunnel_queue_waiters",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_dedicated_tunnel_queue_waiters) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_dedicated_tunnel_acquire_attempts_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.dedicated_tunnel_acquire_attempts),
+        });
+        out.push(MetricSample {
+            name: "narix_dedicated_tunnel_acquire_successes_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.dedicated_tunnel_acquire_successes),
+        });
+        out.push(MetricSample {
+            name: "narix_dedicated_tunnel_rejections_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.dedicated_tunnel_rejections),
+        });
+        out.push(MetricSample {
+            name: "narix_dedicated_tunnel_acquire_timeouts_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.dedicated_tunnel_acquire_timeouts),
+        });
+        out.push(MetricSample {
+            name: "narix_tunnel_pool_hits_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.tunnel_pool_hits),
+        });
+        out.push(MetricSample {
+            name: "narix_tunnel_pool_misses_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.tunnel_pool_misses),
+        });
+        out.push(MetricSample {
+            name: "narix_tunnel_pool_returns_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.tunnel_pool_returns),
+        });
+        out.push(MetricSample {
+            name: "narix_tunnel_pool_discards_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.tunnel_pool_discards),
+        });
+        out.push(MetricSample {
+            name: "narix_tunnel_pool_idle",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.tunnel_pool_idle) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_tunnel_pool_max_idle",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.tunnel_pool_max_idle) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_cluster_aggregate_active",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.cluster_aggregate_active) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_max_cluster_aggregate_active",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_cluster_aggregate_active) as f64),
+        });
+        out.push(MetricSample {
+            name: "narix_cluster_aggregate_operations_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.cluster_aggregate_operations),
+        });
+        out.push(MetricSample {
+            name: "narix_cluster_aggregate_rejections_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.cluster_aggregate_rejections),
+        });
+        out.push(MetricSample {
+            name: "narix_cluster_aggregate_elapsed_micros_total",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Counter(proxy.metrics.cluster_aggregate_elapsed_micros),
+        });
+        out.push(MetricSample {
+            name: "narix_max_cluster_aggregate_elapsed_micros",
+            labels: vec![("proxy", proxy.name.to_string())],
+            value: MetricValue::Gauge((proxy.metrics.max_cluster_aggregate_elapsed_micros) as f64),
+        });
         if let Some(sentinel) = &proxy.sentinel {
-            out.push_str(&format!(
-                "narix_sentinel_refresh_total{{proxy=\"{}\",result=\"success\"}} {}\n",
-                escape_label(&proxy.name),
-                sentinel.refresh_success_total
-            ));
-            out.push_str(&format!(
-                "narix_sentinel_refresh_total{{proxy=\"{}\",result=\"failure\"}} {}\n",
-                escape_label(&proxy.name),
-                sentinel.refresh_failure_total
-            ));
-            out.push_str(&format!(
-                "narix_sentinel_master_change_total{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                sentinel.master_change_total
-            ));
-            out.push_str(&format!(
-                "narix_sentinel_route_generation{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                sentinel.generation
-            ));
-            out.push_str(&format!(
-                "narix_sentinel_last_success_unixtime{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                sentinel.last_refresh_unix_ms / 1_000
-            ));
-            out.push_str(&format!(
-                "narix_sentinel_route_ready{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                if sentinel.routing_state == "serving" {
-                    1
-                } else {
-                    0
-                }
-            ));
+            out.push(MetricSample {
+                name: "narix_sentinel_refresh_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("success").to_string()),
+                ],
+                value: MetricValue::Counter(sentinel.refresh_success_total),
+            });
+            out.push(MetricSample {
+                name: "narix_sentinel_refresh_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("failure").to_string()),
+                ],
+                value: MetricValue::Counter(sentinel.refresh_failure_total),
+            });
+            out.push(MetricSample {
+                name: "narix_sentinel_master_change_total",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Counter(sentinel.master_change_total),
+            });
+            out.push(MetricSample {
+                name: "narix_sentinel_route_generation",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge((sentinel.generation) as f64),
+            });
+            out.push(MetricSample {
+                name: "narix_sentinel_last_success_unixtime",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge((sentinel.last_refresh_unix_ms / 1_000) as f64),
+            });
+            out.push(MetricSample {
+                name: "narix_sentinel_route_ready",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge(
+                    (if sentinel.routing_state == "serving" {
+                        1
+                    } else {
+                        0
+                    }) as f64,
+                ),
+            });
             if let Some(master) = &sentinel.current_master {
-                out.push_str(&format!(
-                    "narix_sentinel_current_master{{proxy=\"{}\",master=\"{}\"}} 1\n",
-                    escape_label(&proxy.name),
-                    escape_label(master)
-                ));
+                out.push(MetricSample {
+                    name: "narix_sentinel_current_master",
+                    labels: vec![
+                        ("proxy", proxy.name.to_string()),
+                        ("master", (master).to_string()),
+                    ],
+                    value: MetricValue::Gauge((1) as f64),
+                });
             }
         }
         if let Some(replication_ha) = &proxy.ha {
-            out.push_str(&format!(
-                "narix_replication_ha_current_master{{proxy=\"{}\",master=\"{}\"}} 1\n",
-                escape_label(&proxy.name),
-                escape_label(&replication_ha.current_master)
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_master_failure_streak{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.master_failure_streak
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_failovers_total{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.failover_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_last_failover_elapsed_micros{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.last_failover_elapsed_micros
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_fences_total{{proxy=\"{}\",mode=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                escape_label(&replication_ha.fencing_mode),
-                replication_ha.fence_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_fence_failures_total{{proxy=\"{}\",mode=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                escape_label(&replication_ha.fencing_mode),
-                replication_ha.fence_failure_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_last_fence_elapsed_micros{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.last_fence_elapsed_micros
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_replica_repairs_total{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.replica_repair_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_replica_repair_failures_total{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.replica_repair_failure_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_last_replica_repair_elapsed_micros{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.last_replica_repair_elapsed_micros
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_lease_acquires_total{{proxy=\"{}\",mode=\"{}\",owner=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                escape_label(&replication_ha.coordinator_mode),
-                escape_label(&replication_ha.coordinator_owner_id),
-                replication_ha.lease_acquire_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_lease_acquire_failures_total{{proxy=\"{}\",mode=\"{}\",owner=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                escape_label(&replication_ha.coordinator_mode),
-                escape_label(&replication_ha.coordinator_owner_id),
-                replication_ha.lease_acquire_failure_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_last_lease_acquire_elapsed_micros{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                replication_ha.last_lease_acquire_elapsed_micros
-            ));
+            out.push(MetricSample {
+                name: "narix_replication_ha_current_master",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("master", replication_ha.current_master.to_string()),
+                ],
+                value: MetricValue::Gauge((1) as f64),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_master_failure_streak",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge((replication_ha.master_failure_streak) as f64),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_failovers_total",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Counter(replication_ha.failover_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_last_failover_elapsed_micros",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge((replication_ha.last_failover_elapsed_micros) as f64),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_fences_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("mode", replication_ha.fencing_mode.to_string()),
+                ],
+                value: MetricValue::Counter(replication_ha.fence_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_fence_failures_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("mode", replication_ha.fencing_mode.to_string()),
+                ],
+                value: MetricValue::Counter(replication_ha.fence_failure_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_last_fence_elapsed_micros",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge((replication_ha.last_fence_elapsed_micros) as f64),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_replica_repairs_total",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Counter(replication_ha.replica_repair_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_replica_repair_failures_total",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Counter(replication_ha.replica_repair_failure_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_last_replica_repair_elapsed_micros",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge(
+                    (replication_ha.last_replica_repair_elapsed_micros) as f64,
+                ),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_lease_acquires_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("mode", replication_ha.coordinator_mode.to_string()),
+                    ("owner", replication_ha.coordinator_owner_id.to_string()),
+                ],
+                value: MetricValue::Counter(replication_ha.lease_acquire_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_lease_acquire_failures_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("mode", replication_ha.coordinator_mode.to_string()),
+                    ("owner", replication_ha.coordinator_owner_id.to_string()),
+                ],
+                value: MetricValue::Counter(replication_ha.lease_acquire_failure_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_last_lease_acquire_elapsed_micros",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge(
+                    (replication_ha.last_lease_acquire_elapsed_micros) as f64,
+                ),
+            });
             let persistence = &replication_ha.persistence;
             for owner in &persistence.snapshot_owners {
-                out.push_str(&format!(
-                    "narix_replication_ha_persistence_owner{{proxy=\"{}\",node=\"{}\",role=\"{}\"}} 1\n",
-                    escape_label(&proxy.name),
-                    escape_label(&owner.node),
-                    escape_label(&owner.role)
-                ));
-                out.push_str(&format!(
-                    "narix_replication_ha_persistence_owner_verified{{proxy=\"{}\",node=\"{}\"}} {}\n",
-                    escape_label(&proxy.name),
-                    escape_label(&owner.node),
-                    if owner.verified { 1 } else { 0 }
-                ));
+                out.push(MetricSample {
+                    name: "narix_replication_ha_persistence_owner",
+                    labels: vec![
+                        ("proxy", proxy.name.to_string()),
+                        ("node", owner.node.to_string()),
+                        ("role", owner.role.to_string()),
+                    ],
+                    value: MetricValue::Gauge((1) as f64),
+                });
+                out.push(MetricSample {
+                    name: "narix_replication_ha_persistence_owner_verified",
+                    labels: vec![
+                        ("proxy", proxy.name.to_string()),
+                        ("node", owner.node.to_string()),
+                    ],
+                    value: MetricValue::Gauge((if owner.verified { 1 } else { 0 }) as f64),
+                });
             }
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_handoffs_total{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.handoff_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_adopt_total{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.adopt_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_enable_total{{proxy=\"{}\",result=\"success\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.enable_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_enable_total{{proxy=\"{}\",result=\"failure\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.enable_failure_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_disable_total{{proxy=\"{}\",result=\"success\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.disable_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_disable_total{{proxy=\"{}\",result=\"failure\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.disable_failure_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_snapshot_total{{proxy=\"{}\",result=\"success\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.snapshot_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_snapshot_total{{proxy=\"{}\",result=\"failure\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.snapshot_failure_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_verify_total{{proxy=\"{}\",result=\"success\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.verify_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_verify_total{{proxy=\"{}\",result=\"failure\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.verify_failure_count
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_verify_duration_micros{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.last_verify_duration_micros
-            ));
-            out.push_str(&format!(
-                "narix_replication_ha_persistence_protection_total{{proxy=\"{}\"}} {}\n",
-                escape_label(&proxy.name),
-                persistence.protection_count
-            ));
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_handoffs_total",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Counter(persistence.handoff_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_adopt_total",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Counter(persistence.adopt_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_enable_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("success").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.enable_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_enable_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("failure").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.enable_failure_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_disable_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("success").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.disable_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_disable_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("failure").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.disable_failure_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_snapshot_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("success").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.snapshot_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_snapshot_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("failure").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.snapshot_failure_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_verify_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("success").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.verify_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_verify_total",
+                labels: vec![
+                    ("proxy", proxy.name.to_string()),
+                    ("result", ("failure").to_string()),
+                ],
+                value: MetricValue::Counter(persistence.verify_failure_count),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_verify_duration_micros",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Gauge((persistence.last_verify_duration_micros) as f64),
+            });
+            out.push(MetricSample {
+                name: "narix_replication_ha_persistence_protection_total",
+                labels: vec![("proxy", proxy.name.to_string())],
+                value: MetricValue::Counter(persistence.protection_count),
+            });
             for node in &replication_ha.nodes {
-                out.push_str(&format!(
-                    "narix_replication_ha_node_role{{proxy=\"{}\",node=\"{}\",role=\"{}\"}} 1\n",
-                    escape_label(&proxy.name),
-                    escape_label(&node.client_addr),
-                    escape_label(&node.role)
-                ));
-                out.push_str(&format!(
-                    "narix_replication_ha_node_probe_latency_micros{{proxy=\"{}\",node=\"{}\"}} {}\n",
-                    escape_label(&proxy.name),
-                    escape_label(&node.client_addr),
-                    node.probe_latency_micros
-                ));
+                out.push(MetricSample {
+                    name: "narix_replication_ha_node_role",
+                    labels: vec![
+                        ("proxy", proxy.name.to_string()),
+                        ("node", node.client_addr.to_string()),
+                        ("role", node.role.to_string()),
+                    ],
+                    value: MetricValue::Gauge((1) as f64),
+                });
+                out.push(MetricSample {
+                    name: "narix_replication_ha_node_probe_latency_micros",
+                    labels: vec![
+                        ("proxy", proxy.name.to_string()),
+                        ("node", node.client_addr.to_string()),
+                    ],
+                    value: MetricValue::Gauge((node.probe_latency_micros) as f64),
+                });
                 if let Some(replica_lag_seconds) = node.replica_lag_seconds {
-                    out.push_str(&format!(
-                        "narix_replication_ha_replica_lag_seconds{{proxy=\"{}\",node=\"{}\"}} {}\n",
-                        escape_label(&proxy.name),
-                        escape_label(&node.client_addr),
-                        replica_lag_seconds
-                    ));
+                    out.push(MetricSample {
+                        name: "narix_replication_ha_replica_lag_seconds",
+                        labels: vec![
+                            ("proxy", proxy.name.to_string()),
+                            ("node", node.client_addr.to_string()),
+                        ],
+                        value: MetricValue::Gauge((replica_lag_seconds) as f64),
+                    });
                 }
             }
             if replication_ha.last_error.is_some() {
-                out.push_str(&format!(
-                    "narix_replication_ha_last_error{{proxy=\"{}\"}} 1\n",
-                    escape_label(&proxy.name)
-                ));
+                out.push(MetricSample {
+                    name: "narix_replication_ha_last_error",
+                    labels: vec![("proxy", proxy.name.to_string())],
+                    value: MetricValue::Gauge((1) as f64),
+                });
             }
         }
     }
     for draining in &snapshot.draining_generations {
-        let _ = writeln!(
-            out,
-            "narix_proxy_draining_connections{{proxy=\"{}\",generation=\"{}\"}} {}",
-            escape_label(&draining.proxy),
-            draining.generation,
-            draining.active_connections
-        );
+        out.push(MetricSample {
+            name: "narix_proxy_draining_connections",
+            labels: vec![
+                ("proxy", draining.proxy.to_string()),
+                ("generation", (draining.generation).to_string()),
+            ],
+            value: MetricValue::Gauge((draining.active_connections) as f64),
+        });
     }
     out
 }
@@ -3199,70 +3298,64 @@ fn populate_platform_process_metrics(snapshot: &mut ProcessMetricsSnapshot) {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn populate_platform_process_metrics(_snapshot: &mut ProcessMetricsSnapshot) {}
 
-/// 业务作用: 将进程资源快照编码为 Prometheus text exposition 格式。
+/// 业务作用: 将真实进程资源采样转换为统一指标值，保留 CPU 累计秒数的小数精度。
 /// 参数说明:
-/// - `out`: 接收 Prometheus 指标文本的输出缓冲区。
+/// - `out`: 接收本轮结构化指标的列表。
 /// - `snapshot`: 本次采集得到的 CPU、内存、线程和文件描述符快照。
-fn append_process_metrics(out: &mut String, snapshot: &ProcessMetricsSnapshot) {
-    out.push_str(
-        "# HELP narix_process_cpu_seconds_total Total user and system CPU time spent by the Narix process.\n",
-    );
-    out.push_str("# TYPE narix_process_cpu_seconds_total counter\n");
-    let _ = writeln!(
-        out,
-        "narix_process_cpu_seconds_total{{mode=\"user\"}} {}",
-        snapshot.cpu_user_seconds
-    );
-    let _ = writeln!(
-        out,
-        "narix_process_cpu_seconds_total{{mode=\"system\"}} {}",
-        snapshot.cpu_system_seconds
-    );
-
-    out.push_str(
-        "# HELP narix_process_resident_memory_bytes Current resident memory used by the Narix process.\n",
-    );
-    out.push_str("# TYPE narix_process_resident_memory_bytes gauge\n");
-    if let Some(value) = snapshot.resident_memory_bytes {
-        let _ = writeln!(out, "narix_process_resident_memory_bytes {value}");
-    }
-
-    out.push_str(
-        "# HELP narix_process_virtual_memory_bytes Current virtual memory used by the Narix process.\n",
-    );
-    out.push_str("# TYPE narix_process_virtual_memory_bytes gauge\n");
-    if let Some(value) = snapshot.virtual_memory_bytes {
-        let _ = writeln!(out, "narix_process_virtual_memory_bytes {value}");
-    }
-
-    out.push_str("# HELP narix_process_threads Number of Narix process threads.\n");
-    out.push_str("# TYPE narix_process_threads gauge\n");
-    if let Some(value) = snapshot.threads {
-        let _ = writeln!(out, "narix_process_threads {value}");
-    }
-
-    out.push_str("# HELP narix_process_open_fds Number of open file descriptors.\n");
-    out.push_str("# TYPE narix_process_open_fds gauge\n");
-    if let Some(value) = snapshot.open_fds {
-        let _ = writeln!(out, "narix_process_open_fds {value}");
-    }
-
-    out.push_str("# HELP narix_process_max_fds Maximum number of open file descriptors.\n");
-    out.push_str("# TYPE narix_process_max_fds gauge\n");
-    if let Some(value) = snapshot.max_fds {
-        let _ = writeln!(out, "narix_process_max_fds {value}");
-    }
-}
-
-/// 业务作用: 转义 管理端 HTTP API、运行时状态快照和指标采集 的输出字段，避免标签或协议文本破坏下游解析。
-/// 参数说明:
-/// - `raw`: 尚未结构化的 RESP 或后端字节数据，解析前必须保留原始顺序。
 ///
-// 格式化 escape_label 输出，用于对外呈现管理健康检查、状态查询、指标和 replication HA 运维接口结果。
-fn escape_label(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"")
+/// 返回: 追加本轮可用的资源样本；CPU 浮点载荷由独立文本源按累计秒数导出。
+fn append_process_metrics(out: &mut Vec<MetricSample>, snapshot: &ProcessMetricsSnapshot) {
+    // 浮点秒数通过独立 Prometheus 源保留 counter 合同，不进入只接受整数 counter 的结构化出口。
+    out.push(MetricSample {
+        name: "narix_process_cpu_seconds_total",
+        labels: vec![("mode", ("user").to_string())],
+        value: MetricValue::Gauge(snapshot.cpu_user_seconds),
+    });
+    out.push(MetricSample {
+        name: "narix_process_cpu_seconds_total",
+        labels: vec![("mode", ("system").to_string())],
+        value: MetricValue::Gauge(snapshot.cpu_system_seconds),
+    });
+
+    if let Some(value) = snapshot.resident_memory_bytes {
+        out.push(MetricSample {
+            name: "narix_process_resident_memory_bytes",
+            labels: vec![],
+            value: MetricValue::Gauge((value) as f64),
+        });
+    }
+
+    if let Some(value) = snapshot.virtual_memory_bytes {
+        out.push(MetricSample {
+            name: "narix_process_virtual_memory_bytes",
+            labels: vec![],
+            value: MetricValue::Gauge((value) as f64),
+        });
+    }
+
+    if let Some(value) = snapshot.threads {
+        out.push(MetricSample {
+            name: "narix_process_threads",
+            labels: vec![],
+            value: MetricValue::Gauge((value) as f64),
+        });
+    }
+
+    if let Some(value) = snapshot.open_fds {
+        out.push(MetricSample {
+            name: "narix_process_open_fds",
+            labels: vec![],
+            value: MetricValue::Gauge((value) as f64),
+        });
+    }
+
+    if let Some(value) = snapshot.max_fds {
+        out.push(MetricSample {
+            name: "narix_process_max_fds",
+            labels: vec![],
+            value: MetricValue::Gauge((value) as f64),
+        });
+    }
 }
 
 /// 业务作用: 对受保护管理端点执行统一认证，并在失败时生成 401 响应。
@@ -3299,14 +3392,4 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= usize::from(a ^ b);
     }
     diff == 0
-}
-
-/// 业务作用: 生成管理状态和指标使用的当前 Unix 秒时间戳。
-/// 参数说明: 无。
-// 系统时间异常早于 Unix epoch 时返回零，管理面不能因时间转换错误而 panic。
-fn current_unix_second() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
 }

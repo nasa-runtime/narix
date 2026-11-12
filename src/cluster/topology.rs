@@ -78,7 +78,7 @@ impl SlotMap {
 /// 参数说明:
 /// - `seed_addr`: 目标网络地址，通常为 `host:port`，用于连接、监听或状态查询。
 /// - `username`: 认证用户名，用于 Redis ACL 场景；未启用 ACL 时通常为空。
-/// - `password`: 认证密码，用于连接后端、协调器或测试代理，调用方负责从安全配置注入。
+/// - `password`: 后端认证密码，调用方负责从安全配置提供。
 /// - `connect_timeout_ms`: 建立后端或 coordinator TCP 连接的超时毫秒数。
 /// - `request_timeout_ms`: 发送命令后等待后端或 coordinator 响应的超时毫秒数。
 /// - `tcp_keepalive_ms`: 后端 TCP keepalive 配置毫秒数，用于清理异常断开的空闲连接。

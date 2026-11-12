@@ -1,10 +1,14 @@
 impl ReplicationHaRuntime {
-/// 业务作用: 在租约、fencing 和多主保护门禁下执行人工故障切换并发布已验证路由。
+    /// 业务作用: 在租约、fencing 和多主保护门禁下执行人工故障切换并发布已验证路由。
+    /// 参数说明: 无。
+    ///
     /// 返回: 动作完成、拓扑复验并发布后返回最新 HA 状态；失权、隔离或收敛失败时返回错误。
     pub async fn manual_failover(&self) -> anyhow::Result<ReplicationHaStatus> {
+        // 人工动作与后台收敛遵循同一配置事务屏障，不能改写正在交接的旧拓扑。
+        let _control = self.acquire_regular_control().await?;
         self.ensure_not_retired("before manual failover")?;
         self.ensure_not_observer("manual failover")?;
-        let _operation = self.failover_lock.lock().await;
+        let _operation = self.acquire_operation().await?;
         let started = Instant::now();
         let current = self.current_master.read().await.clone();
         if self.node_role(&current).await? == HaRole::Master {
@@ -39,8 +43,7 @@ impl ReplicationHaRuntime {
                     .await?;
                 (candidate, true, false)
             };
-        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster
-        {
+        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
             Some(
                 self.acquire_cluster_manual_action(
                     CoordinationActionKind::Failover,
@@ -152,19 +155,17 @@ impl ReplicationHaRuntime {
             self.protect_ha_control_step(result, "while publishing manual failover outcome")
                 .await?;
         }
-        self.finish_master_switch(
-            current.client_addr,
-            new_master,
-            started,
-            "manual failover",
-        )
-        .await?;
+        self.finish_master_switch(current.client_addr, new_master, started, "manual failover")
+            .await?;
         Ok(self.status().await)
     }
 
     /// 业务作用: 在健康旧主参与下执行有序计划切换，完成降级与复制收敛后才开放路由。
+    ///
     /// 返回: 动作完成、拓扑复验并发布后返回最新 HA 状态；失权、隔离或收敛失败时返回错误。
     pub async fn manual_switchover(&self) -> anyhow::Result<ReplicationHaStatus> {
+        // 管理入口必须受事务冻结约束；配置预提交使用内部计划切换路径。
+        let _control = self.acquire_regular_control().await?;
         self.planned_switchover_target(None, "manual switchover")
             .await
     }
@@ -206,7 +207,7 @@ impl ReplicationHaRuntime {
         if retained_client_addrs.is_empty() {
             bail!("configuration persistence handoff requires at least one retained HA node");
         }
-        let _operation = self.failover_lock.lock().await;
+        let _operation = self.acquire_operation().await?;
         let retained = retained_client_addrs
             .iter()
             .map(String::as_str)
@@ -291,7 +292,7 @@ impl ReplicationHaRuntime {
         if self.persistence.policy == HaPersistencePolicy::None {
             return Ok(());
         }
-        let _operation = self.failover_lock.lock().await;
+        let _operation = self.acquire_operation().await?;
         let (masters, replicas) = self.discover_roles_with_replica_lag().await;
         if masters.len() != 1 {
             bail!(
@@ -399,7 +400,7 @@ impl ReplicationHaRuntime {
     ) -> anyhow::Result<ReplicationHaStatus> {
         self.ensure_not_retired("before planned switchover")?;
         self.ensure_not_observer("planned switchover")?;
-        let _operation = self.failover_lock.lock().await;
+        let _operation = self.acquire_operation().await?;
         let started = Instant::now();
         let current = self.current_master.read().await.clone();
         if self.node_role(&current).await? != HaRole::Master {
@@ -445,8 +446,7 @@ impl ReplicationHaRuntime {
             }
         };
 
-        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster
-        {
+        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
             Some(
                 self.acquire_cluster_manual_action(
                     CoordinationActionKind::Failover,
@@ -491,12 +491,7 @@ impl ReplicationHaRuntime {
         )
         .await?;
         let result = self
-            .demote_extra_masters_checked(
-                &candidate,
-                lease.as_ref(),
-                cluster_action.as_ref(),
-                None,
-            )
+            .demote_extra_masters_checked(&candidate, lease.as_ref(), cluster_action.as_ref(), None)
             .await;
         self.protect_ha_control_step(result, "during planned switchover convergence")
             .await?;
@@ -532,9 +527,11 @@ impl ReplicationHaRuntime {
     ///
     /// 返回: 动作完成、拓扑复验并发布后返回最新 HA 状态；失权、隔离或收敛失败时返回错误。
     pub async fn promote_node(&self, client_addr: &str) -> anyhow::Result<ReplicationHaStatus> {
+        // 晋升前先排除配置事务，避免旧代把已移出候选的节点重新变成主节点。
+        let _control = self.acquire_regular_control().await?;
         self.ensure_not_retired("before manual promotion")?;
         self.ensure_not_observer("manual promotion")?;
-        let _operation = self.failover_lock.lock().await;
+        let _operation = self.acquire_operation().await?;
         let started = Instant::now();
         let current = self.current_master_addr().await;
         let current_node = self.find_node(&current)?;
@@ -544,8 +541,7 @@ impl ReplicationHaRuntime {
         } else {
             self.acquire_failover_lease("manual promote").await?
         };
-        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster
-        {
+        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
             Some(
                 self.acquire_cluster_manual_action(
                     CoordinationActionKind::Failover,
@@ -613,12 +609,7 @@ impl ReplicationHaRuntime {
         )
         .await?;
         let result = self
-            .demote_extra_masters_checked(
-                &node,
-                lease.as_ref(),
-                cluster_action.as_ref(),
-                None,
-            )
+            .demote_extra_masters_checked(&node, lease.as_ref(), cluster_action.as_ref(), None)
             .await;
         self.protect_ha_control_step(result, "during manual promotion convergence")
             .await?;
@@ -659,9 +650,11 @@ impl ReplicationHaRuntime {
         client_addr: &str,
         master_addr: &str,
     ) -> anyhow::Result<ReplicationHaStatus> {
+        // 复制指派不能跨越配置预提交到激活的窗口，否则会覆盖候选已验证的上游。
+        let _control = self.acquire_regular_control().await?;
         self.ensure_not_retired("before manual replica assignment")?;
         self.ensure_not_observer("manual replica assignment")?;
-        let _operation = self.failover_lock.lock().await;
+        let _operation = self.acquire_operation().await?;
         let started = Instant::now();
         let node = self.find_node(client_addr)?;
         let master = self.find_node(master_addr)?;
@@ -683,8 +676,7 @@ impl ReplicationHaRuntime {
         } else {
             current.clone()
         };
-        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster
-        {
+        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
             Some(
                 self.acquire_cluster_manual_action(
                     CoordinationActionKind::TopologyRepair,
@@ -737,10 +729,7 @@ impl ReplicationHaRuntime {
                 .await?;
         } else {
             self.master_failure_streak.store(0, Ordering::Relaxed);
-            let serving = matches!(
-                &*self.routing_tx.borrow(),
-                HaRoutingState::Serving { .. }
-            );
+            let serving = matches!(&*self.routing_tx.borrow(), HaRoutingState::Serving { .. });
             if serving {
                 self.set_last_error(None).await;
             }
@@ -754,9 +743,11 @@ impl ReplicationHaRuntime {
     ///
     /// 返回: 动作完成、拓扑复验并发布后返回最新 HA 状态；失权、隔离或收敛失败时返回错误。
     pub async fn fence_node(&self, client_addr: &str) -> anyhow::Result<ReplicationHaStatus> {
+        // 配置交接中的角色判断由事务负责，管理入口不得并发隔离其候选节点。
+        let _control = self.acquire_regular_control().await?;
         self.ensure_not_retired("before manual fencing")?;
         self.ensure_not_observer("manual fencing")?;
-        let _operation = self.failover_lock.lock().await;
+        let _operation = self.acquire_operation().await?;
         let node = self.find_node(client_addr)?;
         let current = self.current_master_addr().await;
         let lease = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
@@ -764,8 +755,7 @@ impl ReplicationHaRuntime {
         } else {
             self.acquire_failover_lease("manual fence").await?
         };
-        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster
-        {
+        let mut cluster_action = if self.coordinator.mode == HaCoordinatorMode::ProxyCluster {
             Some(
                 self.acquire_cluster_manual_action(
                     CoordinationActionKind::TopologyRepair,

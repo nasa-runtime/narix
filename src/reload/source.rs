@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -7,10 +7,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::{default_application_path, ProxyConfig, ProxyItem};
+use crate::infrastructure::credentials::Materials;
+use nasa::secret::SecretBytes;
 
 use super::MAX_CLUSTER_CONFIG_BYTES;
-
-const NARIX_PROFILE_ENV: &str = "NARIX_PROFILE";
 
 /// 表示一次已经完成加载、占位符解析和静态校验的有效配置。
 ///
@@ -24,14 +24,23 @@ pub struct LoadedConfig {
     admin_digest: Arc<str>,
     coordination_digest: Arc<str>,
     process_digest: Arc<str>,
+    log_digest: Arc<str>,
     reload_digest: Arc<str>,
     node_bootstrap_digest: Arc<str>,
-    cluster_payload: Arc<[u8]>,
+    cluster_payload: Arc<SecretBytes>,
     cluster_digest: Arc<str>,
     source_paths: Arc<Vec<PathBuf>>,
 }
 
 impl LoadedConfig {
+    /// 业务作用: 比较本机日志配置，独立于尚未实现热变更的进程字段。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 当前候选日志设置的确定性摘要。
+    pub fn log_digest(&self) -> &str {
+        &self.log_digest
+    }
+
     /// 业务作用: 返回本次加载得到的强类型配置共享句柄。
     ///
     /// 返回: 调用方只读共享的完整强类型配置。
@@ -69,7 +78,7 @@ impl LoadedConfig {
 
     /// 业务作用: 返回代理、管理端和协调配置之外的进程级有效配置摘要。
     ///
-    /// 返回: 日志、热更新策略等进程级字段对应的六十四位 SHA-256 摘要。
+    /// 返回: 排除已独立管理的日志与热更新策略后，其余进程级字段的六十四位 SHA-256 摘要。
     pub fn process_digest(&self) -> &str {
         &self.process_digest
     }
@@ -96,7 +105,7 @@ impl LoadedConfig {
     ///
     /// 返回: 已排除节点本地身份字段、仍可能包含业务凭据的 JSON 字节；调用方不得记录正文。
     pub(crate) fn cluster_payload(&self) -> &[u8] {
-        &self.cluster_payload
+        self.cluster_payload.expose()
     }
 
     /// 业务作用: 返回规范化集群业务配置载荷的确定性摘要。
@@ -122,17 +131,26 @@ pub struct ConfigSource {
 }
 
 impl ConfigSource {
-    /// 业务作用: 使用 NARIX 默认基础配置和可选外部配置创建来源描述。
+    /// 业务作用: 固定本进程的基础配置与外部覆盖文件，使启动和热更新使用同一来源。
     ///
     /// 参数说明:
-    /// - `external_config`: 命令行或环境变量指定的外部配置路径；空白值按未配置处理。
+    /// - `external_config`: 显式外部配置路径，优先于环境变量；空白值按未配置处理。
     ///
-    /// 返回: 可被重复加载的配置来源。
+    /// 返回: 按显式路径、`APP_CONFIG_FILE`、兼容变量 `NARIX_CONFIG` 的顺序选择非空路径。
+    /// 文件存在性与内容在加载时验证；指定文件不可用时拒绝加载，不回退到低优先级来源。
     pub fn from_external(external_config: Option<&str>) -> Self {
-        Self::new(
-            default_application_path(),
-            external_config.map(PathBuf::from),
-        )
+        let external_file = external_config
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                ["APP_CONFIG_FILE", "NARIX_CONFIG"]
+                    .into_iter()
+                    .find_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
+                    .map(PathBuf::from)
+            });
+        // 路径只在来源创建时选择；后续文件缺失或候选非法不能静默切换到另一配置。
+        Self::new(default_application_path(), external_file)
     }
 
     /// 业务作用: 使用明确的基础配置和外部配置路径创建来源描述。
@@ -151,21 +169,28 @@ impl ConfigSource {
     }
 
     /// 业务作用: 重新读取全部配置来源、执行静态校验并计算确定性摘要。
+    /// 参数说明: 无。
     ///
     /// 返回: 已校验的配置快照；读取、解析、证书依赖或校验失败时返回带路径上下文的错误。
+    /// 多线程运行时在同步读取和解析期间移交其它任务的调度，配置结果仍由调用方串行校验和发布。
     pub fn load(&self) -> anyhow::Result<LoadedConfig> {
-        let external = self
-            .external_file
-            .as_deref()
-            .map(|path| {
-                path.to_str()
-                    .context("external config path is not valid UTF-8")
-            })
-            .transpose()?;
-        let (config, tree) = ProxyConfig::load_effective_from(&self.base_file, external)
-            .context("load effective NARIX configuration")?;
-        config.validate().context("validate NARIX configuration")?;
-        build_loaded_config(config, tree, self.config_source_paths()?)
+        // 文件读取、配置解析和证书摘要都同步完成；移交 I/O 调度后仍在本次调用内
+        // 构造候选，避免异步取消留下可独立发布的配置加载任务。
+        crate::infrastructure::blocking::with_blocking_work(|| {
+            let external = self
+                .external_file
+                .as_deref()
+                .map(|path| {
+                    path.to_str()
+                        .context("external config path is not valid UTF-8")
+                })
+                .transpose()?;
+            let (config, tree) = ProxyConfig::load_effective_from(&self.base_file, external)
+                .context("load effective NARIX configuration")?;
+            config.validate().context("validate NARIX configuration")?;
+            let paths = config.source_paths.clone();
+            build_loaded_config(config, tree, paths)
+        })
     }
 
     /// 业务作用: 使用领导节点广播的规范化集群配置正文构造本节点候选配置。
@@ -191,34 +216,16 @@ impl ConfigSource {
                     .context("external config path is not valid UTF-8")
             })
             .transpose()?;
-        let (_, local_tree) = ProxyConfig::load_effective_from(&self.base_file, external)
-            .context("load local bootstrap configuration")?;
+        let (local_config, local_tree) =
+            ProxyConfig::load_effective_from(&self.base_file, external)
+                .context("load local bootstrap configuration")?;
         overlay_local_bootstrap(&mut managed, &local_tree)?;
         let config: ProxyConfig = serde_json::from_value(managed.clone())
             .context("deserialize cluster-managed configuration")?;
         config
             .validate()
             .context("validate cluster-managed configuration")?;
-        build_loaded_config(config, managed, self.config_source_paths()?)
-    }
-
-    /// 业务作用: 收集当前配置层级真实存在的基础、profile 和外部配置路径。
-    ///
-    /// 返回: 已排序并去重的配置文件路径；profile 环境变量非法时返回错误。
-    fn config_source_paths(&self) -> anyhow::Result<Vec<PathBuf>> {
-        let mut paths = vec![self.base_file.clone()];
-        if let Some(profile) = profile_file_for(&self.base_file)? {
-            paths.push(profile);
-        }
-        if let Some(external) = &self.external_file {
-            paths.push(external.clone());
-            if let Some(profile) = profile_file_for(external)? {
-                paths.push(profile);
-            }
-        }
-        paths.sort();
-        paths.dedup();
-        Ok(paths)
+        build_loaded_config(config, managed, local_config.source_paths)
     }
 }
 
@@ -261,6 +268,13 @@ fn overlay_local_bootstrap(managed: &mut Value, local: &Value) -> anyhow::Result
         managed_tls.insert(field.to_string(), value);
     }
     overlay_required_object_field(managed, local, "admin", "listen")?;
+    // 日志目录和过滤属于本机运维配置，不将领导者的文件路径发布到其他节点。
+    if let Some(object) = managed.as_object_mut() {
+        object.insert(
+            "log".to_string(),
+            local.get("log").cloned().unwrap_or(Value::Null),
+        );
+    }
     overlay_existing_proxy_hosts(managed, local)?;
     Ok(())
 }
@@ -401,7 +415,7 @@ fn overlay_existing_node_proxy_hosts(
 ///
 /// 返回: 纳入 TLS 依赖内容并可交给运行时事务的配置快照。
 fn build_loaded_config(
-    config: ProxyConfig,
+    mut config: ProxyConfig,
     tree: Value,
     mut source_paths: Vec<PathBuf>,
 ) -> anyhow::Result<LoadedConfig> {
@@ -417,11 +431,16 @@ fn build_loaded_config(
     source_paths.sort();
     source_paths.dedup();
 
-    let digest = digest_value_and_files(&tree, &dependency_paths)?;
+    let materials = Materials::prepare(&mut config, &dependency_paths)?;
+    for item in &mut config.proxies {
+        crate::cluster::backend::prepare_tls(item)?;
+    }
+    let digest = digest_value_and_files(&tree, &dependency_paths, &materials)?;
     let admin_digest = digest_value(tree.get("admin").unwrap_or(&Value::Null))?;
     let coordination_digest = digest_value_and_files(
         tree.get("coordination").unwrap_or(&Value::Null),
         &coordination_tls_paths,
+        &materials,
     )?;
     let process_digest = process_config_digest(&tree)?;
     let reload_digest = digest_value(tree.get("reload").unwrap_or(&Value::Null))?;
@@ -429,6 +448,7 @@ fn build_loaded_config(
     let node_bootstrap_digest = digest_value_and_files(
         &node_bootstrap_tree(&local_bootstrap),
         &coordination_tls_paths,
+        &materials,
     )?;
     let proxy_digests = proxy_digests(&tree, &config.proxies)?;
     let cluster_tree = cluster_managed_tree(&tree);
@@ -443,9 +463,10 @@ fn build_loaded_config(
         admin_digest: Arc::from(admin_digest),
         coordination_digest: Arc::from(coordination_digest),
         process_digest: Arc::from(process_digest),
+        log_digest: Arc::from(digest_value(tree.get("log").unwrap_or(&Value::Null))?),
         reload_digest: Arc::from(reload_digest),
         node_bootstrap_digest: Arc::from(node_bootstrap_digest),
-        cluster_payload: Arc::from(cluster_payload),
+        cluster_payload: Arc::new(SecretBytes::new(cluster_payload)),
         cluster_digest: Arc::from(cluster_digest),
         source_paths: Arc::new(source_paths),
     })
@@ -459,6 +480,9 @@ fn build_loaded_config(
 /// 返回: 移除节点编号、管理监听、存储目录和本机 TLS 私钥路径后的配置树。
 fn cluster_managed_tree(tree: &Value) -> Value {
     let mut managed = tree.clone();
+    if let Some(object) = managed.as_object_mut() {
+        object.remove("log");
+    }
     if let Some(admin) = managed.get_mut("admin").and_then(Value::as_object_mut) {
         admin.remove("listen");
     }
@@ -602,12 +626,12 @@ fn copy_present_fields(
     }
 }
 
-/// 业务作用: 计算除代理、管理端、协调配置和 reload 配置外的进程级有效配置摘要。
+/// 业务作用: 计算除代理、管理端、协调、日志和 reload 配置外的进程级有效配置摘要。
 ///
 /// 参数说明:
 /// - `tree`: 完成全部来源合并和占位符解析的有效配置树。
 ///
-/// 返回: 日志及其他尚需适配器处理的进程级字段确定性摘要。
+/// 返回: 不允许热变更的其他进程级字段确定性摘要。
 fn process_config_digest(tree: &Value) -> anyhow::Result<String> {
     let mut process_tree = tree.clone();
     if let Some(object) = process_tree.as_object_mut() {
@@ -615,6 +639,7 @@ fn process_config_digest(tree: &Value) -> anyhow::Result<String> {
         object.remove("admin");
         object.remove("coordination");
         object.remove("reload");
+        object.remove("log");
     }
     digest_value(&process_tree)
 }
@@ -649,7 +674,10 @@ fn proxy_digests(tree: &Value, proxies: &[ProxyItem]) -> anyhow::Result<BTreeMap
             )
         })?;
         let paths = proxy_tls_dependency_paths(proxy);
-        out.insert(proxy.name.clone(), digest_value_and_files(value, &paths)?);
+        out.insert(
+            proxy.name.clone(),
+            digest_value_and_files(value, &paths, &proxy.materials)?,
+        );
     }
     Ok(out)
 }
@@ -718,7 +746,7 @@ fn extend_optional_path(paths: &mut BTreeSet<PathBuf>, candidate: Option<&str>) 
 ///
 /// 返回: 六十四位小写十六进制摘要。
 fn digest_value(value: &Value) -> anyhow::Result<String> {
-    digest_value_and_files(value, &[])
+    digest_value_and_files(value, &[], &Materials::default())
 }
 
 /// 业务作用: 计算配置片段以及所引用文件内容共同形成的确定性摘要。
@@ -726,16 +754,20 @@ fn digest_value(value: &Value) -> anyhow::Result<String> {
 /// 参数说明:
 /// - `value`: 已完成合并和占位符解析的 JSON 配置片段。
 /// - `paths`: 内容变化必须触发新版本的依赖文件路径。
+/// - `materials`: 与运行代共同准备的文件快照，摘要计算不得再次读取文件。
 ///
 /// 返回: 六十四位小写十六进制摘要；依赖文件无法读取时返回明确路径错误。
-fn digest_value_and_files(value: &Value, paths: &[PathBuf]) -> anyhow::Result<String> {
+fn digest_value_and_files(
+    value: &Value,
+    paths: &[PathBuf],
+    materials: &Materials,
+) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     let encoded = serde_json::to_vec(value).context("serialize effective config for digest")?;
     hasher.update((encoded.len() as u64).to_be_bytes());
     hasher.update(encoded);
     for path in paths {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read configuration dependency `{}`", path.display()))?;
+        let bytes = materials.file(path)?;
         let path_text = path.to_string_lossy();
         hasher.update((path_text.len() as u64).to_be_bytes());
         hasher.update(path_text.as_bytes());
@@ -771,32 +803,4 @@ fn hex_digest(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
-}
-
-/// 业务作用: 按与配置加载器一致的规则派生当前 profile 文件。
-///
-/// 参数说明:
-/// - `path`: 基础或外部配置文件路径。
-///
-/// 返回: profile 未启用或派生文件不存在时返回 `None`。
-fn profile_file_for(path: &Path) -> anyhow::Result<Option<PathBuf>> {
-    let profile = match std::env::var(NARIX_PROFILE_ENV) {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
-    };
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("application");
-    let file_name = match path.extension().and_then(|value| value.to_str()) {
-        Some(extension) if !extension.is_empty() => {
-            format!("{stem}-{profile}.{extension}")
-        }
-        _ => format!("{stem}-{profile}"),
-    };
-    let candidate = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(file_name),
-        _ => PathBuf::from(file_name),
-    };
-    Ok(candidate.exists().then_some(candidate))
 }

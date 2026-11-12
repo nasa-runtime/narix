@@ -125,7 +125,7 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 }
 
 /// 业务作用: 表示需要协调集群串行化的托管复制 HA 控制动作，枚举值会进入复制日志并参与动作令牌校验。
-/// 分支说明: 故障切换改变主节点；持久化交接改变快照责任节点；拓扑修复处理异常双主或复制关系。
+/// 分支说明: 故障切换改变主节点；持久化交接改变快照责任节点；拓扑收敛处理异常双主或复制关系。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CoordinationActionKind {
@@ -135,7 +135,7 @@ pub enum CoordinationActionKind {
     PersistenceHandoff,
     /// 在配置关闭动态持久化时清除全部节点的持久化责任。
     PersistenceDisable,
-    /// 修复双主、复制方向或启动时缺失主节点等拓扑异常。
+    /// 收敛双主、复制方向或启动时缺失主节点等拓扑异常。
     TopologyRepair,
 }
 

@@ -32,3 +32,14 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings -D missing-docs
         run: cargo doc --locked --no-deps
+
+      - name: 归档构建
+        run: cargo package --locked
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: 最低 Rust 版本编译
+        run: cargo check --locked --all-targets

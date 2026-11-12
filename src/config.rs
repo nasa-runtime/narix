@@ -2,23 +2,33 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use crate::infrastructure::credentials::{Materials, SecretText};
 use anyhow::{bail, Context};
-use config::{Config as ConfigSource, File, FileFormat};
+use nasa::yml::strict::{EnvironmentSnapshot, SourceDocument};
+use nasa::yml::ConfigFormat as FileFormat;
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
+use std::sync::Arc;
 
 use crate::backend::BackendProfile;
 
 /// 未显式指定外部配置时加载的仓库内基础配置路径。
 pub const DEFAULT_APPLICATION_CONFIG: &str = "zcf/application.yml";
+/// 默认输出全部警告与错误，以及 narix 的关键生命周期和状态变化。
+pub(crate) const DEFAULT_LOG_LEVEL: &str = "warn,narix=info";
 const NARIX_PROFILE_ENV: &str = "NARIX_PROFILE";
 const NARIX_ENV_PREFIX: &str = "NARIX_";
-const PLACEHOLDER_MAX_PASSES: usize = 16;
 
 /// 业务作用: 保存管理端、协调集群和全部代理项，是配置合并、校验与运行时组装的根对象。
 #[derive(Debug, Clone, Deserialize)]
 // 表示 ProxyConfig 的数据结构，用于加载、解析和校验 narix 配置。
 pub struct ProxyConfig {
+    /// 本轮实际读取的配置来源，避免摘要与解析观察到不同 profile。
+    #[serde(skip)]
+    pub(crate) source_paths: Vec<PathBuf>,
+    /// 本机日志过滤、输出目录及轮转策略。
+    #[serde(default)]
+    pub log: nasa::log::LogConfig,
     /// 管理端监听、认证和健康检查配置。
     #[serde(default)]
     pub admin: AdminConfig,
@@ -76,6 +86,8 @@ pub struct ProxyClusterCoordinationConfig {
     pub pair_peer_fencing_command: Vec<String>,
     /// 对端代理隔离程序的最长执行时间，单位为毫秒。
     pub pair_peer_fencing_timeout_ms: u64,
+    /// 协调 RPC 的消息、请求时间和受管内存预算；启动后固定。
+    pub grpc: CoordinationGrpcConfig,
     /// 协调端口的双向 TLS 与证书文件配置。
     pub tls: ProxyClusterTlsConfig,
 }
@@ -83,6 +95,7 @@ pub struct ProxyClusterCoordinationConfig {
 impl Default for ProxyClusterCoordinationConfig {
     /// 业务作用: 提供不启用进程级协调器时的安全默认值，使旧配置保持兼容且不会额外开放网络监听。
     /// 参数说明: 无。
+    ///
     /// 返回: 返回禁用状态的协调配置；启用时调用方必须显式填写集群标识、成员和存储目录。
     fn default() -> Self {
         Self {
@@ -105,13 +118,85 @@ impl Default for ProxyClusterCoordinationConfig {
             pair_allow_single_survivor: false,
             pair_peer_fencing_command: Vec::new(),
             pair_peer_fencing_timeout_ms: 5_000,
+            grpc: CoordinationGrpcConfig::default(),
             tls: ProxyClusterTlsConfig::default(),
         }
     }
 }
 
+/// 协调传输的整体资源预算，客户端与服务端共享单消息边界。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoordinationGrpcConfig {
+    /// 部署允许的单消息容量上界，单位为字节；实际编解码上限不得超出。
+    pub message_size_ceiling_bytes: usize,
+    /// 部署允许的 unary 时长上界，单位为毫秒；实际请求预算不得超出。
+    pub unary_timeout_ceiling_ms: u64,
+    /// 单条 gRPC 消息编码与解码上限，单位为字节。
+    pub max_message_bytes: usize,
+    /// 服务端 unary 请求最长持续时间，单位为毫秒；调用方更短的期限仍优先。
+    pub unary_timeout_ms: u64,
+    /// 全部请求与响应共享的在途消息字节预算。
+    pub max_inflight_message_bytes: usize,
+    /// 连接、stream、RPC 与消息状态的受管内存会计预算。
+    pub managed_memory_budget_bytes: usize,
+}
+
+impl Default for CoordinationGrpcConfig {
+    /// 业务作用: 保留完整配置快照和长配置事务所需的协调传输容量。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 256 MiB 消息部署上界、192 MiB 实际消息、24 小时请求上界和实际预算、768 MiB 在途消息及 2 GiB 会计预算。
+    fn default() -> Self {
+        Self {
+            message_size_ceiling_bytes: 256 * 1024 * 1024,
+            unary_timeout_ceiling_ms: 86_400_000,
+            max_message_bytes: 192 * 1024 * 1024,
+            unary_timeout_ms: 86_400_000,
+            max_inflight_message_bytes: 768 * 1024 * 1024,
+            managed_memory_budget_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl CoordinationGrpcConfig {
+    /// 业务作用: 将部署允许的消息和请求时长上界交给框架，供校验与监听装配共享。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 不产生网络副作用的上界对象；其合法性由传输配置整体校验决定。
+    pub fn transport_ceilings(&self) -> nasa::grpc::GrpcServerCeilings {
+        nasa::grpc::GrpcServerCeilings {
+            message_size_ceiling_bytes: self.message_size_ceiling_bytes,
+            unary_timeout_ceiling: std::time::Duration::from_millis(self.unary_timeout_ceiling_ms),
+        }
+    }
+
+    /// 业务作用: 将 YAML 预算转换为框架传输合同，启动网络前拒绝超限或互相不兼容的配置。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 通过全部框架硬上界和总量会计校验的配置；非法预算返回错误，不创建监听。
+    pub fn transport_config(&self) -> anyhow::Result<nasa::grpc::GrpcServerConfig> {
+        let config = nasa::grpc::GrpcServerConfig {
+            message_limits: nasa::grpc::GrpcMessageLimits {
+                max_decoding_bytes: self.max_message_bytes,
+                max_encoding_bytes: self.max_message_bytes,
+            },
+            unary_timeout: std::time::Duration::from_millis(self.unary_timeout_ms),
+            max_inflight_message_bytes: self.max_inflight_message_bytes,
+            managed_memory_budget_bytes: self.managed_memory_budget_bytes,
+            ..Default::default()
+        };
+        // 单项上界通过不代表总预算可承载连接与在途消息，必须复用框架的整体会计校验。
+        config
+            .validate_with_ceilings(&self.transport_ceilings())
+            .context("validate coordination.grpc transport budgets")?;
+        Ok(config)
+    }
+}
+
 impl ProxyClusterCoordinationConfig {
     /// 业务作用: 根据配置文件中的静态成员总数选择双节点或多数派协议；该结果随后写入本地创世信息，不能随在线节点数变化。
+    ///
     /// 返回: 两个成员返回双节点协议，至少三个成员返回多数派协议；成员数不足时返回配置错误。
     pub fn protocol(&self) -> anyhow::Result<ProxyClusterProtocol> {
         match self.peers.len() {
@@ -122,6 +207,7 @@ impl ProxyClusterCoordinationConfig {
     }
 
     /// 业务作用: 校验进程级协调器的成员、计时、持久化和传输安全约束，避免节点以不一致参数加入同一集群。
+    ///
     /// 返回: 配置满足安全约束时返回成功，否则返回指向具体字段的启动错误。
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.enabled {
@@ -130,6 +216,7 @@ impl ProxyClusterCoordinationConfig {
             }
             return Ok(());
         }
+        self.grpc.transport_config()?;
         if self.cluster_id.trim().is_empty() {
             bail!("coordination.cluster_id must not be empty");
         }
@@ -354,6 +441,9 @@ pub struct ProxyClusterPeerConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyClusterTlsConfig {
+    /// 当前配置候选已经读取并固定的 TLS 材料。
+    #[serde(skip)]
+    pub(crate) materials: Arc<Materials>,
     /// 是否同时启用服务端与客户端证书校验。
     pub enabled: bool,
     /// 当前节点证书链的 PEM 文件路径。
@@ -366,6 +456,7 @@ pub struct ProxyClusterTlsConfig {
 
 impl ProxyClusterTlsConfig {
     /// 业务作用: 校验协调端口的证书配置是否成套，防止只启用单向认证或漏配私钥后以明文方式意外启动。
+    ///
     /// 返回: 禁用或三个证书路径均为非空值时返回成功，否则返回启动错误。
     fn validate(&self) -> anyhow::Result<()> {
         let fields = [
@@ -407,7 +498,7 @@ pub struct AdminConfig {
     /// 管理端绑定的 IP 与端口。
     pub listen: String,
     /// 受保护管理接口使用的 Bearer 令牌；空值表示没有可用令牌。
-    pub token: Option<String>,
+    pub token: Option<SecretText>,
     /// 是否显式允许不携带令牌访问受保护管理接口。
     #[serde(default)]
     pub allow_unauthenticated: bool,
@@ -442,10 +533,12 @@ pub struct ReloadConfig {
 
 impl Default for ReloadConfig {
     /// 业务作用: 返回适合本地文件和 ConfigMap 符号链接轮换的安全热更新默认值。
+    /// 参数说明: 无。
+    /// 返回: 使用框架默认补读周期、两次稳定观察和一分钟事务预算的策略。
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_ms: 1_000,
+            poll_interval_ms: nasa::application::DEFAULT_CONFIG_POLL_INTERVAL_MS,
             stable_observations: 2,
             transaction_timeout_ms: 60_000,
         }
@@ -454,6 +547,7 @@ impl Default for ReloadConfig {
 
 impl ReloadConfig {
     /// 业务作用: 校验热更新轮询、防抖和事务超时，避免零间隔忙轮询或未防抖发布半写文件。
+    /// 参数说明: 无。
     ///
     /// 返回: 配置满足运行约束时返回成功，否则返回具体字段错误。
     fn validate(&self) -> anyhow::Result<()> {
@@ -466,9 +560,8 @@ impl ReloadConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.poll_interval_ms == 0 {
-            bail!("reload.poll_interval_ms must be > 0");
-        }
+        nasa::application::ConfigPoller::validate_interval(self.poll_interval_ms)
+            .context("invalid reload.poll_interval_ms")?;
         if self.stable_observations < 2 {
             bail!("reload.stable_observations must be >= 2");
         }
@@ -491,7 +584,7 @@ pub struct ReplicationHaConfig {
     /// 是否允许在 fencing 和 coordinator 门禁满足后自动提升副本。
     pub auto_failover: bool,
     /// 观察者模式：只探测并跟随已经证明收敛的主节点，绝不发送任何后端控制命令
-    /// （不切主、不降级归队旧主、不修复副本漂移、不做持久化编排）；主故障、
+    /// （不切主、不降级归队旧主、不纠正副本漂移、不做持久化编排）；主故障、
     /// 未确认新主或双主时关闭路由。手动拓扑接口一并拒绝，隐含
     /// `auto_failover=false`。该字段只限制 HA 控制面；旁路业务只读还需 `read_only=true`。
     pub observer: bool,
@@ -568,7 +661,7 @@ pub struct ReplicationHaCoordinatorConfig {
     /// 独立 Redis 租约服务的可选 ACL 用户名。
     pub redis_username: Option<String>,
     /// 独立 Redis 租约服务的可选认证密码。
-    pub redis_password: Option<String>,
+    pub redis_password: Option<SecretText>,
     /// 同一 HA 拓扑共享的独立 Redis 租约键。
     pub redis_key: Option<String>,
     /// 独立 Redis 租约服务建连超时，单位为毫秒。
@@ -781,6 +874,15 @@ impl Default for RedisHaAofConfig {
 #[serde(deny_unknown_fields)]
 // 表示 ProxyItem 的数据结构，用于加载、解析和校验 narix 配置。
 pub struct ProxyItem {
+    /// 随运行代持有的安全材料，不接受外部配置直接注入。
+    #[serde(skip)]
+    pub(crate) materials: Arc<Materials>,
+    /// 候选准备时完成的后端 TLS 配置，连接建立时只克隆句柄。
+    #[serde(skip)]
+    pub(crate) backend_tls_prepared: Option<Arc<rustls::ClientConfig>>,
+    /// Sentinel 使用独立身份和信任根，不能复用业务节点的 TLS 配置。
+    #[serde(skip)]
+    pub(crate) sentinel_tls_prepared: Option<Arc<rustls::ClientConfig>>,
     /// 代理项唯一名称，用于日志、指标、状态和协调分组。
     pub name: String,
     /// 后端产品兼容档案；省略时为兼容旧配置默认使用 Redis。
@@ -815,7 +917,7 @@ pub struct ProxyItem {
     /// 访问 Sentinel 控制节点时使用的 ACL 用户名。
     pub sentinel_username: Option<String>,
     /// 访问 Sentinel 控制节点时使用的认证密码。
-    pub sentinel_password: Option<String>,
+    pub sentinel_password: Option<SecretText>,
     /// 是否使用 RESP over TLS 连接 Sentinel 控制节点。
     #[serde(default)]
     pub sentinel_tls_enabled: bool,
@@ -841,9 +943,9 @@ pub struct ProxyItem {
     /// 后端 ACL 用户名；空值表示只使用密码或后端无需认证。
     pub username: Option<String>,
     /// 代理访问后端节点时使用的密码。
-    pub password: Option<String>,
+    pub password: Option<SecretText>,
     /// 代理验证业务客户端时使用的前端密码。
-    pub frontend_password: Option<String>,
+    pub frontend_password: Option<SecretText>,
     /// 节点代理模式向 Redis Cluster 客户端统一公布的主机地址。
     pub cluster_node_advertise_host: Option<String>,
     /// 节点代理模式的一对一后端、监听和公布地址配置。
@@ -997,6 +1099,7 @@ pub enum HaFencingMode {
 
 impl HaFencingMode {
     /// 业务作用: 将 fencing 模式输出为配置和状态接口使用的稳定字符串。
+    ///
     /// 返回: 与 yml 配置值一致的模式名称。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1059,20 +1162,23 @@ impl HaPersistencePolicy {
 impl ProxyConfig {
     /// 业务作用: 从默认内置配置、可选外部配置和环境变量加载最终 proxy 配置。
     /// 参数说明:
-    /// - `external_config`: 外部 yml/json/toml 配置路径；为空时只使用内置配置和环境变量覆盖。
+    /// - `external_config`: 外部 yml/json/toml 配置路径；为空时依次采用 `APP_CONFIG_FILE`、`NARIX_CONFIG`。
     ///
     /// 返回: 反序列化后的强类型配置；读取、合并、占位符解析或 schema 失败时返回错误。
     pub fn load(external_config: Option<&str>) -> anyhow::Result<Self> {
-        let base_file = default_application_path();
-        Self::load_from_path(&base_file, external_config)
+        Ok(crate::reload::ConfigSource::from_external(external_config)
+            .load()?
+            .config()
+            .as_ref()
+            .clone())
     }
 
-    /// 业务作用: 从指定 base 配置加载最终配置，主要供测试和自定义部署入口复用。
+    /// 业务作用: 从指定 base 配置加载可运行配置，供自定义部署入口复用。
     /// 参数说明:
     /// - `base_file`: base 配置文件路径，profile 文件会以该路径规则派生。
     /// - `external_config`: 外部覆盖配置路径；同名 proxy 按业务 identity 合并。
     ///
-    /// 返回: 反序列化后的强类型配置。
+    /// 返回: 完成领域校验和凭据、TLS 准备的强类型配置；候选不完整时拒绝加载。
     pub fn load_from(base_file: &str, external_config: Option<&str>) -> anyhow::Result<Self> {
         Self::load_from_path(Path::new(base_file), external_config)
     }
@@ -1088,8 +1194,8 @@ impl ProxyConfig {
         base_file: &Path,
         external_config: Option<&str>,
     ) -> anyhow::Result<(Self, Value)> {
-        let tree = Self::load_effective_tree(base_file, external_config)?;
-        let config = serde_json::from_value(tree.clone()).with_context(|| {
+        let (tree, source_paths) = Self::load_effective_tree(base_file, external_config)?;
+        let mut config: Self = serde_json::from_value(tree.clone()).with_context(|| {
             if let Some(path) = external_config {
                 format!(
                     "deserialize config from base `{}` with external overlay `{path}`",
@@ -1099,6 +1205,7 @@ impl ProxyConfig {
                 format!("deserialize config from base `{}`", base_file.display())
             }
         })?;
+        config.source_paths = source_paths;
         Ok((config, tree))
     }
 
@@ -1107,9 +1214,13 @@ impl ProxyConfig {
     /// - `base_file`: base 配置文件路径。
     /// - `external_config`: 外部覆盖配置路径；空字符串会被忽略。
     ///
-    /// 返回: 最终强类型配置；错误上下文会带上 base 和 external 路径，便于定位配置来源。
+    /// 返回: 经过领域校验且持有同代材料与 TLS 句柄的强类型配置；准备失败不返回半成品。
     fn load_from_path(base_file: &Path, external_config: Option<&str>) -> anyhow::Result<Self> {
-        Self::load_effective_from(base_file, external_config).map(|(config, _)| config)
+        let source = crate::reload::ConfigSource::new(
+            base_file.to_path_buf(),
+            external_config.map(PathBuf::from),
+        );
+        Ok(source.load()?.config().as_ref().clone())
     }
 
     /// 业务作用: 按固定优先级合并全部配置来源并解析占位符，生成热更新比较使用的有效配置树。
@@ -1122,30 +1233,46 @@ impl ProxyConfig {
     fn load_effective_tree(
         base_file: &Path,
         external_config: Option<&str>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<(Value, Vec<PathBuf>)> {
         let external_config = external_config
             .map(str::trim)
             .filter(|path| !path.is_empty());
-        let mut tree = load_config_tree(base_file, false)
-            .with_context(|| format!("read base config from `{}`", base_file.display()))?;
-        let profiled_tree = load_config_tree(base_file, true)
+        let variables = crate::infrastructure::configuration::environment_variables()?;
+        let environment = EnvironmentSnapshot::from_pairs(variables.iter().cloned())?;
+        let mut source_paths = Vec::new();
+        let mut tree = load_config_tree(base_file, &environment, &mut source_paths)
             .with_context(|| format!("read base/profile config from `{}`", base_file.display()))?;
-        merge_config_value(&mut tree, profiled_tree, MergePolicy::ExpectedState);
 
         if let Some(path) = external_config {
-            let external = load_config_tree(Path::new(path), true)
+            let external = load_config_tree(Path::new(path), &environment, &mut source_paths)
                 .with_context(|| format!("read external config overlay from `{path}`"))?;
             merge_config_value(&mut tree, external, MergePolicy::ExpectedState);
         }
 
-        if let Some(env_tree) = narix_env_tree()? {
+        if let Some(env_tree) = narix_env_tree_from_iter(variables)? {
             merge_config_value(&mut tree, env_tree, MergePolicy::AllowIndexFallback);
         }
-        resolve_placeholders(&mut tree)?;
-        Ok(tree)
+        let log = tree
+            .as_object_mut()
+            .context("configuration root must be an object")?
+            .entry("log")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .context("log configuration must be an object")?;
+        if let Some(level) = environment.get("RUST_LOG")? {
+            log.insert("level".to_string(), Value::String(level.to_string()));
+        } else {
+            log.entry("level")
+                .or_insert_with(|| Value::String(DEFAULT_LOG_LEVEL.to_string()));
+        }
+        crate::infrastructure::configuration::resolve(&mut tree, &environment)?;
+        source_paths.sort();
+        source_paths.dedup();
+        Ok((tree, source_paths))
     }
 
     /// 业务作用: 校验最终配置能安全启动，避免空代理、重复名称、端口冲突或不安全认证策略进入运行时。
+    ///
     /// 返回: 全部配置满足约束时返回成功；任一 listener 或管理端配置非法时 fail-fast。
     pub fn validate(&self) -> anyhow::Result<()> {
         self.admin.validate()?;
@@ -1333,14 +1460,21 @@ pub(crate) fn default_application_path() -> PathBuf {
 /// 业务作用: 加载 配置加载、覆盖合并、环境变量映射和启动前校验 所需数据，并按覆盖优先级或来源差异合并成统一运行视图。
 /// 参数说明:
 /// - `path`: 文件路径或 HTTP 路径，决定本次读取、写入或请求的目标位置。
-/// - `include_profile`: 是否加载配置档覆盖层，用于区分完整启动加载与单文件解析。
+/// - `environment`: 本轮加载固定的环境快照，用于选择 profile。
+/// - `source_paths`: 记录本次实际加载的文件，供候选摘要和来源观察复用。
 ///
 /// 返回: 配置读取和合并成功时返回 YAML 树；文件、语法或结构非法时返回错误。
-fn load_config_tree(path: &Path, include_profile: bool) -> anyhow::Result<Value> {
+fn load_config_tree(
+    path: &Path,
+    environment: &EnvironmentSnapshot,
+    source_paths: &mut Vec<PathBuf>,
+) -> anyhow::Result<Value> {
+    source_paths.push(path.to_path_buf());
     let mut tree = load_required_config_file(path)
         .with_context(|| format!("read config file `{}`", path.display()))?;
-    if include_profile {
-        if let Some(profile_file) = profile_file_for_base(path)? {
+    {
+        if let Some(profile_file) = profile_file_for_base(path, environment)? {
+            source_paths.push(profile_file.clone());
             let profile_tree = load_required_config_file(&profile_file)
                 .with_context(|| format!("read profile config `{}`", profile_file.display()))?;
             merge_config_value(&mut tree, profile_tree, MergePolicy::ExpectedState);
@@ -1356,13 +1490,18 @@ fn load_config_tree(path: &Path, include_profile: bool) -> anyhow::Result<Value>
 /// 返回: 文件解析后的通用配置树；格式未知、文件缺失或语法错误时返回明确上下文。
 fn load_required_config_file(path: &Path) -> anyhow::Result<Value> {
     let format = config_file_format(path)?;
-    let source = File::from(path).format(format);
-    let tree = ConfigSource::builder()
-        .add_source(source)
-        .build()
+    use std::io::Read;
+    let policy = crate::infrastructure::configuration::policy();
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(policy.limits.source_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let document = SourceDocument::new(path.to_string_lossy(), format, bytes);
+    let tree = document
+        .parse(0, &policy)
         .with_context(|| format!("parse config file `{}`", path.display()))?
-        .try_deserialize::<Value>()
-        .with_context(|| format!("convert config file `{}` into JSON tree", path.display()))?;
+        .tree()
+        .clone();
     // 唯一性必须在单个来源进入跨层合并前检查。否则同一文件中两个同名代理会被误判成
     // “高优先级覆盖低优先级”，后一个元素递归覆盖前一个元素，最终强类型校验已经看不到重复项。
     validate_source_array_identities(&tree)
@@ -1441,7 +1580,7 @@ fn validate_array_identity(
 /// 参数说明:
 /// - `path`: 配置文件路径；扩展名为空时兼容历史行为并默认 YAML。
 ///
-/// 返回: `config` crate 使用的文件格式枚举。
+/// 返回: naml 使用的文件格式枚举。
 fn config_file_format(path: &Path) -> anyhow::Result<FileFormat> {
     match path
         .extension()
@@ -1462,11 +1601,15 @@ fn config_file_format(path: &Path) -> anyhow::Result<FileFormat> {
 /// 业务作用: 根据基础配置路径和 profile 名推导同目录的覆盖文件路径。
 /// 参数说明:
 /// - `path`: 文件路径或 HTTP 路径，决定本次读取、写入或请求的目标位置。
+/// - `environment`: 本轮固定的环境快照，提供 NARIX_PROFILE。
 ///
 /// 返回: `NARIX_PROFILE` 为空或派生文件不存在时返回 `None`，避免未配置 profile 阻塞启动。
-fn profile_file_for_base(path: &Path) -> anyhow::Result<Option<PathBuf>> {
-    let profile = match std::env::var(NARIX_PROFILE_ENV) {
-        Ok(value) if !value.trim().is_empty() => value,
+fn profile_file_for_base(
+    path: &Path,
+    environment: &EnvironmentSnapshot,
+) -> anyhow::Result<Option<PathBuf>> {
+    let profile = match environment.get(NARIX_PROFILE_ENV)? {
+        Some(value) if !value.trim().is_empty() => value,
         _ => return Ok(None),
     };
     let stem = path
@@ -1482,112 +1625,6 @@ fn profile_file_for_base(path: &Path) -> anyhow::Result<Option<PathBuf>> {
         _ => PathBuf::from(file_name),
     };
     Ok(candidate.exists().then_some(candidate))
-}
-
-/// 业务作用: 解析并替换 `${path.to.field}` 占位符，使外部覆盖配置可以复用已经合并出的基础配置值。
-/// 参数说明:
-/// - `tree`: 已完成 base/profile/external/env 合并的配置树，会被原地更新。
-///
-/// 返回: 所有占位符解析成功时返回成功；引用不存在、引用非标量或递归过深时 fail-fast。
-fn resolve_placeholders(tree: &mut Value) -> anyhow::Result<()> {
-    for _ in 0..PLACEHOLDER_MAX_PASSES {
-        let before = tree.clone();
-        let root = before.clone();
-        resolve_placeholders_once(tree, &root)?;
-        if *tree == before {
-            return Ok(());
-        }
-    }
-    bail!(
-        "config placeholder resolution exceeded {PLACEHOLDER_MAX_PASSES} passes; check for cycles"
-    )
-}
-
-/// 业务作用: 单轮扫描配置树并替换字符串中的占位符，供外层多轮解析处理嵌套引用。
-/// 参数说明:
-/// - `value`: 当前正在处理的配置子树。
-/// - `root`: 本轮解析使用的完整配置快照。
-///
-/// 返回: 本轮处理成功时返回成功。
-fn resolve_placeholders_once(value: &mut Value, root: &Value) -> anyhow::Result<()> {
-    match value {
-        Value::Object(map) => {
-            for child in map.values_mut() {
-                resolve_placeholders_once(child, root)?;
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                resolve_placeholders_once(child, root)?;
-            }
-        }
-        Value::String(text) => {
-            *text = resolve_placeholders_in_string(text, root)?;
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    }
-    Ok(())
-}
-
-/// 业务作用: 替换单个字符串内的一个或多个 `${...}` 引用，保持普通文本片段原样。
-/// 参数说明:
-/// - `text`: 待解析的配置字符串。
-/// - `root`: 完整配置树，用于按点分路径查找引用值。
-///
-/// 返回: 替换后的字符串。
-fn resolve_placeholders_in_string(text: &str, root: &Value) -> anyhow::Result<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after_start = &rest[start + 2..];
-        let Some(end) = after_start.find('}') else {
-            bail!("config placeholder `{text}` is missing closing `}}`");
-        };
-        let path = after_start[..end].trim();
-        if path.is_empty() {
-            bail!("config placeholder `{text}` contains an empty path");
-        }
-        out.push_str(&placeholder_scalar(root, path)?);
-        rest = &after_start[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
-/// 业务作用: 从配置树读取占位符引用的标量值，并转换为可嵌入配置字符串的文本。
-/// 参数说明:
-/// - `root`: 完整配置树。
-/// - `path`: 以点号分隔的引用路径，数组下标用十进制数字表示。
-///
-/// 返回: 字符串、数字或布尔值的文本表示；对象、数组和空值不允许作为字符串占位符。
-fn placeholder_scalar(root: &Value, path: &str) -> anyhow::Result<String> {
-    let mut current = root;
-    for segment in path.split('.') {
-        current = match current {
-            Value::Object(map) => map
-                .get(segment)
-                .with_context(|| format!("config placeholder `${{{path}}}` not found"))?,
-            Value::Array(items) => {
-                let index = segment.parse::<usize>().with_context(|| {
-                    format!("config placeholder `${{{path}}}` array index `{segment}`")
-                })?;
-                items
-                    .get(index)
-                    .with_context(|| format!("config placeholder `${{{path}}}` not found"))?
-            }
-            _ => bail!("config placeholder `${{{path}}}` crosses a non-container value"),
-        };
-    }
-    match current {
-        Value::String(value) => Ok(value.clone()),
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
-        Value::Null => bail!("config placeholder `${{{path}}}` references null"),
-        Value::Array(_) | Value::Object(_) => {
-            bail!("config placeholder `${{{path}}}` references a non-scalar value")
-        }
-    }
 }
 
 /// 业务作用: 区分配置数组整体替换与按稳定标识合并两种覆盖语义。
@@ -1986,13 +2023,6 @@ const fn field(env: &'static str, key: &'static str, kind: EnvValueKind) -> Fiel
     FieldSpec { env, key, kind }
 }
 
-/// 业务作用: 把 NARIX 环境变量构造成配置覆盖树，供统一合并流程复用。
-/// 参数说明: 无。
-/// 返回: 存在有效环境覆盖时返回配置树，没有匹配变量时返回空；键或值非法时返回错误。
-fn narix_env_tree() -> anyhow::Result<Option<Value>> {
-    narix_env_tree_from_iter(std::env::vars())
-}
-
 /// 业务作用: 从任意环境变量迭代器构造 NARIX 配置覆盖树，保证真实进程环境与受控输入遵循同一规则。
 /// 参数说明:
 /// - `vars`: 已收集的环境变量列表，应用前按配置路径进行排序和类型解析。
@@ -2045,6 +2075,29 @@ fn is_narix_control_env(rest: &str) -> bool {
 ///
 /// 返回: 环境变量后缀唯一匹配时返回配置路径和值类型；未知、歧义或截断时返回错误。
 fn parse_narix_env_path(rest: &str) -> anyhow::Result<(Vec<PathSegment>, EnvValueKind)> {
+    if let Some(log_rest) = rest.strip_prefix("LOG_") {
+        let fields = [
+            field("LEVEL", "level", EnvValueKind::String),
+            field("PATH", "path", EnvValueKind::String),
+            field("MAX_FILE_SIZE", "max_file_size", EnvValueKind::String),
+            field("TOTAL_SIZE_CAP", "total_size_cap", EnvValueKind::String),
+            field("MAX_HISTORY_DAYS", "max_history_days", EnvValueKind::U64),
+            field(
+                "CLEAN_HISTORY_ON_START",
+                "clean_history_on_start",
+                EnvValueKind::Bool,
+            ),
+            field("SPLIT_ERROR_FILE", "split_error_file", EnvValueKind::Bool),
+            field("COLOR", "color", EnvValueKind::Bool),
+            field("PATTERN", "pattern", EnvValueKind::String),
+        ];
+        let Some(field) = match_field(log_rest, &fields)? else {
+            bail!("unsupported log field `{log_rest}`");
+        };
+        let mut path = vec![PathSegment::Key("log")];
+        append_field_path(&mut path, field);
+        return Ok((path, field.kind));
+    }
     if let Some(admin_rest) = rest.strip_prefix("ADMIN_") {
         let Some(field) = match_field(admin_rest, ADMIN_FIELDS)? else {
             bail!("unsupported admin field `{admin_rest}`");
@@ -2269,6 +2322,7 @@ fn empty_value_for_next(next: &PathSegment) -> Value {
 
 impl AdminConfig {
     /// 业务作用: 校验管理监听和认证组合，禁止启用管理端却既无令牌也未显式允许匿名访问。
+    ///
     /// 返回: 全部配置结构和安全约束满足时返回成功；首个非法字段或冲突返回带路径错误。
     fn validate(&self) -> anyhow::Result<()> {
         if !self.enabled {
@@ -2888,6 +2942,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 计算 listener 的实际前端认证模式，兼容旧配置同时让显式 `auth_mode` 优先。
+    ///
     /// 返回: 显式配置优先；存在 `frontend_password` 时默认 terminate；否则默认 backend-inject。
     // 保留未显式配置 auth_mode 的兼容推导；一旦显式配置就不得再由密码字段改写语义。
     pub fn effective_auth_mode(&self) -> AuthMode {
@@ -2899,6 +2954,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 生成当前 proxy listener 的绑定地址。
+    ///
     /// 返回: `listen_host:listen` 格式的地址字符串。
     // 地址合法性在统一 validate 阶段处理，此处只生成稳定的冲突检测键。
     pub fn bind_addr(&self) -> String {
@@ -2906,6 +2962,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 展开一个 proxy item 实际会绑定的所有监听地址，用于启动前端口冲突检测。
+    ///
     /// 返回: 普通模式返回单个 listener；cluster-node-proxy 返回所有子节点 listener。
     // cluster-node-proxy 没有父级业务 listener，必须展开全部子 listener，避免漏报端口冲突。
     pub fn listen_addrs(&self) -> anyhow::Result<Vec<String>> {
@@ -2920,6 +2977,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 生成固定后端地址，用于 standalone 和固定上游代理模式。
+    ///
     /// 返回: `host:port` 字符串；缺少 host 或 port 时带 proxy name 返回错误。
     // 在拼接前分别拒绝缺失字段，使错误能精确指出当前 proxy 的 host 或 port。
     pub fn backend_addr(&self) -> anyhow::Result<String> {
@@ -2966,6 +3024,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 解析 Redis Cluster seed 列表，并在启动前校验每个 seed 都是合法 `host:port`。
+    ///
     /// 返回: 清理空白后的 seed 地址列表；空列表、非法端口或空 host 返回错误。
     // seed 在启动前逐项校验，避免把格式错误延迟到后台拓扑刷新后才暴露。
     pub fn cluster_nodes(&self) -> anyhow::Result<Vec<String>> {
@@ -3009,6 +3068,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 解析通用节点列表，供 cluster 和 replication-ha 等多节点模式复用。
+    ///
     /// 返回: 非空节点 token 列表；缺少配置或解析后为空时返回错误。
     // 这里只保留配置顺序并过滤空项；产品特定地址语义由后续模式校验负责。
     pub fn node_tokens(&self) -> anyhow::Result<Vec<String>> {
@@ -3029,6 +3089,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 读取 cluster-node-proxy 子 listener 配置，确保节点级一对一代理不会以空列表启动。
+    ///
     /// 返回: 子节点代理配置切片；缺少或为空时返回带 proxy name 的错误。
     // 空子列表不能退化成一个没有 listener 的“成功启动”代理项。
     pub fn cluster_node_proxies(&self) -> anyhow::Result<&[ClusterNodeProxyItem]> {
@@ -3048,6 +3109,7 @@ impl ProxyItem {
     }
 
     /// 业务作用: 校验单代理的模式、产品能力、认证、监听、资源限制以及 HA 安全约束。
+    ///
     /// 返回: 全部配置结构和安全约束满足时返回成功；首个非法字段或冲突返回带路径错误。
     fn validate(&self, coordination_enabled: bool) -> anyhow::Result<()> {
         if self.name.trim().is_empty() {
@@ -3556,10 +3618,10 @@ fn is_loopback_listen_host(host: &str) -> bool {
 /// 参数说明:
 /// - `value`: 待写入、解析或比较的业务值。
 ///
-fn option_has_text(value: &Option<String>) -> bool {
+fn option_has_text<T: AsRef<str>>(value: &Option<T>) -> bool {
     value
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+        .as_ref()
+        .is_some_and(|value| !value.as_ref().trim().is_empty())
 }
 
 /// 业务作用: 校验 RESP TLS 客户端配置，保证加密启用时始终执行证书身份校验，并约束 mTLS 材料成对出现。

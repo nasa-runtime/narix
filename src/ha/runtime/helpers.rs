@@ -1,4 +1,37 @@
 impl ReplicationHaRuntime {
+    /// 业务作用: 串行取得当前运行代的控制动作入口，并复验等待期间未发生退休或资源异常。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 之前的租约释放完成且运行代有效时返回互斥守卫；退休或收尾异常时拒绝动作。
+    async fn acquire_operation(&self) -> anyhow::Result<tokio::sync::MutexGuard<'_, ()>> {
+        let operation = self.failover_lock.lock().await;
+        // 请求可能在退休前入队、退休后才取得锁；必须在等待之后重新验证代次权威。
+        self.ensure_not_retired("after acquiring the HA operation lock")?;
+        // 在开始新动作前释放上一动作的续期任务与控制连接；独立租约令牌另行隔离服务端迟到命令。
+        self.cleanup_tasks.drain_current().await?;
+        self.ensure_not_retired("after waiting for previous HA lease cleanup")?;
+        Ok(operation)
+    }
+
+    /// 业务作用: 在运行代退休后等待在途手动动作交还互斥权，再等待租约续期停止和释放完成。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 退休状态下所有已接纳收尾成功时返回成功；活动运行代或收尾失败时拒绝正常关闭结论。
+    pub(crate) async fn finish_control_cleanup(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_retired(), "HA runtime must retire before cleanup");
+        // 后台调和已退出，但管理请求仍可能持有动作锁；先等待其守卫析构，再封闭收尾入口。
+        let _operation = self.failover_lock.lock().await;
+        self.cleanup_tasks.finish().await
+    }
+
+    /// 业务作用: 将租约收尾异常纳入当前运行代健康检查，防止控制资源失败被后台日志掩盖。
+    /// 参数说明: 无。
+    ///
+    /// 返回: 未观察到收尾异常时成功，否则由调用方退休运行代并触发进程关闭。
+    pub(crate) fn check_control_cleanup(&self) -> anyhow::Result<()> {
+        self.cleanup_tasks.check()
+    }
+
     /// 业务作用: 将当前运行代标记为已退休；置位后所有新的后端控制副作用都会被拒绝。
     pub(crate) fn mark_retired(&self) {
         self.generation_guard.mark_retired();
@@ -59,10 +92,8 @@ impl ReplicationHaRuntime {
             .coordinator
             .lease_ttl_ms
             .max(self.probe_interval_ms.saturating_mul(10));
-        self.automatic_retry_not_before_ms.store(
-            now_ms().saturating_add(retry_delay_ms),
-            Ordering::Relaxed,
-        );
+        self.automatic_retry_not_before_ms
+            .store(now_ms().saturating_add(retry_delay_ms), Ordering::Relaxed);
     }
 
     /// 业务作用: 校验当前运行时不是观察者，观察者统一拒绝一切拓扑改写入口。
@@ -86,22 +117,23 @@ impl ReplicationHaRuntime {
 /// 参数说明:
 /// - `proxy_name`: 目标代理项名称，用于在同进程多代理中选择唯一运行时。
 ///
-fn default_coordinator_owner_id(proxy_name: &str) -> String {
+/// 返回: 包含独立随机身份的 owner；系统随机源不可用时拒绝构造，不能复用旧实例身份。
+fn default_coordinator_owner_id(proxy_name: &str) -> anyhow::Result<String> {
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
         .filter(|host| !host.trim().is_empty())
         .unwrap_or_else(|| "unknown-host".to_string());
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{proxy_name}:{host}:{}:{nonce}", std::process::id())
+    let nonce = crate::infrastructure::identity::instance_nonce()?;
+    Ok(format!(
+        "{proxy_name}:{host}:{}:{nonce}",
+        std::process::id()
+    ))
 }
 
 /// 业务作用: 把 replication HA 主从探活、受控切换、租约互斥和持久化编排 的内部状态渲染成外部命令、指标、文件内容或日志可读文本。
 /// 参数说明:
-/// - `nodes`: 节点集合，用于拓扑发现、候选选择、批量验证或测试环境清理。
+/// - `nodes`: 待按原顺序汇总客户端地址的 HA 节点集合。
 ///
 // 格式化 format_node_addrs 输出，用于对外呈现维护 replication HA 主从拓扑、探测状态和切主控制结果。
 fn format_node_addrs(nodes: &[HaNode]) -> String {
@@ -274,12 +306,11 @@ fn compare_persistence_candidate_rank(
     left: &(ReplicaCandidate, u64),
     right: &(ReplicaCandidate, u64),
 ) -> std::cmp::Ordering {
-    (left.1, left.0.node.client_addr.as_str())
-        .cmp(&(right.1, right.0.node.client_addr.as_str()))
+    (left.1, left.0.node.client_addr.as_str()).cmp(&(right.1, right.0.node.client_addr.as_str()))
 }
 
 /// 业务作用: 共享 failover outcome 只能在目标是本轮唯一健康主节点时作为路由收敛证据。
-/// 仍存在旧主或第三个主节点时必须先保持保护并完成双主修复，不能仅凭一个仍在
+/// 仍存在旧主或第三个主节点时必须先保持保护并完成双主收敛，不能仅凭一个仍在
 /// TTL 内的历史结果重新开放数据面。
 fn failover_outcome_matches_unique_master(masters: &[HaNode], outcome_master: &str) -> bool {
     matches!(masters, [master] if master.client_addr == outcome_master)
@@ -549,12 +580,4 @@ fn update_group_config_digest(hasher: &mut Sha256, name: &str, value: &[u8]) {
     hasher.update(name.as_bytes());
     hasher.update((value.len() as u64).to_be_bytes());
     hasher.update(value);
-}
-
-/// 业务作用: 把操作开始时刻转换为饱和 u64 微秒耗时指标。
-/// 参数说明:
-/// - `started`: 操作开始的单调时钟时间点，用于计算耗时且不受系统时钟回拨影响。
-///
-fn elapsed_micros(started: Instant) -> u64 {
-    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
 }

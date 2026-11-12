@@ -1,7 +1,7 @@
+use crate::infrastructure::time::display_millis as now_epoch_ms;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::RwLock;
@@ -414,14 +414,4 @@ fn finish_snapshot(snapshot: &mut ReloadSnapshot, result: ReloadResultKind, erro
     snapshot.phase = ReloadPhase::Idle;
     snapshot.last_result = Some(result);
     snapshot.last_error = error;
-}
-
-/// 业务作用: 返回当前 Unix 时间的毫秒值，系统时钟早于纪元时安全返回零。
-///
-/// 返回: 可供状态排序和持续时间计算的 Unix 毫秒时间。
-fn now_epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }

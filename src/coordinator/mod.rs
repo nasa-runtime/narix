@@ -1,6 +1,6 @@
 /// 业务作用: 收纳协议文件生成的 gRPC 消息与服务定义；业务模块只通过该命名空间访问线上的稳定字段编号。
 pub mod wire {
-    tonic::include_proto!("narix.coordinator.v1");
+    nasa::grpc::include_proto!("narix.coordinator.v1");
 }
 
 /// 协调成员 RPC 客户端、静态身份和超时边界。
@@ -32,12 +32,6 @@ openraft::declare_raft_types!(
 
 /// 业务作用: 固定多数派共识运行时类型，供网络服务、业务句柄和进程生命周期共享同一实例。
 pub type CoordinatorRaft = openraft::Raft<CoordinatorTypeConfig>;
-
-/// 协调 gRPC 最大消息尺寸。
-///
-/// 集群配置正文上限为 16 MiB；共识快照还会把该正文包进 JSON 信封。该上限只控制
-/// 实际收到的单条消息，不会在建连时预分配同等内存。
-pub(crate) const MAX_COORDINATION_GRPC_MESSAGE_BYTES: usize = 192 * 1024 * 1024;
 
 /// 业务作用: 对所有成员必须一致的协调参数生成稳定摘要，防止超时、证书身份表或隔离策略不同的节点互相交换协议状态。
 /// 参数说明:
@@ -86,6 +80,36 @@ pub(crate) fn cluster_configuration_digest(config: &ProxyClusterCoordinationConf
     ];
     for (name, value) in fields {
         update_configuration_digest(&mut hasher, name, value.as_bytes());
+    }
+
+    // 默认传输预算沿用既有集群身份，保证升级后仍能读取原创世状态。
+    // 自定义预算必须绑定到成员协议身份，阻止不同消息容量或期限的节点交换共识状态。
+    if config.grpc != crate::config::CoordinationGrpcConfig::default() {
+        for (name, value) in [
+            (
+                "grpc.message_size_ceiling_bytes",
+                config.grpc.message_size_ceiling_bytes as u64,
+            ),
+            (
+                "grpc.unary_timeout_ceiling_ms",
+                config.grpc.unary_timeout_ceiling_ms,
+            ),
+            (
+                "grpc.max_message_bytes",
+                config.grpc.max_message_bytes as u64,
+            ),
+            ("grpc.unary_timeout_ms", config.grpc.unary_timeout_ms),
+            (
+                "grpc.max_inflight_message_bytes",
+                config.grpc.max_inflight_message_bytes as u64,
+            ),
+            (
+                "grpc.managed_memory_budget_bytes",
+                config.grpc.managed_memory_budget_bytes as u64,
+            ),
+        ] {
+            update_configuration_digest(&mut hasher, name, value.to_string().as_bytes());
+        }
     }
 
     let mut peers = config.peers.iter().collect::<Vec<_>>();

@@ -2,6 +2,118 @@ use std::ops::Range;
 
 use anyhow::{bail, Context};
 
+/// 业务作用: 紧凑保存常见命令的参数边界，较长命令及超大偏移保留完整地址宽度。
+#[derive(Debug, Clone)]
+pub(crate) enum CommandArgRanges {
+    Inline { ranges: [[u32; 2]; 3], len: u8 },
+    Heap(Vec<Range<usize>>),
+}
+
+impl Default for CommandArgRanges {
+    /// 业务作用: 创建尚无参数的命令元数据，不预先占用堆空间。
+    /// 参数说明: 无。
+    /// 返回: 空的内联参数集合，后续只在容量或地址宽度超限时转为堆存储。
+    fn default() -> Self {
+        Self::Inline {
+            ranges: [[0; 2]; 3],
+            len: 0,
+        }
+    }
+}
+
+impl CommandArgRanges {
+    /// 业务作用: 查询命令参数数量，供命令分类和参数限制校验使用。
+    /// 参数说明: 无。
+    /// 返回: 已完整解析的参数数量。
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => usize::from(*len),
+            Self::Heap(ranges) => ranges.len(),
+        }
+    }
+
+    /// 业务作用: 识别无参数帧，避免把空命令提交到后端。
+    /// 参数说明: 无。
+    /// 返回: 尚无参数时为 true。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 业务作用: 读取指定参数的完整地址区间，供路由和命令改写借用原始内容。
+    /// 参数说明:
+    /// - `index`: 参数在命令中的位置，零表示命令名称。
+    ///
+    /// 返回: 下标有效时返回原始区间，否则返回 None；不截断大地址偏移。
+    pub(crate) fn get(&self, index: usize) -> Option<Range<usize>> {
+        match self {
+            Self::Inline { ranges, len } => {
+                if index >= usize::from(*len) {
+                    return None;
+                }
+                let [start, end] = ranges[index];
+                Some(start as usize..end as usize)
+            }
+            Self::Heap(ranges) => ranges.get(index).cloned(),
+        }
+    }
+
+    /// 业务作用: 按客户端顺序遍历参数边界，统一紧凑和完整地址表示的校验口径。
+    /// 参数说明: 无。
+    /// 返回: 无额外堆分配的区间迭代器，不改变已保存的命令元数据。
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = Range<usize>> + '_ {
+        (0..self.len()).map(|index| match self {
+            Self::Inline { ranges, .. } => {
+                let [start, end] = ranges[index];
+                start as usize..end as usize
+            }
+            Self::Heap(ranges) => ranges[index].clone(),
+        })
+    }
+
+    /// 业务作用: 追加已通过帧边界校验的参数，同时保留超大命令的完整偏移。
+    /// 参数说明:
+    /// - `range`: 参数相对原始命令起点的字节区间。
+    ///
+    /// 返回: 参数追加到集合；内联空间或地址宽度不足时迁移已有区间，不改变顺序。
+    fn push(&mut self, range: Range<usize>) {
+        match self {
+            Self::Inline { ranges, len }
+                if usize::from(*len) < ranges.len()
+                    && u32::try_from(range.start).is_ok()
+                    && u32::try_from(range.end).is_ok() =>
+            {
+                ranges[usize::from(*len)] = [range.start as u32, range.end as u32];
+                *len += 1;
+            }
+            Self::Inline { ranges, len } => {
+                // 超出紧凑表示时恢复完整地址宽度，不能把合法大帧的偏移截断后用于路由。
+                let mut heap = Vec::with_capacity(8);
+                heap.extend(
+                    ranges[..usize::from(*len)]
+                        .iter()
+                        .map(|&[start, end]| start as usize..end as usize),
+                );
+                heap.push(range);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(ranges) => ranges.push(range),
+        }
+    }
+}
+
+impl Extend<Range<usize>> for CommandArgRanges {
+    /// 业务作用: 接收共享 RESP 解析器输出的参数边界，避免为紧凑存储另写协议解析逻辑。
+    /// 参数说明:
+    /// - `ranges`: 按原始命令顺序提供的已解析参数区间。
+    ///
+    /// 返回: 全部区间依次追加，必要时自动使用完整地址宽度的堆存储。
+    fn extend<T: IntoIterator<Item = Range<usize>>>(&mut self, ranges: T) {
+        for range in ranges {
+            self.push(range);
+        }
+    }
+}
+
 // RESP 聚合值来自后端，不能信任其嵌套层数。限制为 128 层既远高于正常 Redis
 // 响应所需深度，又能保证递归解析不会被异常后端响应拖到线程栈溢出。
 const MAX_RESP_NESTING_DEPTH: usize = 128;
@@ -28,7 +140,7 @@ pub struct ParsedCommandRanges {
     pub consumed: usize,
 }
 
-/// 业务作用: 表示需要被理解或改写的 RESP 值，主要用于 Cluster 拓扑响应、管理接口测试和聚合命令结果。
+/// 业务作用: 表示需要被理解或改写的 RESP 值，主要用于 Cluster 拓扑响应改写和聚合命令结果。
 /// 分支说明: 分支覆盖 RESP2 常见类型和代理需要处理的 RESP3 map/set/push/null，未知类型在解析阶段 fail-fast。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -74,8 +186,34 @@ pub fn parse_command(input: &[u8]) -> anyhow::Result<Option<ParsedCommand>> {
 /// - `input`: 前端连接当前已读取但尚未消费的字节缓冲，返回区间都指向这段缓冲。
 ///
 /// 返回: 完整命令返回参数区间和消费长度；半包返回 `None`；协议错误返回错误。
-// 解析 parse_command_ranges 输入，用于支撑解析和编码 Redis RESP 协议帧。
 pub fn parse_command_ranges(input: &[u8]) -> anyhow::Result<Option<ParsedCommandRanges>> {
+    Ok(
+        parse_ranges(input)?.map(|(arg_ranges, consumed)| ParsedCommandRanges {
+            arg_ranges,
+            consumed,
+        }),
+    )
+}
+
+/// 业务作用: 为转发路径解析参数区间，使少量参数无需独立堆分配。
+/// 参数说明:
+/// - `input`: 当前未消费的前端缓冲，区间相对其中第一条命令起点计算。
+///
+/// 返回: 完整命令返回参数区间及消费长度；半包返回 `None`；协议错误不产生可转发命令。
+pub(crate) fn parse_compact_command_ranges(
+    input: &[u8],
+) -> anyhow::Result<Option<(CommandArgRanges, usize)>> {
+    parse_ranges(input)
+}
+
+/// 业务作用: 让公开解析接口与转发路径共享相同的协议校验和半包处理。
+/// 参数说明:
+/// - `input`: 当前未消费的前端协议缓冲。
+///
+/// 返回: 完整命令返回指定存储形态的参数区间及消费长度；半包或协议错误不会发布部分结果。
+fn parse_ranges<R: Default + Extend<Range<usize>>>(
+    input: &[u8],
+) -> anyhow::Result<Option<(R, usize)>> {
     if input.is_empty() {
         return Ok(None);
     }
@@ -154,7 +292,7 @@ fn attribute_frame_len(input: &[u8], remaining_depth: usize) -> anyhow::Result<O
     Ok(Some(pos))
 }
 
-/// 业务作用: 把一条完整 RESP 值解析成内部枚举，供需要理解响应结构的拓扑改写和测试断言使用。
+/// 业务作用: 把一条完整 RESP 值解析成内部枚举，供需要理解响应结构的拓扑改写和聚合处理使用。
 /// 参数说明:
 /// - `input`: 以 RESP 类型字节开头的未消费缓冲。
 ///
@@ -298,6 +436,7 @@ pub fn encode_value(value: &RespValue) -> Vec<u8> {
 
 /// 业务作用: 生成 Redis `+OK` 响应，用于本地处理 AUTH、SELECT 0、QUIT 等无需后端参与的命令。
 /// 参数说明: 无。
+///
 /// 返回: 静态 RESP 简单字符串字节。
 pub fn simple_ok() -> &'static [u8] {
     b"+OK\r\n"
@@ -305,6 +444,7 @@ pub fn simple_ok() -> &'static [u8] {
 
 /// 业务作用: 生成 Redis `+PONG` 响应，用于本地处理无参数 `PING`。
 /// 参数说明: 无。
+///
 /// 返回: 静态 RESP 简单字符串字节。
 pub fn pong() -> &'static [u8] {
     b"+PONG\r\n"
@@ -325,6 +465,7 @@ pub fn bulk(item: &[u8]) -> Vec<u8> {
 
 /// 业务作用: 生成 RESP2 null bulk，用于不存在的 key、聚合缺失值和兼容旧客户端。
 /// 参数说明: 无。
+///
 /// 返回: 静态 `$-1` 响应字节。
 pub fn null_bulk() -> &'static [u8] {
     b"$-1\r\n"
@@ -341,6 +482,7 @@ pub fn integer(value: i64) -> Vec<u8> {
 
 /// 业务作用: 生成 Redis 认证缺失错误，用于 terminate 模式下首条业务命令未认证的场景。
 /// 参数说明: 无。
+///
 /// 返回: 静态错误响应字节。
 pub fn noauth() -> &'static [u8] {
     b"-NOAUTH Authentication required.\r\n"
@@ -348,6 +490,7 @@ pub fn noauth() -> &'static [u8] {
 
 /// 业务作用: 生成 Redis 密码错误响应，保持客户端对认证失败的标准识别。
 /// 参数说明: 无。
+///
 /// 返回: 静态错误响应字节。
 pub fn wrongpass() -> &'static [u8] {
     b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
@@ -355,6 +498,7 @@ pub fn wrongpass() -> &'static [u8] {
 
 /// 业务作用: 生成 Redis 标准 `NOPROTO` 错误，用于明确拒绝当前代理模式不能完整兑现的协议版本。
 /// 参数说明: 无。
+///
 /// 返回: 静态协议版本不受支持错误字节。
 pub fn noproto() -> &'static [u8] {
     b"-NOPROTO unsupported protocol version\r\n"
@@ -447,6 +591,7 @@ pub fn scan_response(cursor: &[u8], items: &[Vec<u8>]) -> Vec<u8> {
 
 /// 业务作用: 生成默认 standalone 模式的 RESP3 `HELLO` 响应，供简单前端认证路径复用。
 /// 参数说明: 无。
+///
 /// 返回: 静态 RESP3 map 响应字节。
 pub fn hello3_response() -> &'static [u8] {
     b"%7\r\n+server\r\n+narix\r\n+version\r\n+1.0.0\r\n+proto\r\n:3\r\n+id\r\n:0\r\n+mode\r\n+standalone\r\n+role\r\n+master\r\n+modules\r\n*0\r\n"
@@ -481,6 +626,7 @@ pub fn hello3_response_for_server_mode(server: &str, mode: &str) -> Vec<u8> {
 
 /// 业务作用: 生成默认 standalone 模式的 RESP2 `HELLO` 响应，供只支持 RESP2 的客户端认证后使用。
 /// 参数说明: 无。
+///
 /// 返回: 静态 RESP2 array 响应字节。
 pub fn hello2_response() -> &'static [u8] {
     b"*14\r\n$6\r\nserver\r\n$5\r\nnarix\r\n$7\r\nversion\r\n$5\r\n1.0.0\r\n$5\r\nproto\r\n:2\r\n$2\r\nid\r\n:0\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n"
@@ -590,13 +736,14 @@ fn parse_array(input: &[u8]) -> anyhow::Result<Option<ParsedCommand>> {
 /// - `input`: 以 `*` 开头的 Redis 命令帧，参数必须都是非空 bulk string。
 ///
 /// 返回: 完整命令返回参数区间和消费长度；半包返回 `None`；非法 bulk 或 CRLF 返回错误。
-// 解析 parse_array_ranges 输入，用于支撑解析和编码 Redis RESP 协议帧。
-fn parse_array_ranges(input: &[u8]) -> anyhow::Result<Option<ParsedCommandRanges>> {
+fn parse_array_ranges<R: Default + Extend<Range<usize>>>(
+    input: &[u8],
+) -> anyhow::Result<Option<(R, usize)>> {
     let Some((line, mut pos)) = read_line(input, 1)? else {
         return Ok(None);
     };
     let count: usize = parse_usize(line).context("invalid array length")?;
-    let mut arg_ranges = Vec::new();
+    let mut arg_ranges = R::default();
 
     for _ in 0..count {
         if pos >= input.len() {
@@ -622,14 +769,11 @@ fn parse_array_ranges(input: &[u8]) -> anyhow::Result<Option<ParsedCommandRanges
         if &input[data_end..crlf_end] != b"\r\n" {
             bail!("invalid bulk string terminator");
         }
-        arg_ranges.push(data_start..data_end);
+        arg_ranges.extend(std::iter::once(data_start..data_end));
         pos = crlf_end;
     }
 
-    Ok(Some(ParsedCommandRanges {
-        arg_ranges,
-        consumed: pos,
-    }))
+    Ok(Some((arg_ranges, pos)))
 }
 
 /// 业务作用: 解析 inline command，并按空格或制表符拆分参数，兼容手工 telnet 风格输入。
@@ -658,14 +802,15 @@ fn parse_inline(input: &[u8]) -> anyhow::Result<Option<ParsedCommand>> {
 /// - `input`: 一行以 CRLF 或 LF 结束的 inline command 缓冲。
 ///
 /// 返回: 完整命令返回参数区间和消费长度；没有完整行结束符时返回 `None`。
-// 解析 parse_inline_ranges 输入，用于支撑解析和编码 Redis RESP 协议帧。
-fn parse_inline_ranges(input: &[u8]) -> anyhow::Result<Option<ParsedCommandRanges>> {
+fn parse_inline_ranges<R: Default + Extend<Range<usize>>>(
+    input: &[u8],
+) -> anyhow::Result<Option<(R, usize)>> {
     let line_end = find_inline_line_end(input);
     reject_nul_in_line_prefix(input, 0, line_end.map(|(end, _)| end))?;
     let Some((end, consumed)) = line_end else {
         return Ok(None);
     };
-    let mut arg_ranges = Vec::new();
+    let mut arg_ranges = R::default();
     let mut pos = 0;
     while pos < end {
         while pos < end && (input[pos] == b' ' || input[pos] == b'\t') {
@@ -676,13 +821,10 @@ fn parse_inline_ranges(input: &[u8]) -> anyhow::Result<Option<ParsedCommandRange
             pos += 1;
         }
         if start < pos {
-            arg_ranges.push(start..pos);
+            arg_ranges.extend(std::iter::once(start..pos));
         }
     }
-    Ok(Some(ParsedCommandRanges {
-        arg_ranges,
-        consumed,
-    }))
+    Ok(Some((arg_ranges, consumed)))
 }
 
 /// 业务作用: 查找 inline 命令行边界，同时兼容 Redis 常见 CRLF 和 Dragonfly 接受的单 LF 输入。
@@ -872,13 +1014,13 @@ fn parse_map_value(
     Ok(Some((RespValue::Map(Some(values)), pos)))
 }
 
-/// 业务作用: 递归解析 RESP3 set，用于保持 RESP3 响应读取和测试校验的类型信息。
+/// 业务作用: 递归解析 RESP3 set，用于保留 RESP3 集合响应的类型和元素边界。
 /// 参数说明:
 /// - `input`: 以 `~` 开头的 RESP3 set 缓冲。
 /// - `remaining_depth`: set 元素可继续使用的嵌套预算。
 ///
 /// 返回: 完整 set 返回元素列表；任一子元素半包时返回 `None`。
-// 解析 parse_set_value 输入，用于支撑 RESP3 set 类型的响应读取和测试校验。
+// 解析 parse_set_value 输入，沿用剩余嵌套预算，避免集合元素绕过递归深度限制。
 fn parse_set_value(
     input: &[u8],
     remaining_depth: usize,
@@ -902,13 +1044,13 @@ fn parse_set_value(
     Ok(Some((RespValue::Set(Some(values)), pos)))
 }
 
-/// 业务作用: 递归解析 RESP3 push，用于 Pub/Sub 或服务端主动推送帧的测试和转发辅助判断。
+/// 业务作用: 递归解析 RESP3 push，用于识别 Pub/Sub 和服务端主动推送帧，保留其与普通响应的类型差异。
 /// 参数说明:
 /// - `input`: 以 `>` 开头的 RESP3 push 缓冲。
 /// - `remaining_depth`: push 元素可继续使用的嵌套预算。
 ///
 /// 返回: 完整 push 返回元素列表；负长度会作为协议错误拒绝。
-// 解析 parse_push_value 输入，用于支撑 RESP3 Pub/Sub push 帧和客户端主动推送消息的校验。
+// 解析 parse_push_value 输入，用于支撑 RESP3 Pub/Sub push 帧和服务端主动推送消息的校验。
 fn parse_push_value(
     input: &[u8],
     remaining_depth: usize,
@@ -1065,22 +1207,46 @@ fn find_crlf(input: &[u8], start: usize) -> Option<usize> {
 
 /// 业务作用: 将 RESP 长度行解析成无符号整数，用于 array 元素数和 command 参数个数。
 /// 参数说明:
-/// - `bytes`: 协议帧或字节缓冲区，用于 RESP 解析、写回或大小限制校验。
+/// - `bytes`: 不含行结束符的十进制长度字段。
 ///
-/// 返回: 成功返回整数；非 UTF-8 或非数字返回错误。
-// 解析 parse_usize 输入，用于支撑解析和编码 Redis RESP 协议帧。
+/// 返回: 合法字段返回完整整数；非法编码、格式或超出地址宽度时返回错误。
 fn parse_usize(bytes: &[u8]) -> anyhow::Result<usize> {
+    if let Some(value) = parse_short_decimal(bytes) {
+        return Ok(value);
+    }
     Ok(std::str::from_utf8(bytes)?.parse()?)
 }
 
 /// 业务作用: 将 RESP 长度行解析成有符号整数，用于识别 null bulk、null array 等负长度语义。
 /// 参数说明:
-/// - `bytes`: 协议帧或字节缓冲区，用于 RESP 解析、写回或大小限制校验。
+/// - `bytes`: 不含行结束符的十进制长度字段，可包含符号。
 ///
-/// 返回: 成功返回整数；非 UTF-8 或非数字返回错误。
-// 解析 parse_isize 输入，用于支撑解析和编码 Redis RESP 协议帧。
+/// 返回: 合法字段返回完整有符号整数；非法编码、格式或溢出时返回错误。
 fn parse_isize(bytes: &[u8]) -> anyhow::Result<isize> {
+    if let Some(value) = parse_short_decimal(bytes) {
+        return Ok(value as isize);
+    }
     Ok(std::str::from_utf8(bytes)?.parse()?)
+}
+
+/// 业务作用: 直接读取常见短长度字段，避免每条命令重复进行通用字符串与整数解析。
+/// 参数说明:
+/// - `bytes`: 完整长度字段，不含 CRLF。
+///
+/// 返回: 一至三位 ASCII 数字返回不超过 999 的值；其它输入返回 None，由完整解析器判断合法性。
+#[inline]
+fn parse_short_decimal(bytes: &[u8]) -> Option<usize> {
+    // 仅接受有界纯数字；符号、长字段和非法字节仍走原解析器，保留溢出与错误语义。
+    match bytes {
+        [a] if a.is_ascii_digit() => Some(usize::from(a - b'0')),
+        [a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
+            Some(usize::from(a - b'0') * 10 + usize::from(b - b'0'))
+        }
+        [a, b, c] if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() => {
+            Some(usize::from(a - b'0') * 100 + usize::from(b - b'0') * 10 + usize::from(c - b'0'))
+        }
+        _ => None,
+    }
 }
 
 /// 业务作用: 对帧偏移做溢出保护加法，防止恶意长度字段导致 usize 回绕后越界切片。
@@ -1089,9 +1255,10 @@ fn parse_isize(bytes: &[u8]) -> anyhow::Result<isize> {
 /// - `right`: 需要增加的帧长度。
 /// - `message`: 溢出时附加到错误里的上下文说明。
 ///
-/// 返回: 加法成功返回新偏移；溢出返回错误。
+/// 返回: 加法成功返回新偏移且不分配错误文本；溢出时附加给定上下文并返回错误。
 fn checked_add(left: usize, right: usize, message: &str) -> anyhow::Result<usize> {
-    left.checked_add(right).context(message.to_string())
+    // 长度计算位于每条请求和响应的解析路径，只有溢出时才需要拥有错误文本。
+    left.checked_add(right).with_context(|| message.to_string())
 }
 
 /// 业务作用: 清理 RESP simple string payload，避免动态 mode 字段插入 CRLF 破坏 HELLO 响应结构。
