@@ -12,7 +12,8 @@ homepage = "https://github.com/nasa-runtime/narix"
 keywords = ["dragonfly", "redis", "resp", "proxy", "high-availability"]
 categories = ["database", "network-programming"]
 include = [
-    "/.github/**",
+    "/.github/**/*.yml",
+    "/.github/**/*.yaml",
     "/.gitignore",
     "/.dockerignore",
     "/CHANGELOG.md",
@@ -29,12 +30,14 @@ include = [
     "/build.rs",
     "/command-matrix.md",
     "/command-matrix.en.md",
-    "/dashboards/**",
-    "/docs/**",
-    "/docker/**",
-    "/proto/**",
-    "/src/**",
-    "/zcf/**",
+    "/dashboards/**/*.json",
+    "/docs/**/*.md",
+    "/docs/**/*.yml",
+    "/docker/Dockerfile",
+    "/docker/*.md",
+    "/proto/**/*.proto",
+    "/src/**/*.rs",
+    "/zcf/**/*.yml",
 ]
 
 # 跨 crate 优化与集中生成减少重复机器码，同时保留默认的 panic 展开和运行时能力。
